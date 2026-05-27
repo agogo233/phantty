@@ -2,9 +2,7 @@ name: Publish Windows Release
 
 on:
   push:
-    tags:
-      - '[0-9]*'
-      - 'v[0-9]*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -185,56 +183,3 @@ jobs:
           name: phantty-windows-portable-no-webview-${{ github.ref_name }}
           path: phantty-windows-portable-no-webview-${{ github.ref_name }}.zip
           if-no-files-found: error
-
-      - name: Publish GitHub release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $tag = "${{ github.ref_name }}"
-          $portableAsset = "phantty-windows-portable-$tag.zip"
-          $portableWebView2Asset = "phantty-windows-portable-webview2-$tag.zip"
-          $portableNoWebViewAsset = "phantty-windows-portable-no-webview-$tag.zip"
-
-          if (!(Test-Path $portableAsset)) {
-            throw "Portable release asset not found: $portableAsset"
-          }
-          if (!(Test-Path $portableWebView2Asset)) {
-            throw "Portable WebView2 release asset not found: $portableWebView2Asset"
-          }
-          if (!(Test-Path $portableNoWebViewAsset)) {
-            throw "Portable no-WebView release asset not found: $portableNoWebViewAsset"
-          }
-
-          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $portableAsset $portableWebView2Asset $portableNoWebViewAsset --repo $env:GITHUB_REPOSITORY --clobber
-          } else {
-            $assetNotes = @(
-              "Windows assets included in this release:",
-              "",
-              "- Portable: lightweight zip archive containing phantty.exe",
-              "- Portable WebView2: zip archive containing phantty.exe and WebView2Loader.dll for the embedded browser",
-              "- Portable no-WebView: zip archive containing phantty.exe, built with embedded WebView2 disabled",
-              "",
-              "The unsigned IExpress setup executable is not published because Windows Defender can quarantine it as a false positive. Use one of the portable zip assets for now."
-            ) -join "`n"
-
-            $releaseNotesPath = Join-Path "release-notes" "$tag.md"
-            if (Test-Path $releaseNotesPath) {
-              $curatedNotes = (Get-Content $releaseNotesPath -Raw).Trim()
-              if (![string]::IsNullOrWhiteSpace($curatedNotes)) {
-                $notes = @($curatedNotes, "", $assetNotes) -join "`n"
-              } else {
-                $notes = $assetNotes
-              }
-            } else {
-              $notes = $assetNotes
-            }
-
-            gh release create $tag $portableAsset $portableWebView2Asset $portableNoWebViewAsset `
-              --repo $env:GITHUB_REPOSITORY `
-              --verify-tag `
-              --generate-notes `
-              --notes $notes
-          }
