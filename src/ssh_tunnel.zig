@@ -1,6 +1,7 @@
 //! SSH loopback port forwarding for URLs opened from SSH terminal surfaces.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Surface = @import("Surface.zig");
 const browser_url = @import("browser_url.zig");
 const platform_process = @import("platform/process.zig");
@@ -188,8 +189,8 @@ fn spawnSshTunnel(allocator: std.mem.Allocator, conn: *const Surface.SshConnecti
         if (env_map) |*map| {
             map.put("SSH_ASKPASS", askpass_path.?) catch return null;
             map.put("SSH_ASKPASS_REQUIRE", "force") catch return null;
-            map.put("DISPLAY", "phantty") catch return null;
-            map.put("PHANTTY_SSH_PASSWORD", conn.password()) catch return null;
+            map.put("DISPLAY", "wispterm") catch return null;
+            map.put("WISPTERM_SSH_PASSWORD", conn.password()) catch return null;
         }
     }
 
@@ -216,6 +217,14 @@ fn spawnSshTunnel(allocator: std.mem.Allocator, conn: *const Surface.SshConnecti
         appendSshOption(&argv_buf, &argc, "NumberOfPasswordPrompts=1");
     } else {
         appendSshOption(&argv_buf, &argc, "BatchMode=yes");
+    }
+    // Route the forwarding connection through the same jump host as the
+    // interactive session so loopback tunnels reach the real destination.
+    // `proxy_opt_buf` must outlive the child spawn below, which it does.
+    var proxy_opt_buf: [288]u8 = undefined;
+    if (conn.proxyJump().len > 0) {
+        const opt = std.fmt.bufPrint(&proxy_opt_buf, "ProxyJump={s}", .{conn.proxyJump()}) catch return null;
+        appendSshOption(&argv_buf, &argc, opt);
     }
     if (conn.port().len > 0) {
         argv_buf[argc] = "-p";
@@ -259,6 +268,13 @@ fn pruneExitedTunnels() void {
 fn stopTunnelSlot(slot: *?SshTunnel) void {
     if (slot.*) |*tunnel| {
         if (childHasExited(&tunnel.child)) {
+            // On POSIX childHasExited() already reaped the zombie via
+            // waitpid(WNOHANG). Pre-set Child.term so child.wait() takes std's
+            // cleanup-only fast path instead of a second waitpid — that would
+            // hit ECHILD, which std.posix.waitpid treats as `unreachable`
+            // (abort, not catchable). On Windows the handle is not consumed,
+            // so leave term unset and let wait() close it.
+            if (builtin.os.tag != .windows) tunnel.child.term = .{ .Unknown = 0 };
             _ = tunnel.child.wait() catch {};
         } else {
             _ = tunnel.child.kill() catch {};
@@ -300,7 +316,10 @@ fn canConnectToLocalHostName(allocator: std.mem.Allocator, local_host: []const u
 }
 
 fn childHasExited(child: *const std.process.Child) bool {
-    return platform_process.childExited(child.id, 0);
+    return switch (platform_process.childExited(child.id, 0)) {
+        .running => false,
+        .exited, .gone => true,
+    };
 }
 
 fn reservePreferredLocalPort(preferred_port: u16) ?u16 {

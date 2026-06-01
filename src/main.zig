@@ -1,10 +1,11 @@
-//! Phantty entry point.
+//! WispTerm entry point.
 //!
 //! Handles CLI args and special commands, then creates an App which
 //! manages one or more AppWindow instances. Most terminal logic lives
 //! in AppWindow.zig.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Config = @import("config.zig");
 const App = @import("App.zig");
 const image_decoder = @import("image_decoder.zig");
@@ -19,6 +20,26 @@ const render_diagnostics = @import("render_diagnostics.zig");
 
 fn prepareCliConsole() void {
     platform_console.prepareCliConsole();
+}
+
+/// macOS-only: .app bundles launched by launchd inherit cwd "/", which then
+/// leaks into every new shell session (initial_cwd, getActiveCwd, PTY
+/// inherited cwd). Reroot to $HOME so newly spawned tabs/splits land where
+/// the user expects, while leaving wispterm alone when it was invoked from a
+/// real shell with a meaningful cwd.
+///
+/// Wrapped in a comptime os.tag check so Windows builds skip the whole body
+/// — std.posix.getenv is a @compileError on Windows (env strings are
+/// WTF-16, not UTF-8), and an unguarded reference here breaks the Windows
+/// release build.
+fn rerootCwdFromBundleRootIfNeeded() void {
+    if (builtin.os.tag == .macos) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.process.getCwd(&buf) catch return;
+        if (!std.mem.eql(u8, cwd, "/")) return;
+        const home = std.posix.getenv("HOME") orelse return;
+        std.posix.chdir(home) catch {};
+    }
 }
 
 fn listSystemFonts(allocator: std.mem.Allocator, writer: anytype) !void {
@@ -123,7 +144,8 @@ pub fn main() !void {
         return;
     }
 
-    std.debug.print("Phantty starting...\n", .{});
+    std.debug.print("WispTerm starting...\n", .{});
+    rerootCwdFromBundleRootIfNeeded();
     image_decoder.install();
 
     // Load configuration: defaults → config file → CLI flags
@@ -138,17 +160,17 @@ pub fn main() !void {
 
     // Honor the config opt-in for render diagnostics before any window/GL
     // exists, so the very first WM_SIZE/WM_DPICHANGED events are captured.
-    render_diagnostics.enableFromConfig(cfg.@"phantty-debug-render");
+    render_diagnostics.enableFromConfig(cfg.@"wispterm-debug-render");
 
     // Create the App and run (first window on main thread, spawned windows on separate threads)
     var app = try App.init(allocator, cfg);
     defer app.deinit();
 
     // App now lives at a stable address; start the WeChat direct bridge (no-op
-    // unless weixin-direct-enabled and remote is inactive).
+    // unless weixin-direct-enabled is set).
     app.startWeixin(&cfg);
 
     try app.run();
 
-    std.debug.print("Phantty exiting...\n", .{});
+    std.debug.print("WispTerm exiting...\n", .{});
 }

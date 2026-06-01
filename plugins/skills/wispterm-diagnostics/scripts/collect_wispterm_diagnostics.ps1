@@ -2,7 +2,7 @@ param(
     [string]$ProblemType = "",
     [string]$UserDescription = "",
     [string]$ReproductionSteps = "",
-    [string]$PhanttyExePath = "",
+    [string]$WispTermExePath = "",
     [switch]$StartupProbe,
     [switch]$EnableCrashDumps,
     [int]$CrashEventDays = 14,
@@ -86,7 +86,7 @@ function Redact-Text {
     $redacted = [regex]::Replace($redacted, $urlPattern, {
         param($m)
         $url = $m.Groups[1].Value
-        if ($url -match '(?i)(github\.com/xuzhougeng/phantty|github\.com/ghostty-org/ghostty)') {
+        if ($url -match '(?i)(github\.com/xuzhougeng/wispterm|github\.com/ghostty-org/ghostty)') {
             return $url
         }
         return Redact-UrlForPublicReport $url
@@ -207,22 +207,22 @@ function Get-CommandPath {
     }
 }
 
-function Find-PhanttyExe {
+function Find-WispTermExe {
     param([string]$ProvidedPath)
 
     if (Test-PathSafe $ProvidedPath) { return (Resolve-Path -LiteralPath $ProvidedPath).Path }
 
     try {
-        $proc = Get-Process -Name phantty -ErrorAction SilentlyContinue |
+        $proc = Get-Process -Name wispterm -ErrorAction SilentlyContinue |
             Where-Object { $_.Path } |
             Select-Object -First 1
         if ($proc -and (Test-PathSafe $proc.Path)) { return $proc.Path }
     } catch {}
 
-    $fromPath = Get-CommandPath "phantty.exe"
+    $fromPath = Get-CommandPath "wispterm.exe"
     if (Test-PathSafe $fromPath) { return $fromPath }
 
-    $cwdCandidate = Join-Path (Get-Location).Path "phantty.exe"
+    $cwdCandidate = Join-Path (Get-Location).Path "wispterm.exe"
     if (Test-PathSafe $cwdCandidate) { return $cwdCandidate }
 
     return $null
@@ -251,6 +251,51 @@ function Get-DpiInfo {
         }
         return "default or per-monitor"
     } catch {
+        return "unavailable"
+    }
+}
+
+function Get-MonitorInfo {
+    $lines = New-Object System.Collections.Generic.List[string]
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $screens = [System.Windows.Forms.Screen]::AllScreens
+        foreach ($s in $screens) {
+            $primary = if ($s.Primary) { " [primary]" } else { "" }
+            $lines.Add("$($s.DeviceName): $($s.Bounds.Width)x$($s.Bounds.Height) bits=$($s.BitsPerPixel)$primary") | Out-Null
+        }
+    } catch {
+        try {
+            $monitors = Get-CimInstance Win32_DesktopMonitor -ErrorAction Stop
+            foreach ($m in $monitors) {
+                $w = if ($m.ScreenWidth) { $m.ScreenWidth } else { "?" }
+                $h = if ($m.ScreenHeight) { $m.ScreenHeight } else { "?" }
+                $lines.Add("$($m.Name): ${w}x${h}") | Out-Null
+            }
+        } catch {}
+    }
+    if ($lines.Count -eq 0) { return "unavailable" }
+    return ($lines -join "; ")
+}
+
+function Get-CpuSample {
+    param([int]$Seconds = 3)
+    try {
+        $procs = Get-Process -Name wispterm -ErrorAction SilentlyContinue
+        if (-not $procs) { return "wispterm.exe not running during sample" }
+        $proc = $procs | Sort-Object CPU -Descending | Select-Object -First 1
+        $t0 = $proc.TotalProcessorTime
+        $w0 = [DateTime]::UtcNow
+        Start-Sleep -Seconds $Seconds
+        $proc.Refresh()
+        $dt = ($proc.TotalProcessorTime - $t0).TotalSeconds
+        $wall = ([DateTime]::UtcNow - $w0).TotalSeconds
+        $cores = [Environment]::ProcessorCount
+        $pct = [Math]::Round($dt / $wall / $cores * 100, 1)
+        $mem = [Math]::Round($proc.WorkingSet64 / 1MB, 1)
+        return "~$pct% of one core ($Seconds s sample, $cores logical cores, ${mem} MB working set, PID $($proc.Id))"
+    } catch {
+        Add-FailedCommand "sample CPU" $_.Exception.Message
         return "unavailable"
     }
 }
@@ -295,7 +340,7 @@ function Get-SshInfo {
     }
     if ($scp -and [string]::IsNullOrWhiteSpace($scpVersion)) { $scpVersion = "unavailable" }
 
-    $sshHosts = if ($env:APPDATA) { Join-Path $env:APPDATA "phantty\ssh_hosts" } else { $null }
+    $sshHosts = if ($env:APPDATA) { Join-Path $env:APPDATA "wispterm\ssh_hosts" } else { $null }
     $profileCount = "not found"
     if (Test-PathSafe $sshHosts) {
         try {
@@ -353,7 +398,7 @@ function Get-WebView2Version {
 
 function Get-RenderDiagnosticLogPath {
     if (-not $env:APPDATA) { return $null }
-    return Join-Path $env:APPDATA "phantty\render-diagnostic.log"
+    return Join-Path $env:APPDATA "wispterm\render-diagnostic.log"
 }
 
 function Get-OpenGlFromRenderDiagnosticLog {
@@ -407,20 +452,21 @@ function Get-RenderingInfo {
         GPU = if ($gpuLines.Count -gt 0) { $gpuLines -join "; " } else { "unavailable" }
         OpenGL = Get-OpenGlFromRenderDiagnosticLog
         DpiScaling = Get-DpiInfo
+        Monitors = Get-MonitorInfo
         WebView2Runtime = Get-WebView2Version
     }
 }
 
-function Get-PhanttyInfo {
-    $exe = Find-PhanttyExe $PhanttyExePath
+function Get-WispTermInfo {
+    $exe = Find-WispTermExe $WispTermExePath
     $exeDir = if ($exe) { Split-Path -Parent $exe } else { $null }
-    $versionOutput = if ($exe) { Invoke-CapturedCommand $exe @("--version") 5000 "phantty.exe --version" } else { $null }
-    $configPath = if ($exe) { Invoke-CapturedCommand $exe @("--show-config-path") 5000 "phantty.exe --show-config-path" } else { $null }
+    $versionOutput = if ($exe) { Invoke-CapturedCommand $exe @("--version") 5000 "wispterm.exe --version" } else { $null }
+    $configPath = if ($exe) { Invoke-CapturedCommand $exe @("--show-config-path") 5000 "wispterm.exe --show-config-path" } else { $null }
     if ($configPath -match "(?im)^\s*(?:Config file|Config path):\s*(.+?)\s*$") {
         $configPath = $Matches[1]
     }
     if ([string]::IsNullOrWhiteSpace($configPath) -and $env:APPDATA) {
-        $configPath = Join-Path $env:APPDATA "phantty\config"
+        $configPath = Join-Path $env:APPDATA "wispterm\config"
     }
 
     $versionTxt = if ($exeDir) { Join-Path $exeDir "version.txt" } else { $null }
@@ -430,15 +476,15 @@ function Get-PhanttyInfo {
     }
 
     $loader = if ($exeDir) { Join-Path $exeDir "WebView2Loader.dll" } else { $null }
-    $portableConfig = if ($exeDir) { Join-Path $exeDir "phantty.conf" } else { $null }
+    $portableConfig = if ($exeDir) { Join-Path $exeDir "wispterm.conf" } else { $null }
     $package = "unknown"
     if ($exeDir) {
         if (Test-PathSafe $loader) { $package = "portable-webview2 or WebView-enabled package" }
         else { $package = "portable or installed package (WebView2Loader.dll not found)" }
     }
 
-    $appDataDir = if ($env:APPDATA) { Join-Path $env:APPDATA "phantty" } else { $null }
-    $appDataConfig = if ($env:APPDATA) { Join-Path $env:APPDATA "phantty\config" } else { $null }
+    $appDataDir = if ($env:APPDATA) { Join-Path $env:APPDATA "wispterm" } else { $null }
+    $appDataConfig = if ($env:APPDATA) { Join-Path $env:APPDATA "wispterm\config" } else { $null }
     $session = if ($appDataDir) { Join-Path $appDataDir "session.json" } else { $null }
     $logs = if ($appDataDir) { Join-Path $appDataDir "logs" } else { $null }
 
@@ -484,7 +530,7 @@ function Format-CrashEvent {
     $provider = Format-Value $Event.ProviderName
 
     if ($Event.Id -eq 1000) {
-        $app = if ($map.ContainsKey("AppName")) { $map["AppName"] } else { "phantty.exe" }
+        $app = if ($map.ContainsKey("AppName")) { $map["AppName"] } else { "wispterm.exe" }
         $module = if ($map.ContainsKey("ModuleName")) { $map["ModuleName"] } else { "unavailable" }
         $code = if ($map.ContainsKey("ExceptionCode")) { $map["ExceptionCode"] } else { "unavailable" }
         $offset = if ($map.ContainsKey("FaultingOffset")) { $map["FaultingOffset"] } else { "unavailable" }
@@ -500,7 +546,7 @@ function Format-CrashEvent {
     return "- $time Event $($Event.Id) ${provider}: $(Format-Value $message)"
 }
 
-function Get-PhanttyCrashEvents {
+function Get-WispTermCrashEvents {
     param([int]$Days = 14)
     $start = (Get-Date).AddDays(-1 * [Math]::Max(1, $Days))
     $eventLines = New-Object System.Collections.Generic.List[string]
@@ -511,7 +557,7 @@ function Get-PhanttyCrashEvents {
             $text = ""
             try { $text = $event.FormatDescription() } catch {}
             $values = ($map.Values -join " ") + " " + $text
-            if ($values -notmatch "(?i)\bphantty\.exe\b") { continue }
+            if ($values -notmatch "(?i)\bwispterm\.exe\b") { continue }
             $eventLines.Add((Format-CrashEvent $event)) | Out-Null
             if ($eventLines.Count -ge 5) { break }
         }
@@ -519,12 +565,12 @@ function Get-PhanttyCrashEvents {
         Add-FailedCommand "read Windows Application crash events" $_.Exception.Message
     }
 
-    if ($eventLines.Count -eq 0) { return @("- No recent phantty.exe crash events found in the Windows Application log.") }
+    if ($eventLines.Count -eq 0) { return @("- No recent wispterm.exe crash events found in the Windows Application log.") }
     return @($eventLines)
 }
 
 function Get-WerDumpRegistryPath {
-    return "HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\phantty.exe"
+    return "HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\wispterm.exe"
 }
 
 function Resolve-WerDumpFolder {
@@ -551,7 +597,7 @@ function Enable-WerCrashDumpCollection {
         New-ItemProperty -Force -Path $regPath -Name DumpFolder -PropertyType ExpandString -Value $folder | Out-Null
         New-ItemProperty -Force -Path $regPath -Name DumpType -PropertyType DWord -Value 2 | Out-Null
         New-ItemProperty -Force -Path $regPath -Name DumpCount -PropertyType DWord -Value 5 | Out-Null
-        $script:CrashDumpSetup = "enabled for phantty.exe at $(Format-Value $folder) (full dumps; do not post publicly)"
+        $script:CrashDumpSetup = "enabled for wispterm.exe at $(Format-Value $folder) (full dumps; do not post publicly)"
     } catch {
         $script:CrashDumpSetup = "failed ($($_.Exception.Message))"
         Add-FailedCommand "enable WER crash dumps" $_.Exception.Message
@@ -563,7 +609,7 @@ function Get-WerDumpInfo {
     $dumpType = Get-RegistryValue $regPath "DumpType"
     $dumpCount = Get-RegistryValue $regPath "DumpCount"
     $folder = Resolve-WerDumpFolder
-    $folderSummary = if ($folder) { Get-DirectoryFileSummary $folder "phantty*.dmp" } else { "unavailable" }
+    $folderSummary = if ($folder) { Get-DirectoryFileSummary $folder "wispterm*.dmp" } else { "unavailable" }
     $configured = if (Test-PathSafe $regPath) { "yes" } else { "no" }
 
     return [pscustomobject]@{
@@ -576,10 +622,10 @@ function Get-WerDumpInfo {
     }
 }
 
-function Invoke-PhanttyStartupProbe {
+function Invoke-WispTermStartupProbe {
     param([string]$ExePath, [int]$TimeoutMs = 8000)
     if (-not (Test-PathSafe $ExePath)) {
-        $script:StartupProbeResult = "not run (phantty.exe not found)"
+        $script:StartupProbeResult = "not run (wispterm.exe not found)"
         return
     }
 
@@ -590,7 +636,7 @@ function Invoke-PhanttyStartupProbe {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $false
-    $psi.EnvironmentVariables["PHANTTY_RENDER_DIAGNOSTICS"] = "1"
+    $psi.EnvironmentVariables["WISPTERM_RENDER_DIAGNOSTICS"] = "1"
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $psi
@@ -677,7 +723,7 @@ function Get-ConfigExcerpt {
         }
         return $redacted
     } catch {
-        Add-FailedCommand "read Phantty config" $_.Exception.Message
+        Add-FailedCommand "read WispTerm config" $_.Exception.Message
         return @("# config unavailable")
     }
 }
@@ -734,25 +780,40 @@ function Get-IssueHints {
                 "- Remote console: include whether the browser login page or console shell is failing."
             )
         }
+        "(?i)render|dpi|monitor|display|glitch|resize" {
+            return @(
+                "- Rendering/DPI: monitor count and resolutions are collected in the Rendering section above.",
+                "- Rendering/DPI: if render-diagnostic.log is missing or empty, add `wispterm-debug-render = true` to your config, restart WispTerm, reproduce the issue, then re-run this script.",
+                "- Rendering/DPI: attach a screenshot or short screen recording showing the glitch."
+            )
+        }
+        "(?i)cpu|perf|slow|performance|high.cpu" {
+            return @(
+                "- High CPU: CPU usage sample is in the Rendering section (wispterm.exe must be running when the script runs).",
+                "- High CPU: note whether CPU stays high continuously or spikes briefly.",
+                "- High CPU: check whether a background AI Chat request, remote session, or file preview is active when CPU is high."
+            )
+        }
         default { return @() }
     }
 }
 
 function New-MarkdownReport {
-    $phantty = Get-PhanttyInfo
+    $wispterm = Get-WispTermInfo
     if ($EnableCrashDumps) { Enable-WerCrashDumpCollection }
-    if ($StartupProbe) { Invoke-PhanttyStartupProbe $phantty.ExePathRaw $StartupProbeTimeoutMs }
+    if ($StartupProbe) { Invoke-WispTermStartupProbe $wispterm.ExePathRaw $StartupProbeTimeoutMs }
     $windows = Get-WindowsInfo
     $ssh = Get-SshInfo
     $rendering = Get-RenderingInfo
-    $configLines = Get-ConfigExcerpt $phantty.ConfigPathRaw
+    $cpuSample = if ($ProblemType -match "(?i)cpu|perf|slow|performance|high.cpu") { Get-CpuSample 3 } else { $null }
+    $configLines = Get-ConfigExcerpt $wispterm.ConfigPathRaw
     $hints = Get-IssueHints $ProblemType
-    $crashEvents = Get-PhanttyCrashEvents $CrashEventDays
+    $crashEvents = Get-WispTermCrashEvents $CrashEventDays
     $wer = Get-WerDumpInfo
     $renderLog = Get-RenderDiagnosticLogExcerpt
 
     $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add("## Phantty Diagnostic Report") | Out-Null
+    $lines.Add("## WispTerm Diagnostic Report") | Out-Null
     $lines.Add("") | Out-Null
     $lines.Add("### Summary") | Out-Null
     $lines.Add("- Generated at: $((Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz"))") | Out-Null
@@ -760,14 +821,14 @@ function New-MarkdownReport {
     $lines.Add("- User description: $(Format-Value $UserDescription)") | Out-Null
     $lines.Add("- Reproduction steps: $(Format-Value $ReproductionSteps)") | Out-Null
     $lines.Add("") | Out-Null
-    $lines.Add("### Phantty") | Out-Null
-    $lines.Add("- Version: $($phantty.Version)") | Out-Null
-    $lines.Add("- version.txt: $($phantty.VersionTxt)") | Out-Null
-    $lines.Add("- Package: $($phantty.Package)") | Out-Null
-    $lines.Add("- Executable path: $($phantty.ExePath)") | Out-Null
-    $lines.Add("- Config path: $($phantty.ConfigPath)") | Out-Null
-    $lines.Add("- Portable config: $($phantty.PortableConfig)") | Out-Null
-    $lines.Add("- WebView2Loader.dll: $($phantty.WebView2Loader)") | Out-Null
+    $lines.Add("### WispTerm") | Out-Null
+    $lines.Add("- Version: $($wispterm.Version)") | Out-Null
+    $lines.Add("- version.txt: $($wispterm.VersionTxt)") | Out-Null
+    $lines.Add("- Package: $($wispterm.Package)") | Out-Null
+    $lines.Add("- Executable path: $($wispterm.ExePath)") | Out-Null
+    $lines.Add("- Config path: $($wispterm.ConfigPath)") | Out-Null
+    $lines.Add("- Portable config: $($wispterm.PortableConfig)") | Out-Null
+    $lines.Add("- WebView2Loader.dll: $($wispterm.WebView2Loader)") | Out-Null
     $lines.Add("") | Out-Null
     $lines.Add("### Windows") | Out-Null
     $lines.Add("- Edition/version/build: $($windows.Edition)") | Out-Null
@@ -789,7 +850,11 @@ function New-MarkdownReport {
     $lines.Add("- GPU: $($rendering.GPU)") | Out-Null
     $lines.Add("- OpenGL: $($rendering.OpenGL)") | Out-Null
     $lines.Add("- DPI/scaling: $($rendering.DpiScaling)") | Out-Null
+    $lines.Add("- Monitors: $($rendering.Monitors)") | Out-Null
     $lines.Add("- WebView2 runtime: $($rendering.WebView2Runtime)") | Out-Null
+    if ($cpuSample) {
+        $lines.Add("- wispterm.exe CPU sample: $cpuSample") | Out-Null
+    }
     $lines.Add("") | Out-Null
     $lines.Add("### Startup / Crash") | Out-Null
     $lines.Add("- Startup probe: $(Format-Value $script:StartupProbeResult)") | Out-Null
@@ -818,10 +883,10 @@ function New-MarkdownReport {
         $lines.Add("") | Out-Null
     }
     $lines.Add("### Relevant Files") | Out-Null
-    $lines.Add("- `%APPDATA%\phantty\config`: $($phantty.AppDataConfig)") | Out-Null
-    $lines.Add("- `%APPDATA%\phantty\session.json`: $($phantty.SessionJson)") | Out-Null
-    $lines.Add("- `%APPDATA%\phantty\logs`: $($phantty.Logs)") | Out-Null
-    $lines.Add("- portable `phantty.conf`: $($phantty.PortableConfig)") | Out-Null
+    $lines.Add("- `%APPDATA%\wispterm\config`: $($wispterm.AppDataConfig)") | Out-Null
+    $lines.Add("- `%APPDATA%\wispterm\session.json`: $($wispterm.SessionJson)") | Out-Null
+    $lines.Add("- `%APPDATA%\wispterm\logs`: $($wispterm.Logs)") | Out-Null
+    $lines.Add("- portable `wispterm.conf`: $($wispterm.PortableConfig)") | Out-Null
     $lines.Add("") | Out-Null
     if ($hints.Count -gt 0) {
         $lines.Add("### Issue-Type Notes") | Out-Null
@@ -854,7 +919,7 @@ function Invoke-SelfTest {
     $line = Redact-ConfigLine "keybind = ctrl+shift+p=toggle_command_palette"
     if ($line -ne "keybind = ctrl+shift+p=toggle_command_palette") { throw "safe keybind was incorrectly redacted" }
 
-    $fakeUserPath = Join-Path $env:USERPROFILE "Documents\secret\phantty.exe"
+    $fakeUserPath = Join-Path $env:USERPROFILE "Documents\secret\wispterm.exe"
     $redacted = Redact-Text $fakeUserPath
     if ($redacted -match [regex]::Escape($env:USERPROFILE)) { throw "USERPROFILE path was not redacted" }
 
@@ -873,6 +938,12 @@ function Invoke-SelfTest {
 
     $crashHints = Get-IssueHints "startup/crash"
     if ($crashHints.Count -lt 2) { throw "startup/crash hints missing" }
+
+    $renderHints = Get-IssueHints "rendering/DPI"
+    if ($renderHints.Count -lt 2) { throw "rendering/DPI hints missing" }
+
+    $cpuHints = Get-IssueHints "high-cpu"
+    if ($cpuHints.Count -lt 2) { throw "high-cpu hints missing" }
 
     "Self-test passed"
 }

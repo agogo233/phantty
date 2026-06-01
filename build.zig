@@ -35,6 +35,7 @@ const macos_app_frameworks = [_][]const u8{
     "CoreText",
     "CoreGraphics",
     "Foundation",
+    "UserNotifications",
     "CoreFoundation",
     "Carbon",
 };
@@ -115,24 +116,45 @@ fn appFrameworksFor(features: PlatformFeatures) []const []const u8 {
 
 fn macosBundleMetadata() MacosBundleMetadata {
     return .{
-        .bundle_dir = "Phantty.app",
-        .executable_name = "Phantty",
-        .display_name = "Phantty",
-        .bundle_identifier = "com.phantty.terminal",
+        .bundle_dir = "WispTerm.app",
+        .executable_name = "WispTerm",
+        .display_name = "WispTerm",
+        .bundle_identifier = "com.wispterm.terminal",
         .minimum_system_version = "13.0",
     };
 }
 
 fn macosBundleInfoPlistPath() []const u8 {
-    return "Phantty.app/Contents/Info.plist";
+    return "WispTerm.app/Contents/Info.plist";
 }
 
 fn macosBundleExecutablePath() []const u8 {
-    return "Phantty.app/Contents/MacOS/Phantty";
+    return "WispTerm.app/Contents/MacOS/WispTerm";
 }
 
 fn macosBundleResourcesKeepPath() []const u8 {
-    return "Phantty.app/Contents/Resources/.keep";
+    return "WispTerm.app/Contents/Resources/.keep";
+}
+
+fn macosBundleIconSourcePath() []const u8 {
+    return "assets/wispterm.icns";
+}
+
+fn macosBundleIconBundlePath() []const u8 {
+    return "WispTerm.app/Contents/Resources/WispTerm.icns";
+}
+
+fn macosBundlePluginsSourcePath() []const u8 {
+    return "plugins";
+}
+
+fn macosBundlePluginsBundlePath() []const u8 {
+    return "WispTerm.app/Contents/Resources/plugins";
+}
+
+fn macosBundleIconNameInPlist() []const u8 {
+    // CFBundleIconFile is stored without the .icns extension.
+    return "WispTerm";
 }
 
 fn macosPackageScriptPath() []const u8 {
@@ -140,7 +162,7 @@ fn macosPackageScriptPath() []const u8 {
 }
 
 fn macosEntitlementsPath() []const u8 {
-    return "packaging/macos/Phantty.entitlements";
+    return "packaging/macos/WispTerm.entitlements";
 }
 
 fn macosInfoPlist(allocator: std.mem.Allocator, app_version: []const u8) []const u8 {
@@ -155,6 +177,8 @@ fn macosInfoPlist(allocator: std.mem.Allocator, app_version: []const u8) []const
         \\    <key>CFBundleDisplayName</key>
         \\    <string>{s}</string>
         \\    <key>CFBundleExecutable</key>
+        \\    <string>{s}</string>
+        \\    <key>CFBundleIconFile</key>
         \\    <string>{s}</string>
         \\    <key>CFBundleIdentifier</key>
         \\    <string>{s}</string>
@@ -178,6 +202,7 @@ fn macosInfoPlist(allocator: std.mem.Allocator, app_version: []const u8) []const
     , .{
         metadata.display_name,
         metadata.executable_name,
+        macosBundleIconNameInPlist(),
         metadata.bundle_identifier,
         metadata.display_name,
         app_version,
@@ -274,7 +299,7 @@ test "windows system libraries are gated by platform" {
 
 test "macOS platform advertises required app frameworks" {
     const frameworks = appFrameworksFor(PlatformFeatures.forOs(.macos));
-    try std.testing.expectEqual(@as(usize, 8), frameworks.len);
+    try std.testing.expectEqual(@as(usize, 9), frameworks.len);
     try expectContainsString(frameworks, "Metal");
     try expectContainsString(frameworks, "QuartzCore");
     try expectContainsString(frameworks, "AppKit");
@@ -283,6 +308,7 @@ test "macOS platform advertises required app frameworks" {
     try expectContainsString(frameworks, "Foundation");
     try expectContainsString(frameworks, "CoreFoundation");
     try expectContainsString(frameworks, "Carbon");
+    try expectContainsString(frameworks, "UserNotifications");
 
     try std.testing.expectEqual(@as(usize, 0), appFrameworksFor(PlatformFeatures.forOs(.windows)).len);
     try std.testing.expectEqual(@as(usize, 0), appFrameworksFor(PlatformFeatures.forOs(.linux)).len);
@@ -348,12 +374,12 @@ test "macOS app bundle build contract is declared" {
     try expectSourceContains(source, "b.step(\"macos-app\"");
     try expectSourceContains(source, "Build and install the native macOS .app bundle");
     try expectSourceContains(source, "src/main.zig");
-    try expectSourceContains(source, "phantty-clean-macos-app");
+    try expectSourceContains(source, "wispterm-clean-macos-app");
     try std.testing.expect(std.mem.indexOf(u8, source, stub_path) == null);
     try std.testing.expect(std.mem.indexOf(u8, source, skeleton_text) == null);
-    try std.testing.expectEqualStrings("Phantty.app/Contents/Info.plist", macosBundleInfoPlistPath());
-    try std.testing.expectEqualStrings("Phantty.app/Contents/MacOS/Phantty", macosBundleExecutablePath());
-    try std.testing.expectEqualStrings("Phantty.app/Contents/Resources/.keep", macosBundleResourcesKeepPath());
+    try std.testing.expectEqualStrings("WispTerm.app/Contents/Info.plist", macosBundleInfoPlistPath());
+    try std.testing.expectEqualStrings("WispTerm.app/Contents/MacOS/WispTerm", macosBundleExecutablePath());
+    try std.testing.expectEqualStrings("WispTerm.app/Contents/Resources/.keep", macosBundleResourcesKeepPath());
 }
 
 test "macOS distribution packaging contract is declared" {
@@ -362,7 +388,7 @@ test "macOS distribution packaging contract is declared" {
     try expectSourceContains(source, "b.step(\"macos-dist\"");
     try expectSourceContains(source, "packaging/macos/package.sh");
     try std.testing.expectEqualStrings("packaging/macos/package.sh", macosPackageScriptPath());
-    try std.testing.expectEqualStrings("packaging/macos/Phantty.entitlements", macosEntitlementsPath());
+    try std.testing.expectEqualStrings("packaging/macos/WispTerm.entitlements", macosEntitlementsPath());
 }
 
 test "macOS window backend smoke test step is declared" {
@@ -406,9 +432,9 @@ test "macOS NSMenu smoke test step is declared" {
 
 test "macOS Info.plist renders app bundle metadata and package type" {
     const metadata = macosBundleMetadata();
-    try std.testing.expectEqualStrings("Phantty.app", metadata.bundle_dir);
-    try std.testing.expectEqualStrings("Phantty", metadata.executable_name);
-    try std.testing.expectEqualStrings("com.phantty.terminal", metadata.bundle_identifier);
+    try std.testing.expectEqualStrings("WispTerm.app", metadata.bundle_dir);
+    try std.testing.expectEqualStrings("WispTerm", metadata.executable_name);
+    try std.testing.expectEqualStrings("com.wispterm.terminal", metadata.bundle_identifier);
 
     const plist = macosInfoPlist(std.testing.allocator, "1.2.3");
     defer std.testing.allocator.free(plist);
@@ -416,11 +442,13 @@ test "macOS Info.plist renders app bundle metadata and package type" {
     try expectSourceContains(plist, "CFBundlePackageType");
     try expectSourceContains(plist, "<string>APPL</string>");
     try expectSourceContains(plist, "<key>CFBundleExecutable</key>");
-    try expectSourceContains(plist, "<string>Phantty</string>");
+    try expectSourceContains(plist, "<string>WispTerm</string>");
     try expectSourceContains(plist, "<key>CFBundleIdentifier</key>");
-    try expectSourceContains(plist, "<string>com.phantty.terminal</string>");
+    try expectSourceContains(plist, "<string>com.wispterm.terminal</string>");
     try expectSourceContains(plist, "<key>CFBundleShortVersionString</key>");
     try expectSourceContains(plist, "<string>1.2.3</string>");
+    try expectSourceContains(plist, "<key>CFBundleIconFile</key>");
+    try expectSourceContains(plist, "<string>WispTerm</string>");
 }
 
 test "macOS app bundle links required native frameworks" {
@@ -487,7 +515,7 @@ pub fn build(b: *std.Build) void {
         const exe_mod = createAppModule(b, target, optimize, app_version, platform, webview);
 
         const exe = b.addExecutable(.{
-            .name = "phantty",
+            .name = "wispterm",
             .root_module = exe_mod,
         });
         if (platform.supports_app_bundle) {
@@ -547,8 +575,15 @@ pub fn build(b: *std.Build) void {
     const fast_test_options = b.addOptions();
     fast_test_options.addOption([]const u8, "app_version", app_version);
     fast_test_mod.addOptions("build_options", fast_test_options);
+    // Mirror the app's doc embeds: a fast-test module (ai_chat_protocol) pulls in
+    // wispterm_docs, whose @embedFile names must resolve here too.
+    fast_test_mod.addAnonymousImport("wispterm_doc_faq", .{ .root_source_file = b.path("docs/faq.md") });
+    fast_test_mod.addAnonymousImport("wispterm_doc_configuration", .{ .root_source_file = b.path("docs/configuration.md") });
+    fast_test_mod.addAnonymousImport("wispterm_doc_ai_agent", .{ .root_source_file = b.path("docs/ai-agent.md") });
+    fast_test_mod.addAnonymousImport("wispterm_doc_file_explorer", .{ .root_source_file = b.path("docs/file-explorer.md") });
+    fast_test_mod.addAnonymousImport("wispterm_doc_media", .{ .root_source_file = b.path("docs/media.md") });
     const fast_tests = b.addTest(.{
-        .name = "phantty-fast-test",
+        .name = "wispterm-fast-test",
         .root_module = fast_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(fast_tests).step);
@@ -563,7 +598,7 @@ pub fn build(b: *std.Build) void {
     shared_test_mod.addOptions("build_options", shared_test_options);
 
     const shared_tests = b.addTest(.{
-        .name = "phantty-shared-compile-test",
+        .name = "wispterm-shared-compile-test",
         .root_module = shared_test_mod,
     });
     test_shared_step.dependOn(&shared_tests.step);
@@ -588,7 +623,7 @@ pub fn build(b: *std.Build) void {
         metal_test_mod.linkFramework("QuartzCore", .{});
         metal_test_mod.linkSystemLibrary("objc", .{});
         const metal_tests = b.addTest(.{
-            .name = "phantty-metal-test",
+            .name = "wispterm-metal-test",
             .root_module = metal_test_mod,
         });
         apple_sdk.addPaths(b, metal_tests) catch @panic("failed to locate native Apple SDK for Metal tests");
@@ -611,7 +646,7 @@ pub fn build(b: *std.Build) void {
         macos_window_test_mod.linkFramework("QuartzCore", .{});
         macos_window_test_mod.linkSystemLibrary("objc", .{});
         const macos_window_tests = b.addTest(.{
-            .name = "phantty-macos-window-test",
+            .name = "wispterm-macos-window-test",
             .root_module = macos_window_test_mod,
         });
         apple_sdk.addPaths(b, macos_window_tests) catch @panic("failed to locate native Apple SDK for macOS window tests");
@@ -633,7 +668,7 @@ pub fn build(b: *std.Build) void {
         macos_font_test_mod.linkFramework("CoreText", .{});
         macos_font_test_mod.linkFramework("Foundation", .{});
         const macos_font_tests = b.addTest(.{
-            .name = "phantty-macos-font-test",
+            .name = "wispterm-macos-font-test",
             .root_module = macos_font_test_mod,
         });
         apple_sdk.addPaths(b, macos_font_tests) catch @panic("failed to locate native Apple SDK for macOS font tests");
@@ -656,7 +691,7 @@ pub fn build(b: *std.Build) void {
         macos_services_test_mod.linkFramework("Foundation", .{});
         macos_services_test_mod.linkSystemLibrary("objc", .{});
         const macos_services_tests = b.addTest(.{
-            .name = "phantty-macos-services-test",
+            .name = "wispterm-macos-services-test",
             .root_module = macos_services_test_mod,
         });
         apple_sdk.addPaths(b, macos_services_tests) catch @panic("failed to locate native Apple SDK for macOS service tests");
@@ -672,7 +707,7 @@ pub fn build(b: *std.Build) void {
             false,
         );
         const macos_ui_tests = b.addTest(.{
-            .name = "phantty-macos-ui-test",
+            .name = "wispterm-macos-ui-test",
             .root_module = macos_ui_test_mod,
         });
         apple_sdk.addPaths(b, macos_ui_tests) catch @panic("failed to locate native Apple SDK for macOS UI tests");
@@ -688,7 +723,7 @@ pub fn build(b: *std.Build) void {
             false,
         );
         const macos_menu_tests = b.addTest(.{
-            .name = "phantty-macos-menu-test",
+            .name = "wispterm-macos-menu-test",
             .root_module = macos_menu_test_mod,
         });
         apple_sdk.addPaths(b, macos_menu_tests) catch @panic("failed to locate native Apple SDK for macOS menu tests");
@@ -762,14 +797,14 @@ fn createAppModuleWithRoot(
     app_options.addOption([]const u8, "app_version", app_version);
     app_mod.addOptions("build_options", app_options);
 
-    // Embed user-facing docs so the phantty_docs agent tool can read them at
+    // Embed user-facing docs so the wispterm_docs agent tool can read them at
     // runtime. @embedFile cannot escape src/, so docs/ files are wired in here
-    // as named embed imports consumed by src/phantty_docs.zig.
-    app_mod.addAnonymousImport("phantty_doc_faq", .{ .root_source_file = b.path("docs/faq.md") });
-    app_mod.addAnonymousImport("phantty_doc_configuration", .{ .root_source_file = b.path("docs/configuration.md") });
-    app_mod.addAnonymousImport("phantty_doc_ai_agent", .{ .root_source_file = b.path("docs/ai-agent.md") });
-    app_mod.addAnonymousImport("phantty_doc_file_explorer", .{ .root_source_file = b.path("docs/file-explorer.md") });
-    app_mod.addAnonymousImport("phantty_doc_media", .{ .root_source_file = b.path("docs/media.md") });
+    // as named embed imports consumed by src/wispterm_docs.zig.
+    app_mod.addAnonymousImport("wispterm_doc_faq", .{ .root_source_file = b.path("docs/faq.md") });
+    app_mod.addAnonymousImport("wispterm_doc_configuration", .{ .root_source_file = b.path("docs/configuration.md") });
+    app_mod.addAnonymousImport("wispterm_doc_ai_agent", .{ .root_source_file = b.path("docs/ai-agent.md") });
+    app_mod.addAnonymousImport("wispterm_doc_file_explorer", .{ .root_source_file = b.path("docs/file-explorer.md") });
+    app_mod.addAnonymousImport("wispterm_doc_media", .{ .root_source_file = b.path("docs/media.md") });
 
     // Add ghostty-vt dependency with SIMD disabled for cross-compilation.
     if (b.lazyDependency("ghostty", .{
@@ -802,6 +837,11 @@ fn createAppModuleWithRoot(
     const freetype_dep = b.lazyDependency("freetype", .{
         .target = target,
         .optimize = optimize,
+        // Apple Color Emoji and most modern color-emoji fonts store sbix /
+        // CBDT strikes as PNG; without libpng FreeType reads the strike
+        // metadata but renderGlyph fails to decode the bitmap, leaving
+        // emoji cells blank.
+        .@"enable-libpng" = true,
     });
     if (freetype_dep) |dep| {
         app_mod.addImport("freetype", dep.module("freetype"));
@@ -873,7 +913,7 @@ fn createAppModuleWithRoot(
 
     if (platform.supports_resource_manifest) {
         app_mod.addWin32ResourceFile(.{
-            .file = b.path("assets/phantty.rc"),
+            .file = b.path("assets/wispterm.rc"),
             .include_paths = &.{b.path("assets")},
         });
     }
@@ -902,9 +942,14 @@ fn addMacosAppBundle(
 
     const bundle = b.addWriteFiles();
     _ = bundle.add(macosBundleInfoPlistPath(), macosInfoPlist(b.allocator, app_version));
-    _ = bundle.add("Phantty.app/Contents/PkgInfo", "APPL????");
+    _ = bundle.add("WispTerm.app/Contents/PkgInfo", "APPL????");
     _ = bundle.add(macosBundleResourcesKeepPath(), "");
     _ = bundle.addCopyFile(exe.getEmittedBin(), macosBundleExecutablePath());
+    _ = bundle.addCopyFile(b.path(macosBundleIconSourcePath()), macosBundleIconBundlePath());
+    // Ship the bundled default skills/commands so a packaged .app has them even
+    // before the user populates ~/Library/Application Support. The runtime looks
+    // for these under <exe_dir>/../Resources (see defaultSkillRootPaths).
+    _ = bundle.addCopyDirectory(b.path(macosBundlePluginsSourcePath()), macosBundlePluginsBundlePath(), .{});
 
     const install_bundle = b.addInstallDirectory(.{
         .source_dir = bundle.getDirectory(),
@@ -915,7 +960,7 @@ fn addMacosAppBundle(
         "bash",
         "-c",
         "rm -rf \"$1\"",
-        "phantty-clean-macos-app",
+        "wispterm-clean-macos-app",
         b.getInstallPath(.bin, metadata.bundle_dir),
     });
     install_bundle.step.dependOn(&clean_existing_bundle.step);

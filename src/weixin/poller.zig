@@ -9,13 +9,32 @@ const control_mod = @import("control.zig");
 const reply_progress = @import("reply_progress.zig");
 
 pub const SESSION_EXPIRED_ERRCODE: i64 = -14;
-const AI_REPLY_CHECKPOINTS_MS = [_]u64{ 10_000, 30_000, 60_000, 120_000 };
+/// Elapsed times at which an in-progress AI follow-up pings the user so a slow
+/// task visibly stays alive: 30s, then 2m, 5m, 10m, 20m. The ~30-minute mark is
+/// the context-token window edge, handled by the window-expired resend notice.
+const AI_REPLY_CHECKPOINTS_MS = [_]u64{ 30_000, 120_000, 300_000, 600_000, 1_200_000 };
 const AI_REPLY_POLL_MS: u64 = 1_000;
 const POLL_ERROR_BACKOFF_MS: u64 = 1_000;
 const SHUTDOWN_JOIN_TIMEOUT_MS: u32 = 1500;
+/// The WeChat `context_token` that lets the bot reply to an inbound message is
+/// only valid for ~30 minutes. A reply sent with an expired token is rejected by
+/// the server and the user silently receives nothing — the root cause of "the
+/// bot just stops replying" for slow AI tasks. The follow-up must therefore
+/// finish (or hand back) within this window, regardless of reply_timeout_ms.
+const CONTEXT_TOKEN_WINDOW_MS: u64 = 30 * 60 * 1000;
+/// Send the final answer / progress / resend notice this far before the hard
+/// expiry so it still goes out on a valid token.
+const EXPIRY_NOTICE_MARGIN_MS: u64 = 30 * 1000;
+/// Latest elapsed time at which the follow-up still sends on the original token.
+const AI_REPLY_DEADLINE_MS: u64 = CONTEXT_TOKEN_WINDOW_MS - EXPIRY_NOTICE_MARGIN_MS;
+/// Sent once when the window closes with no final answer: the token is about to
+/// expire, so a fresh inbound message is needed to keep the conversation going.
+const AI_REPLY_WINDOW_EXPIRED_NOTICE = "AI 处理已超过 30 分钟仍未完成，微信回复窗口即将关闭。请重新发送一条消息以继续接收回复。";
 
 pub const RouteResult = struct {
     expect_ai_progress: bool = false,
+    /// true ⇒ cancel any active AI-reply progress streaming (set by /stop).
+    stop_followup: bool = false,
     /// Heap-owned by ProcessInput. Freed after start_progress_fn returns.
     baseline_transcript: []u8 = &.{},
 };
@@ -38,11 +57,21 @@ pub const ProcessInput = struct {
     route_ctx: *anyopaque,
     /// Fills `reply` with the response text; returns true if the caller should
     /// begin AI-reply progress streaming.
-    route_fn: *const fn (ctx: *anyopaque, text: []const u8, allocator: std.mem.Allocator, reply: *std.ArrayListUnmanaged(u8)) anyerror!RouteResult,
+    route_fn: *const fn (
+        ctx: *anyopaque,
+        text: []const u8,
+        to_user_id: []const u8,
+        context_token: []const u8,
+        allocator: std.mem.Allocator,
+        reply: *std.ArrayListUnmanaged(u8),
+    ) anyerror!RouteResult,
     send_ctx: *anyopaque,
     send_fn: *const fn (ctx: *anyopaque, to_user_id: []const u8, text: []const u8, context_token: []const u8) anyerror!void,
     progress_ctx: ?*anyopaque = null,
     start_progress_fn: ?*const fn (ctx: *anyopaque, baseline_transcript: []const u8, to_user_id: []const u8, context_token: []const u8) anyerror!void = null,
+    /// Cancels any active AI-reply progress streaming. Invoked (with progress_ctx)
+    /// when a routed message reports stop_followup (e.g. /stop).
+    stop_progress_fn: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 /// Mirror of processWeixinUpdates: filter, extract, route, reply.
@@ -76,7 +105,7 @@ pub fn processUpdates(input: ProcessInput) !void {
 
         var reply: std.ArrayListUnmanaged(u8) = .empty;
         defer reply.deinit(input.allocator);
-        const route_result = input.route_fn(input.route_ctx, text, input.allocator, &reply) catch |err| {
+        const route_result = input.route_fn(input.route_ctx, text, msg.from_user_id, msg.context_token, input.allocator, &reply) catch |err| {
             std.debug.print("weixin process({d}): index={d} route=failed err={}\n", .{ debugNowMs(), i, err });
             continue;
         };
@@ -85,6 +114,18 @@ pub fn processUpdates(input: ProcessInput) !void {
             "weixin process({d}): index={d} route=done reply_bytes={d} ai_followup={} baseline_bytes={d}\n",
             .{ debugNowMs(), i, reply.items.len, route_result.expect_ai_progress, route_result.baseline_transcript.len },
         );
+
+        // /stop (and any stop_followup route) cancels active reply streaming
+        // before the confirmation reply is sent, so no stale progress/final
+        // reply trails the stop.
+        if (route_result.stop_followup) {
+            if (input.progress_ctx) |ctx| {
+                if (input.stop_progress_fn) |stop| {
+                    std.debug.print("weixin process({d}): index={d} ai_followup=cancel\n", .{ debugNowMs(), i });
+                    stop(ctx);
+                }
+            }
+        }
 
         const trimmed = std.mem.trim(u8, reply.items, " \t\r\n");
         if (trimmed.len != 0) {
@@ -224,10 +265,18 @@ pub const Poller = struct {
             .send_fn = sendAdapter,
             .progress_ctx = self,
             .start_progress_fn = startProgressAdapter,
+            .stop_progress_fn = stopProgressAdapter,
         });
     }
 
-    fn routeAdapter(ctx: *anyopaque, text: []const u8, allocator: std.mem.Allocator, reply: *std.ArrayListUnmanaged(u8)) anyerror!RouteResult {
+    fn routeAdapter(
+        ctx: *anyopaque,
+        text: []const u8,
+        to_user_id: []const u8,
+        context_token: []const u8,
+        allocator: std.mem.Allocator,
+        reply: *std.ArrayListUnmanaged(u8),
+    ) anyerror!RouteResult {
         const self: *Poller = @ptrCast(@alignCast(ctx));
         if (self.stop_requested.load(.acquire)) return error.PollerStopped;
         const baseline = try self.allocTranscriptSnapshot(allocator);
@@ -235,16 +284,34 @@ pub const Poller = struct {
 
         var r = agent.Reply.init(allocator);
         defer r.deinit();
-        try agent.route(allocator, self.control, self.settings, text, &r);
+        const reply_context = types.ReplyContext{
+            .sender = .{ .ctx = self, .send_attachment = pollerSendAttachment },
+            .to_user_id = to_user_id,
+            .context_token = context_token,
+        };
+        try agent.route(allocator, self.control, self.settings, text, reply_context, &r);
         try reply.appendSlice(allocator, r.text.items);
         if (!r.expect_ai_progress) {
             if (baseline.len != 0) allocator.free(baseline);
-            return .{};
+            return .{ .stop_followup = r.stop_followup };
         }
         return .{
             .expect_ai_progress = true,
             .baseline_transcript = baseline,
         };
+    }
+
+    fn pollerSendAttachment(
+        ctx: *anyopaque,
+        kind: types.AttachmentKind,
+        path: []const u8,
+        display_name: []const u8,
+        to_user_id: []const u8,
+        context_token: []const u8,
+    ) anyerror!void {
+        const self: *Poller = @ptrCast(@alignCast(ctx));
+        if (self.stop_requested.load(.acquire)) return error.PollerStopped;
+        try self.client.sendAttachment(kind, path, display_name, to_user_id, context_token);
     }
 
     fn sendAdapter(ctx: *anyopaque, to_user_id: []const u8, text: []const u8, context_token: []const u8) anyerror!void {
@@ -256,6 +323,11 @@ pub const Poller = struct {
     fn startProgressAdapter(ctx: *anyopaque, baseline_transcript: []const u8, to_user_id: []const u8, context_token: []const u8) anyerror!void {
         const self: *Poller = @ptrCast(@alignCast(ctx));
         try self.startAiFollowup(baseline_transcript, to_user_id, context_token);
+    }
+
+    fn stopProgressAdapter(ctx: *anyopaque) void {
+        const self: *Poller = @ptrCast(@alignCast(ctx));
+        self.cancelAiFollowup();
     }
 
     fn getUpdatesLocked(self: *Poller, sync_buf_value: []const u8) !@import("ilink_codec.zig").ParsedUpdates {
@@ -360,14 +432,14 @@ pub const Poller = struct {
             self.allocator.destroy(job);
         }
 
-        const max_checkpoint = AI_REPLY_CHECKPOINTS_MS[AI_REPLY_CHECKPOINTS_MS.len - 1];
-        const deadline_ms = @max(@as(u64, self.settings.reply_timeout_ms), max_checkpoint);
+        var schedule = ProgressSchedule{};
         var elapsed_ms: u64 = 0;
-        var checkpoint_index: usize = 0;
 
+        // Wait for the AI's answer up to the context_token's validity window, not
+        // the old reply_timeout_ms (<= 3 min) cap that abandoned slow tasks.
         while (!self.stop_requested.load(.acquire) and
             self.followup_generation.load(.acquire) == generation and
-            elapsed_ms <= deadline_ms)
+            elapsed_ms < AI_REPLY_DEADLINE_MS)
         {
             std.Thread.sleep(AI_REPLY_POLL_MS * std.time.ns_per_ms);
             elapsed_ms += AI_REPLY_POLL_MS;
@@ -388,21 +460,30 @@ pub const Poller = struct {
                 return;
             }
 
-            if (checkpoint_index < AI_REPLY_CHECKPOINTS_MS.len and elapsed_ms >= AI_REPLY_CHECKPOINTS_MS[checkpoint_index]) {
-                checkpoint_index += 1;
-                if (progress.text.len != 0) {
-                    std.debug.print(
-                        "weixin send({d}): kind=ai_progress generation={d} checkpoint={d} to_len={d} to_hash={x} bytes={d} context={}\n",
-                        .{ debugNowMs(), generation, checkpoint_index, job.to_user_id.len, debugHash(job.to_user_id), progress.text.len, job.context_token.len != 0 },
-                    );
-                    self.sendTextLocked(job.to_user_id, progress.text, job.context_token) catch |err| {
-                        std.debug.print("weixin send({d}): kind=ai_progress generation={d} checkpoint={d} status=failed err={}\n", .{ debugNowMs(), generation, checkpoint_index, err });
-                        continue;
-                    };
-                    std.debug.print("weixin send({d}): kind=ai_progress generation={d} checkpoint={d} status=sent bytes={d}\n", .{ debugNowMs(), generation, checkpoint_index, progress.text.len });
-                }
+            if (schedule.pingDue(elapsed_ms) and progress.text.len != 0) {
+                std.debug.print(
+                    "weixin send({d}): kind=ai_progress generation={d} elapsed_ms={d} to_len={d} to_hash={x} bytes={d} context={}\n",
+                    .{ debugNowMs(), generation, elapsed_ms, job.to_user_id.len, debugHash(job.to_user_id), progress.text.len, job.context_token.len != 0 },
+                );
+                self.sendTextLocked(job.to_user_id, progress.text, job.context_token) catch |err| {
+                    std.debug.print("weixin send({d}): kind=ai_progress generation={d} status=failed err={}\n", .{ debugNowMs(), generation, err });
+                    continue;
+                };
+                std.debug.print("weixin send({d}): kind=ai_progress generation={d} status=sent bytes={d}\n", .{ debugNowMs(), generation, progress.text.len });
             }
         }
+
+        // Reached the window's edge with no final answer (the loop ran out, not a
+        // stop/refresh). The token is about to expire, so prompt the user to send
+        // a fresh message — a silent stop here looks exactly like the old bug.
+        if (self.stop_requested.load(.acquire) or self.followup_generation.load(.acquire) != generation) return;
+        std.debug.print(
+            "weixin send({d}): kind=ai_window_expired generation={d} to_len={d} to_hash={x} context={}\n",
+            .{ debugNowMs(), generation, job.to_user_id.len, debugHash(job.to_user_id), job.context_token.len != 0 },
+        );
+        self.sendTextLocked(job.to_user_id, AI_REPLY_WINDOW_EXPIRED_NOTICE, job.context_token) catch |err| {
+            std.debug.print("weixin send({d}): kind=ai_window_expired generation={d} status=failed err={}\n", .{ debugNowMs(), generation, err });
+        };
     }
 
     fn allocProgressText(self: *Poller, baseline_transcript: []const u8) !struct { done: bool, text: []u8 } {
@@ -428,6 +509,25 @@ fn debugNowMs() i64 {
     return std.time.milliTimestamp();
 }
 
+/// Decides when an AI follow-up should ping progress: a fixed, increasingly
+/// spaced set of checkpoints (30s, 2m, 5m, 10m, 20m). Pure and state-advancing
+/// so each checkpoint fires exactly once; the caller drives it with monotonically
+/// increasing `elapsed_ms` at AI_REPLY_POLL_MS steps. The ~30-minute window edge
+/// is covered separately by the window-expired resend notice.
+const ProgressSchedule = struct {
+    checkpoint_index: usize = 0,
+
+    fn pingDue(self: *ProgressSchedule, elapsed_ms: u64) bool {
+        if (self.checkpoint_index < AI_REPLY_CHECKPOINTS_MS.len and
+            elapsed_ms >= AI_REPLY_CHECKPOINTS_MS[self.checkpoint_index])
+        {
+            self.checkpoint_index += 1;
+            return true;
+        }
+        return false;
+    }
+};
+
 const FollowupJob = struct {
     baseline_transcript: []u8 = &.{},
     to_user_id: []u8 = &.{},
@@ -447,19 +547,27 @@ const codec = @import("ilink_codec.zig");
 const Captured = struct {
     sent: std.ArrayListUnmanaged([]u8) = .empty,
     routed: std.ArrayListUnmanaged([]u8) = .empty,
+    routed_to: std.ArrayListUnmanaged([]u8) = .empty,
+    routed_context: std.ArrayListUnmanaged([]u8) = .empty,
     fn deinit(self: *Captured) void {
         for (self.sent.items) |s| t.allocator.free(s);
         for (self.routed.items) |s| t.allocator.free(s);
+        for (self.routed_to.items) |s| t.allocator.free(s);
+        for (self.routed_context.items) |s| t.allocator.free(s);
         self.sent.deinit(t.allocator);
         self.routed.deinit(t.allocator);
+        self.routed_to.deinit(t.allocator);
+        self.routed_context.deinit(t.allocator);
     }
 };
 
 const RouteCtx = struct {
     cap: *Captured,
-    fn route(ctx: *anyopaque, text: []const u8, allocator: std.mem.Allocator, reply: *std.ArrayListUnmanaged(u8)) anyerror!RouteResult {
+    fn route(ctx: *anyopaque, text: []const u8, to_user_id: []const u8, context_token: []const u8, allocator: std.mem.Allocator, reply: *std.ArrayListUnmanaged(u8)) anyerror!RouteResult {
         const self: *RouteCtx = @ptrCast(@alignCast(ctx));
         try self.cap.routed.append(t.allocator, try t.allocator.dupe(u8, text));
+        try self.cap.routed_to.append(t.allocator, try t.allocator.dupe(u8, to_user_id));
+        try self.cap.routed_context.append(t.allocator, try t.allocator.dupe(u8, context_token));
         try reply.appendSlice(allocator, "ok");
         return .{};
     }
@@ -476,6 +584,7 @@ const SendCtx = struct {
 
 const ProgressCtx = struct {
     started: bool = false,
+    stopped: bool = false,
     baseline: std.ArrayListUnmanaged(u8) = .empty,
     to_user_id: std.ArrayListUnmanaged(u8) = .empty,
     context_token: std.ArrayListUnmanaged(u8) = .empty,
@@ -493,6 +602,11 @@ const ProgressCtx = struct {
         try self.to_user_id.appendSlice(t.allocator, to_user_id);
         try self.context_token.appendSlice(t.allocator, context_token);
     }
+
+    fn stop(ctx: *anyopaque) void {
+        const self: *ProgressCtx = @ptrCast(@alignCast(ctx));
+        self.stopped = true;
+    }
 };
 
 const FakeClient = struct {
@@ -503,6 +617,7 @@ const FakeClient = struct {
         return .{ .ctx = self, .vtable = &.{
             .get_updates = getUpdates,
             .send_text = sendText,
+            .send_attachment = sendAttachment,
         } };
     }
 
@@ -519,6 +634,17 @@ const FakeClient = struct {
     fn sendText(ctx: *anyopaque, _: []const u8, _: []const u8, _: []const u8) anyerror!void {
         const self: *FakeClient = @ptrCast(@alignCast(ctx));
         self.send_count += 1;
+    }
+
+    fn sendAttachment(
+        ctx: *anyopaque,
+        _: types.AttachmentKind,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+    ) anyerror!void {
+        _ = ctx;
     }
 };
 
@@ -549,7 +675,7 @@ const NoopControl = struct {
     fn openAiAgent(_: *anyopaque, _: u32) control_mod.OpenResult {
         return .offline;
     }
-    fn sendInput(_: *anyopaque, _: [16]u8, _: []const u8) bool {
+    fn sendInput(_: *anyopaque, _: [16]u8, _: []const u8, _: ?types.ReplyContext) bool {
         return false;
     }
     fn latestTranscript(_: *anyopaque) []const u8 {
@@ -592,13 +718,15 @@ test "processUpdates routes accepted text and sends replies" {
 
     try t.expectEqual(@as(usize, 1), cap.routed.items.len);
     try t.expectEqualStrings("hi", cap.routed.items[0]);
+    try t.expectEqualStrings("u1", cap.routed_to.items[0]);
+    try t.expectEqualStrings("c", cap.routed_context.items[0]);
     try t.expectEqual(@as(usize, 1), cap.sent.items.len);
     try t.expectEqualStrings("ok", cap.sent.items[0]);
 }
 
 test "processUpdates starts AI followup after ack reply is sent" {
     const Route = struct {
-        fn route(_: *anyopaque, _: []const u8, allocator: std.mem.Allocator, reply: *std.ArrayListUnmanaged(u8)) anyerror!RouteResult {
+        fn route(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, allocator: std.mem.Allocator, reply: *std.ArrayListUnmanaged(u8)) anyerror!RouteResult {
             try reply.appendSlice(allocator, "ack");
             return .{
                 .expect_ai_progress = true,
@@ -637,6 +765,70 @@ test "processUpdates starts AI followup after ack reply is sent" {
     try t.expectEqualStrings("ctx", pctx.context_token.items);
 }
 
+test "processUpdates routes inbound voice transcript as message text" {
+    var cap = Captured{};
+    defer cap.deinit();
+    var rctx = RouteCtx{ .cap = &cap };
+    var sctx = SendCtx{ .cap = &cap };
+
+    const msgs = [_]types.Message{
+        .{ .from_user_id = "u1", .context_token = "voice-ctx", .item_list = &.{.{ .type = 3, .voice_text = "transcribed command" }} },
+    };
+
+    try processUpdates(.{
+        .allocator = t.allocator,
+        .owner = "u1",
+        .account_id = "",
+        .messages = &msgs,
+        .route_ctx = &rctx,
+        .route_fn = RouteCtx.route,
+        .send_ctx = &sctx,
+        .send_fn = SendCtx.send,
+    });
+
+    try t.expectEqual(@as(usize, 1), cap.routed.items.len);
+    try t.expectEqualStrings("transcribed command", cap.routed.items[0]);
+    try t.expectEqualStrings("u1", cap.routed_to.items[0]);
+    try t.expectEqualStrings("voice-ctx", cap.routed_context.items[0]);
+}
+
+test "processUpdates cancels AI followup when a routed message reports stop_followup" {
+    const Route = struct {
+        fn route(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, allocator: std.mem.Allocator, reply: *std.ArrayListUnmanaged(u8)) anyerror!RouteResult {
+            try reply.appendSlice(allocator, "已发送停止指令。");
+            return .{ .stop_followup = true };
+        }
+    };
+    var cap = Captured{};
+    defer cap.deinit();
+    var sctx = SendCtx{ .cap = &cap };
+    var pctx = ProgressCtx{};
+    defer pctx.deinit();
+    var route_ctx: u8 = 0;
+
+    const msgs = [_]types.Message{
+        .{ .from_user_id = "u1", .context_token = "ctx", .item_list = &.{.{ .type = 1, .text = "/stop" }} },
+    };
+
+    try processUpdates(.{
+        .allocator = t.allocator,
+        .owner = "u1",
+        .account_id = "",
+        .messages = &msgs,
+        .route_ctx = &route_ctx,
+        .route_fn = Route.route,
+        .send_ctx = &sctx,
+        .send_fn = SendCtx.send,
+        .progress_ctx = &pctx,
+        .start_progress_fn = ProgressCtx.start,
+        .stop_progress_fn = ProgressCtx.stop,
+    });
+
+    try t.expect(pctx.stopped);
+    try t.expect(!pctx.started);
+    try t.expectEqualStrings("已发送停止指令。", cap.sent.items[0]);
+}
+
 test "poller bootstrap advances cursor without replying to historical messages" {
     var fake = FakeClient{};
     var sync = SyncCapture{};
@@ -662,4 +854,39 @@ test "poller bootstrap advances cursor without replying to historical messages" 
     try t.expect(!p.bootstrap_skip_pending);
     try t.expectEqualStrings("NEXT", p.sync_buf);
     try t.expectEqualStrings("NEXT", sync.value.items);
+}
+
+test "ai reply window extends to the 30-minute context-token validity with a resend margin" {
+    // The bug: replies were abandoned after deadline = max(reply_timeout_ms, 120s)
+    // <= 180s, so any AI task slower than ~3 minutes never delivered its answer.
+    // The real ceiling is the WeChat context_token validity (~30 minutes).
+    try t.expectEqual(@as(u64, 30 * 60 * 1000), CONTEXT_TOKEN_WINDOW_MS);
+    // We keep waiting (and can deliver a final answer) far beyond the old cap.
+    try t.expect(AI_REPLY_DEADLINE_MS > 180_000);
+    try t.expect(AI_REPLY_DEADLINE_MS >= 25 * 60 * 1000);
+    // The resend notice still goes out on a valid token, before the hard expiry.
+    try t.expect(AI_REPLY_DEADLINE_MS < CONTEXT_TOKEN_WINDOW_MS);
+    try t.expectEqual(CONTEXT_TOKEN_WINDOW_MS - EXPIRY_NOTICE_MARGIN_MS, AI_REPLY_DEADLINE_MS);
+}
+
+test "progress schedule pings at increasingly spaced checkpoints up to the window edge" {
+    var sched = ProgressSchedule{};
+    var pings: std.ArrayListUnmanaged(u64) = .empty;
+    defer pings.deinit(t.allocator);
+
+    var elapsed_ms: u64 = 0;
+    while (elapsed_ms < AI_REPLY_DEADLINE_MS) {
+        elapsed_ms += AI_REPLY_POLL_MS;
+        if (sched.pingDue(elapsed_ms)) try pings.append(t.allocator, elapsed_ms);
+    }
+
+    // Exactly the fixed cadence: 30s, 2m, 5m, 10m, 20m — each fires once and
+    // there is no extra heartbeat beyond the last checkpoint.
+    const expected = [_]u64{ 30_000, 120_000, 300_000, 600_000, 1_200_000 };
+    try t.expectEqual(expected.len, pings.items.len);
+    for (expected, pings.items) |want, got| try t.expectEqual(want, got);
+    // The ~30-minute window edge is handled by the resend notice, not a ping, so
+    // every checkpoint still lands well before the send deadline.
+    const last = pings.items[pings.items.len - 1];
+    try t.expect(last < AI_REPLY_DEADLINE_MS);
 }

@@ -5,6 +5,7 @@
 //! OpenGL context, fonts, and terminal state.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Config = @import("config.zig");
 const AppWindow = @import("AppWindow.zig");
 const ai_chat = @import("ai_chat.zig");
@@ -23,6 +24,7 @@ const platform_dirs = @import("platform/dirs.zig");
 const platform_open_url = @import("platform/open_url.zig");
 const update_check = @import("update_check.zig");
 const update_install = @import("update_install.zig");
+const skill_update = @import("skill_update.zig");
 
 const App = @This();
 
@@ -72,6 +74,7 @@ copy_on_select: bool,
 right_click_action: Config.RightClickAction,
 url_open_mode: Config.UrlOpenMode,
 ssh_legacy_algorithms: bool,
+weixin_notify_forward: bool,
 
 // Background image
 background_image: ?[]const u8,
@@ -86,7 +89,7 @@ remote_device_name: ?[]const u8,
 remote_session_key: ?[]const u8,
 remote_client: ?*remote.Client,
 
-// WeChat direct (embedded ilink). Mutually exclusive with remote_client.
+// WeChat direct (embedded ilink). Independent from the remote relay client.
 weixin_controller: ?*weixin.Controller,
 
 // AI agent config
@@ -119,6 +122,9 @@ update_check_in_flight: bool,
 download_thread: ?std.Thread,
 download_in_flight: bool,
 download_worker_running: bool,
+skill_update_thread: ?std.Thread,
+skill_update_in_flight: bool,
+skill_update_result: skill_update.Outcome,
 startup_update_check_started: bool,
 
 // Window management
@@ -200,9 +206,9 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !App {
         .title = title,
         .quake_mode = cfg.@"quake-mode",
         .keybinds = cfg.keybinds,
-        .debug_fps = cfg.@"phantty-debug-fps",
-        .debug_draw_calls = cfg.@"phantty-debug-draw-calls",
-        .debug_memory = cfg.@"phantty-debug-memory",
+        .debug_fps = cfg.@"wispterm-debug-fps",
+        .debug_draw_calls = cfg.@"wispterm-debug-draw-calls",
+        .debug_memory = cfg.@"wispterm-debug-memory",
         .unfocused_split_opacity = cfg.@"unfocused-split-opacity",
         .split_divider_color = cfg.@"split-divider-color",
         .focus_follows_mouse = cfg.@"focus-follows-mouse",
@@ -210,6 +216,7 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !App {
         .right_click_action = cfg.@"right-click-action",
         .url_open_mode = cfg.@"url-open-mode",
         .ssh_legacy_algorithms = cfg.@"ssh-legacy-algorithms",
+        .weixin_notify_forward = cfg.@"weixin-notify-forward",
         .background_image = background_image,
         .background_opacity = cfg.@"background-opacity",
         .background_image_mode = cfg.@"background-image-mode",
@@ -246,6 +253,9 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !App {
         .download_thread = null,
         .download_in_flight = false,
         .download_worker_running = false,
+        .skill_update_thread = null,
+        .skill_update_in_flight = false,
+        .skill_update_result = .{ .state = .idle },
         .startup_update_check_started = false,
         .windows = .empty,
         .mutex = .{},
@@ -291,15 +301,10 @@ fn startRemoteClient(
 // WeChat here). /term-/keys terminal delegation and the AI transcript (for
 // reply-progress streaming) remain stubbed in AppWindow — see its TODOs.
 
-/// Creates and starts the WeChat direct controller when enabled and remote is
-/// not active. Call once, after App is at its final address (see main.zig).
-/// Mutually exclusive with remote: if remote is active, this is skipped.
+/// Creates and starts the WeChat direct controller when enabled. Call once,
+/// after App is at its final address (see main.zig).
 pub fn startWeixin(self: *App, cfg: *const Config) void {
     if (!cfg.@"weixin-direct-enabled") return;
-    if (self.remote_client != null) {
-        std.debug.print("weixin-direct disabled: remote-enabled takes precedence\n", .{});
-        return;
-    }
     const state_path = platform_dirs.pathInConfigDir(self.allocator, "weixin.json") catch return;
     defer self.allocator.free(state_path);
 
@@ -367,9 +372,9 @@ pub fn updateConfig(self: *App, cfg: *const Config) void {
     self.replaceOptStr(&self.shader_path, cfg.@"custom-shader");
     self.initial_cols = if (cfg.@"window-width" > 0) cfg.@"window-width" else 80;
     self.initial_rows = if (cfg.@"window-height" > 0) cfg.@"window-height" else 24;
-    self.debug_fps = cfg.@"phantty-debug-fps";
-    self.debug_draw_calls = cfg.@"phantty-debug-draw-calls";
-    self.debug_memory = cfg.@"phantty-debug-memory";
+    self.debug_fps = cfg.@"wispterm-debug-fps";
+    self.debug_draw_calls = cfg.@"wispterm-debug-draw-calls";
+    self.debug_memory = cfg.@"wispterm-debug-memory";
     self.unfocused_split_opacity = cfg.@"unfocused-split-opacity";
     self.split_divider_color = cfg.@"split-divider-color";
     self.focus_follows_mouse = cfg.@"focus-follows-mouse";
@@ -377,6 +382,7 @@ pub fn updateConfig(self: *App, cfg: *const Config) void {
     self.right_click_action = cfg.@"right-click-action";
     self.url_open_mode = cfg.@"url-open-mode";
     self.ssh_legacy_algorithms = cfg.@"ssh-legacy-algorithms";
+    self.weixin_notify_forward = cfg.@"weixin-notify-forward";
     self.replaceOptStr(&self.background_image, cfg.@"background-image");
     self.background_opacity = cfg.@"background-opacity";
     self.background_image_mode = cfg.@"background-image-mode";
@@ -666,6 +672,64 @@ fn joinFinishedDownloadThread(self: *App) void {
     if (thread) |t| t.join();
 }
 
+fn joinFinishedSkillUpdateThread(self: *App) void {
+    var thread: ?std.Thread = null;
+    {
+        self.update_mutex.lock();
+        defer self.update_mutex.unlock();
+        if (!self.skill_update_in_flight and self.skill_update_thread != null) {
+            thread = self.skill_update_thread;
+            self.skill_update_thread = null;
+        }
+    }
+    if (thread) |t| t.join();
+}
+
+pub fn requestSkillUpdate(self: *App) void {
+    self.joinFinishedSkillUpdateThread();
+
+    {
+        self.update_mutex.lock();
+        defer self.update_mutex.unlock();
+        if (self.skill_update_in_flight) return;
+        self.skill_update_in_flight = true;
+        self.skill_update_result = .{ .state = .downloading };
+    }
+
+    const thread = std.Thread.spawn(.{}, skillUpdateThreadMain, .{self}) catch |err| {
+        std.debug.print("Skill update: failed to spawn thread: {}\n", .{err});
+        self.update_mutex.lock();
+        defer self.update_mutex.unlock();
+        self.skill_update_in_flight = false;
+        self.skill_update_result = .{ .state = .failed };
+        return;
+    };
+
+    self.update_mutex.lock();
+    defer self.update_mutex.unlock();
+    self.skill_update_thread = thread;
+}
+
+fn skillUpdateThreadMain(app: *App) void {
+    const outcome = skill_update.downloadAndInstall(app.allocator);
+    app.update_mutex.lock();
+    defer app.update_mutex.unlock();
+    app.skill_update_result = outcome;
+    app.skill_update_in_flight = false;
+}
+
+/// Returns the latest skill-update outcome and resets it to idle. While a
+/// download is still running this returns `.downloading` without resetting.
+pub fn consumeSkillUpdateResult(self: *App) skill_update.Outcome {
+    self.update_mutex.lock();
+    defer self.update_mutex.unlock();
+
+    const result = self.skill_update_result;
+    if (result.state == .idle or result.state == .downloading) return result;
+    self.skill_update_result = .{ .state = .idle };
+    return result;
+}
+
 fn joinFinishedUpdateThread(self: *App) void {
     var thread: ?std.Thread = null;
     {
@@ -701,28 +765,57 @@ fn joinDownloadThread(self: *App) void {
     if (thread) |t| t.join();
 }
 
+fn joinSkillUpdateThread(self: *App) void {
+    var thread: ?std.Thread = null;
+    {
+        self.update_mutex.lock();
+        defer self.update_mutex.unlock();
+        thread = self.skill_update_thread;
+        self.skill_update_thread = null;
+    }
+    if (thread) |t| t.join();
+}
+
 // ============================================================================
 // Window Management
 // ============================================================================
 
 /// Run the first window on the main thread. Blocks until that window closes.
 /// After returning, waits for all spawned window threads to finish.
+///
+/// On macOS the close-button no longer terminates the process (matches
+/// Terminal.app / VS Code). After the first window closes the main thread
+/// enters an idle pump loop:
+///   * Dock-icon reopen → spawn a fresh window on a new thread (so all
+///     thread-local globals — font atlas, glyph cache, UI flags — start
+///     from their declared defaults instead of inheriting stale state from
+///     the previous main-thread session).
+///   * cmd+Q / app-menu Quit → drain the quit flag and tear down.
 pub fn run(self: *App) !void {
-    // Create and run the first window on the main thread
+    try self.runFirstWindowOnce();
+
+    if (builtin.os.tag == .macos) {
+        self.macIdleUntilQuit();
+    }
+
+    // Wait for all spawned window threads to finish
+    self.joinAllWindowThreads();
+}
+
+/// Construct and run a first-window on the main thread (one window session).
+/// Adds to / removes from the global window list around the run call.
+fn runFirstWindowOnce(self: *App) !void {
     var first_window = try AppWindow.init(self.allocator, self);
     defer first_window.deinit();
 
-    // Add to window list
     {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.windows.append(self.allocator, &first_window);
     }
 
-    // Run blocks until window closes
     first_window.run();
 
-    // Remove from list
     {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -733,9 +826,29 @@ pub fn run(self: *App) !void {
             }
         }
     }
+}
 
-    // Wait for all spawned window threads to finish
-    self.joinAllWindowThreads();
+/// macOS-only: main-thread idle loop that runs once the initial first-window
+/// has returned. Pumps NSApp events so AppDelegate callbacks (reopen,
+/// terminate) fire, and either spawns a fresh window on a worker thread when
+/// the user clicks the Dock icon or returns when quit is requested.
+fn macIdleUntilQuit(self: *App) void {
+    while (true) {
+        // Block (up to 250ms) waiting for the next AppKit event. The blocking
+        // wait keeps the main run loop alive, which is what drains the GCD
+        // main queue used by wispterm_macos_run_on_main(). Without it, worker
+        // threads calling setContentSize/setFrame/etc would deadlock waiting
+        // for the main thread to come back from std.Thread.sleep().
+        window_backend.pumpAppEvents(0.25);
+
+        if (window_backend.consumeQuitRequest()) return;
+        if (window_backend.consumeReopenRequest()) {
+            // Spawn on a worker thread (same code path as Ctrl+Shift+N) so
+            // thread-local globals start fresh. Main thread keeps idling so
+            // it can pump AppKit and respond to the next reopen/quit.
+            self.requestNewWindow(null, null);
+        }
+    }
 }
 
 /// Request a new window to be spawned on a separate thread.
@@ -884,6 +997,7 @@ pub fn deinit(self: *App) void {
     self.joinAllWindowThreads();
     self.joinUpdateThread();
     self.joinDownloadThread();
+    self.joinSkillUpdateThread();
 
     if (self.remote_client) |client| {
         client.destroy();
@@ -936,6 +1050,37 @@ test "app: updateConfig refreshes configured shell command" {
     const expected_len = platform_pty_command.resolveShellCommandLine(&expected_buf, next_shell);
     const CommandUnit = @TypeOf(expected_buf[0]);
     try testing.expectEqualSlices(CommandUnit, expected_buf[0..expected_len], app.getShellCmd());
+}
+
+test "app: WeChat direct can start while remote client is active" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const config_dir = try std.fs.path.join(allocator, &.{ tmp_root, "config" });
+    defer allocator.free(config_dir);
+
+    platform_dirs.setTestConfigDirForCurrentThread(config_dir);
+    defer platform_dirs.clearTestConfigDirForCurrentThread();
+    try tmp.dir.makePath("config");
+
+    const cfg = Config{
+        .@"remote-enabled" = true,
+        .@"weixin-direct-enabled" = true,
+    };
+    var app = try App.init(allocator, cfg);
+    defer app.deinit();
+
+    app.remote_client = @ptrFromInt(@as(usize, 0x1000));
+    defer app.remote_client = null;
+
+    app.startWeixin(&cfg);
+
+    try testing.expect(app.weixin_controller != null);
 }
 
 test "app: pending download snapshot remains stable when update buffers change" {

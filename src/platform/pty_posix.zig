@@ -39,6 +39,9 @@ extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname_r(fd: c_int, buf: [*]u8, buflen: usize) c_int;
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 /// Raw `_exit(2)` — used in the forked child so we never run libc `atexit`
 /// handlers or flush stdio buffers inherited from the parent.
 extern "c" fn _exit(code: c_int) noreturn;
@@ -300,7 +303,26 @@ fn childExec(
 
     if (cwd) |dir| {
         _ = c.chdir(dir);
+    } else if (getenv("HOME")) |home| {
+        // No explicit cwd — match Terminal.app/Ghostty and land in $HOME so
+        // .app bundle launches (whose cwd is "/") don't drop the user at the
+        // filesystem root. Falls through to inherited cwd if HOME is unset.
+        _ = c.chdir(home);
     }
+
+    // GUI-launched apps on macOS inherit a minimal environment from launchd, so
+    // TERM is usually unset. Without it, shells fall back to "dumb" or other
+    // limited profiles — Starship rendered a stub prompt, zsh-autosuggestions
+    // miscalculated redraw widths, and line-edit redraws left stale glyphs on
+    // screen. xterm-256color is the most broadly supported terminfo entry and
+    // matches the SGR / cursor-control set our ghostty-vt parser implements.
+    _ = setenv("TERM", "xterm-256color", 1);
+    _ = setenv("COLORTERM", "truecolor", 1);
+    _ = setenv("TERM_PROGRAM", "wispterm", 1);
+    // Some shells refuse to load completions when TERMINFO points at a value
+    // that doesn't exist for our TERM choice. Clearing it lets ncurses fall
+    // back to the system database.
+    _ = unsetenv("TERMINFO");
 
     // Parse command line into argv (split on ASCII whitespace).
     var arg_storage: [ARG_BUF]u8 = undefined;
@@ -309,9 +331,42 @@ fn childExec(
     if (argc == 0) _exit(127);
     argv[argc] = null;
 
-    _ = execvp(argv[0].?, @ptrCast(&argv));
+    // On macOS, follow the Terminal.app/iTerm/Ghostty convention of starting
+    // the user's shell as a login shell so /etc/zprofile (path_helper) and
+    // ~/.zprofile run — without this the child inherits a PATH that lacks
+    // /opt/homebrew/bin, etc. We do this by prefixing argv[0] with '-' (the
+    // historical BSD signal) while keeping execvp's lookup name unchanged.
+    // Only applied when argv[0]'s basename names a known interactive shell,
+    // so explicit-command tabs, SSH, and WSL launches are unaffected.
+    const exec_target = argv[0].?;
+    var login_argv0: [32]u8 = undefined;
+    if (builtin.os.tag == .macos) {
+        const arg0 = std.mem.sliceTo(exec_target, 0);
+        if (shellBasenameForLogin(arg0)) |base| {
+            if (1 + base.len + 1 <= login_argv0.len) {
+                login_argv0[0] = '-';
+                @memcpy(login_argv0[1 .. 1 + base.len], base);
+                login_argv0[1 + base.len] = 0;
+                argv[0] = @ptrCast(&login_argv0[0]);
+            }
+        }
+    }
+
+    _ = execvp(exec_target, @ptrCast(&argv));
     // execvp only returns on failure.
     _exit(127);
+}
+
+/// Returns the basename of `arg0` when it names a known interactive shell,
+/// otherwise null. Used to decide whether to start the child as a login shell.
+fn shellBasenameForLogin(arg0: []const u8) ?[]const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, arg0, '/');
+    const base = if (slash) |idx| arg0[idx + 1 ..] else arg0;
+    const known = [_][]const u8{ "zsh", "bash", "sh", "fish", "dash", "tcsh", "ksh" };
+    for (known) |name| {
+        if (std.mem.eql(u8, base, name)) return base;
+    }
+    return null;
 }
 
 /// Splits `command_line` on ASCII whitespace into NUL-terminated argv entries
@@ -349,6 +404,16 @@ fn parseArgv(
 
 const backend_facade = @import("pty.zig");
 
+test "shellBasenameForLogin recognises known interactive shells" {
+    try std.testing.expectEqualStrings("zsh", shellBasenameForLogin("zsh").?);
+    try std.testing.expectEqualStrings("zsh", shellBasenameForLogin("/bin/zsh").?);
+    try std.testing.expectEqualStrings("bash", shellBasenameForLogin("/usr/local/bin/bash").?);
+    try std.testing.expectEqualStrings("fish", shellBasenameForLogin("/opt/homebrew/bin/fish").?);
+    try std.testing.expect(shellBasenameForLogin("ssh") == null);
+    try std.testing.expect(shellBasenameForLogin("/usr/bin/ssh") == null);
+    try std.testing.expect(shellBasenameForLogin("/bin/echo") == null);
+}
+
 test "posix backend selected for linux + macos; bsd/wasi unsupported" {
     try std.testing.expectEqual(backend_facade.Backend.posix, backend_facade.backendForOs(.linux));
     try std.testing.expectEqual(backend_facade.Backend.posix, backend_facade.backendForOs(.macos));
@@ -377,7 +442,7 @@ test "spawn child writes output that readOutput receives" {
     var command: pty_command.Command = .{};
     defer command.deinit();
 
-    try pty.startCommand(&command, "/bin/echo phantty-marker", null);
+    try pty.startCommand(&command, "/bin/echo wispterm-marker", null);
 
     var buf: [4096]u8 = undefined;
     var collected: std.ArrayListUnmanaged(u8) = .empty;
@@ -394,7 +459,7 @@ test "spawn child writes output that readOutput receives" {
         };
         if (n == 0) break;
         try collected.appendSlice(std.testing.allocator, buf[0..n]);
-        if (std.mem.indexOf(u8, collected.items, "phantty-marker") != null) {
+        if (std.mem.indexOf(u8, collected.items, "wispterm-marker") != null) {
             saw_marker = true;
             break;
         }
@@ -454,7 +519,7 @@ test "outputAvailable returns a byte count after child writes" {
     var command: pty_command.Command = .{};
     defer command.deinit();
 
-    try pty.startCommand(&command, "/bin/echo phantty-avail", null);
+    try pty.startCommand(&command, "/bin/echo wispterm-avail", null);
 
     // Wait (bounded) until the kernel reports bytes available on the master.
     var iterations: usize = 0;

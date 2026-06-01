@@ -177,9 +177,13 @@ pub fn resolveTerminalPreviewPath(allocator: std.mem.Allocator, surface: *Surfac
             if (std.fs.path.isAbsolute(path) or (path.len >= 2 and path[1] == ':')) {
                 break :blk try allocator.dupe(u8, path);
             }
-            const cwd = surface.getInitialCwd() orelse {
+            // Resolve relative to the shell's CURRENT cwd, not its launch cwd:
+            // the user may have `cd`'d, and shells like zsh don't emit OSC 7,
+            // so we fall back to a live process-cwd query (see dupeCurrentCwd).
+            const cwd = surface.dupeCurrentCwd(allocator) orelse {
                 break :blk try allocator.dupe(u8, path);
             };
+            defer allocator.free(cwd);
             break :blk try std.fs.path.join(allocator, &.{ cwd, path });
         },
     };
@@ -190,7 +194,7 @@ pub fn readTerminalPreviewSource(allocator: std.mem.Allocator, surface: *Surface
         .wsl => readWslPreviewSource(allocator, path, markdown_preview.MAX_SOURCE_BYTES),
         .ssh => blk: {
             const conn = surface.ssh_connection orelse {
-                std.debug.print("Markdown preview over SSH needs Phantty SSH connection metadata; manual ssh sessions are not supported yet\n", .{});
+                std.debug.print("Markdown preview over SSH needs WispTerm SSH connection metadata; manual ssh sessions are not supported yet\n", .{});
                 return error.PreviewFailed;
             };
             break :blk try readSshPreviewSource(allocator, &conn, path, markdown_preview.MAX_SOURCE_BYTES);

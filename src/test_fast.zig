@@ -23,6 +23,7 @@ test {
     _ = @import("input/command_dispatch.zig");
     _ = @import("input/click_tracker.zig");
     _ = @import("input/hit_test.zig");
+    _ = @import("input/mouse_report.zig");
     _ = @import("command_palette_model.zig");
     _ = @import("command_center_state.zig");
     _ = @import("config.zig");
@@ -39,10 +40,25 @@ test {
     _ = @import("sync_output.zig");
     _ = @import("agent_history.zig");
     _ = @import("render_diagnostics.zig");
+    _ = @import("notification.zig");
     _ = @import("renderer/gpu/backend.zig");
     _ = @import("renderer/cell_geometry.zig");
     _ = @import("renderer/titlebar_layout.zig");
     _ = @import("ai_chat_layout.zig");
+    _ = @import("ai_sidebar.zig");
     _ = @import("appwindow/flush_scheduler.zig");
     _ = @import("ai_chat_protocol.zig");
+    _ = @import("weixin/types.zig");
+    _ = @import("weixin/ilink_codec.zig");
+    _ = @import("weixin/ilink_client.zig");
+    _ = @import("weixin/media.zig");
+    _ = @import("weixin/binding.zig");
+    _ = @import("ai_chat_title.zig");
+    _ = @import("command_registry.zig");
+    // Generic POSIX SSH/WSL command builder: asserts native (non-Windows)
+    // command-line shapes, so it runs here rather than in test-full's Windows
+    // cross-compile path. (The Windows backend stays in test-full.)
+    if (@import("builtin").os.tag != .windows) {
+        _ = @import("platform/pty_command_unsupported.zig");
+    }
 }

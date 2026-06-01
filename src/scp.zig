@@ -73,8 +73,8 @@ pub fn transferWithControl(allocator: std.mem.Allocator, conn: *const SshConnect
         if (env_map) |*map| {
             map.put("SSH_ASKPASS", askpass_path.?) catch return .spawn_error;
             map.put("SSH_ASKPASS_REQUIRE", "force") catch return .spawn_error;
-            map.put("DISPLAY", "phantty") catch return .spawn_error;
-            map.put("PHANTTY_SSH_PASSWORD", conn.password()) catch return .spawn_error;
+            map.put("DISPLAY", "wispterm") catch return .spawn_error;
+            map.put("WISPTERM_SSH_PASSWORD", conn.password()) catch return .spawn_error;
         }
     }
 
@@ -221,8 +221,8 @@ pub fn sshExec(allocator: std.mem.Allocator, conn: *const SshConnection, command
         if (env_map) |*map| {
             map.put("SSH_ASKPASS", askpass_path.?) catch return null;
             map.put("SSH_ASKPASS_REQUIRE", "force") catch return null;
-            map.put("DISPLAY", "phantty") catch return null;
-            map.put("PHANTTY_SSH_PASSWORD", conn.password()) catch return null;
+            map.put("DISPLAY", "wispterm") catch return null;
+            map.put("WISPTERM_SSH_PASSWORD", conn.password()) catch return null;
         }
     }
 
@@ -250,10 +250,15 @@ pub fn sshExec(allocator: std.mem.Allocator, conn: *const SshConnection, command
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    // Capture stderr so a failed remote exec surfaces the real ssh error
+    // (auth failure, host key, timeout) instead of a silent null.
+    child.stderr_behavior = .Pipe;
     if (env_map) |*map| child.env_map = map;
     child.create_no_window = true;
-    child.spawn() catch return null;
+    child.spawn() catch |err| {
+        std.debug.print("sshExec: spawn failed: {}\n", .{err});
+        return null;
+    };
 
     // Read stdout
     var output: std.ArrayListUnmanaged(u8) = .empty;
@@ -270,12 +275,26 @@ pub fn sshExec(allocator: std.mem.Allocator, conn: *const SshConnection, command
         output.appendSlice(allocator, buf[0..n]) catch break;
     }
 
+    var stderr_text: std.ArrayListUnmanaged(u8) = .empty;
+    defer stderr_text.deinit(allocator);
+    if (child.stderr) |stderr| {
+        var errbuf: [1024]u8 = undefined;
+        while (true) {
+            const n = stderr.read(&errbuf) catch break;
+            if (n == 0) break;
+            stderr_text.appendSlice(allocator, errbuf[0..n]) catch break;
+        }
+    }
+
     const term = child.wait() catch return null;
     const ok = switch (term) {
         .Exited => |code| code == 0,
         else => false,
     };
-    if (!ok) return null;
+    if (!ok) {
+        std.debug.print("sshExec: ssh exited non-zero (term={any}); stderr: {s}\n", .{ term, stderr_text.items });
+        return null;
+    }
 
     return output.toOwnedSlice(allocator) catch null;
 }
@@ -432,6 +451,10 @@ fn sshStreamUpload(
             };
         }
         in.close();
+        // child.stdin still owns the same fd; nulling it prevents
+        // Child.cleanupStreams from closing it again during wait() and
+        // crashing on EBADF (Zig's posix.close treats EBADF as unreachable).
+        child.stdin = null;
     } else {
         write_ok = false;
     }
@@ -616,7 +639,7 @@ fn sshControlPathOption(allocator: std.mem.Allocator) ?[]u8 {
     for (trimmed) |ch| {
         normalized.append(allocator, if (ch == '\\') '/' else ch) catch return null;
     }
-    normalized.appendSlice(allocator, "/phantty-ssh-%C") catch return null;
+    normalized.appendSlice(allocator, "/wispterm-ssh-%C") catch return null;
     return normalized.toOwnedSlice(allocator) catch null;
 }
 
@@ -730,11 +753,11 @@ test "appendSshOptions with control path" {
     conn.port_len = 0;
 
     var argv_buf: [32][]const u8 = undefined;
-    const argc = appendSshOptions(&argv_buf, 0, &conn, .ssh, "ControlPath=C:/Temp/phantty-ssh-%C");
+    const argc = appendSshOptions(&argv_buf, 0, &conn, .ssh, "ControlPath=C:/Temp/wispterm-ssh-%C");
     try std.testing.expectEqual(@as(usize, 12), argc);
     try std.testing.expectEqualStrings("ControlMaster=auto", argv_buf[7]);
     try std.testing.expectEqualStrings("ControlPersist=10m", argv_buf[9]);
-    try std.testing.expectEqualStrings("ControlPath=C:/Temp/phantty-ssh-%C", argv_buf[11]);
+    try std.testing.expectEqualStrings("ControlPath=C:/Temp/wispterm-ssh-%C", argv_buf[11]);
 }
 
 test "appendSshOptions includes legacy algorithms when enabled" {

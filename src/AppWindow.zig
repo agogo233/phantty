@@ -18,6 +18,7 @@ const Renderer = @import("renderer/Renderer.zig");
 const remote = @import("remote_client.zig");
 const remote_snapshot = @import("remote_snapshot.zig");
 const weixin_control = @import("weixin/control.zig");
+const weixin_types = @import("weixin/types.zig");
 const memory_debug = @import("memory_debug.zig");
 const agent_detector = @import("agent_detector.zig");
 const agent_history = @import("agent_history.zig");
@@ -28,6 +29,7 @@ const platform_file_dialog = @import("platform/file_dialog.zig");
 const platform_global_hotkey = @import("platform/global_hotkey.zig");
 const platform_menu = @import("platform/menu.zig");
 const platform_notifications = @import("platform/notifications.zig");
+const notif_mod = @import("notification.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
 const platform_window_state = @import("platform/window_state.zig");
 const platform_wsl = @import("platform/wsl.zig");
@@ -63,6 +65,7 @@ pub const browser_panel = if (build_options.webview)
 else
     @import("browser_panel_stub.zig");
 pub const ai_chat_renderer = @import("renderer/ai_chat_renderer.zig");
+const ai_sidebar = @import("ai_sidebar.zig");
 pub const ui_perf = @import("ui_perf.zig");
 const log = std.log.scoped(.app_window);
 
@@ -90,10 +93,28 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
 
     // Store app pointer globally for requestNewWindow
     g_app = app;
+    ai_chat.setSkillUpdateTrigger(triggerSkillUpdate);
+    // `/resume` opens the existing command-center agent history picker (the same
+    // entry point the Command Palette uses for the "Select Agent History" action).
+    ai_chat.setSessionResumeTrigger(struct {
+        fn cb() void {
+            overlays.commandPaletteOpenAgentHistory();
+        }
+    }.cb);
+    // `/export [full|clean]` writes the active AI Chat transcript as Markdown.
+    ai_chat.setMarkdownExportTrigger(struct {
+        fn cb(mode: ai_chat.MarkdownExportMode) void {
+            exportActiveAiChatMarkdown(mode);
+        }
+    }.cb);
     app.maybeStartStartupUpdateCheck();
 
     try ensureGlobalAgentHistoryStore(allocator);
     tab.g_ai_history_change_hook = saveAiHistoryChangeEvent;
+    // Let session restore reopen AI Chat tabs from their persisted history
+    // session id. AppWindow owns the agent history store, so it supplies the
+    // hook tab.zig calls from restoreTab (which only knows the session id).
+    tab.g_ai_restore_hook = reopenAiChatTabFromHistorySessionId;
 
     // Apply config from App to globals
     g_theme = app.theme;
@@ -112,6 +133,7 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
     input.g_url_open_mode = app.url_open_mode;
     g_ssh_legacy_algorithms = app.ssh_legacy_algorithms;
     tab.g_ssh_legacy_algorithms = app.ssh_legacy_algorithms;
+    g_weixin_notify_forward = app.weixin_notify_forward;
     overlays.g_split_divider_color = app.split_divider_color;
 
     // Apply window size from config
@@ -550,15 +572,27 @@ fn renderAiChatFrame(fb_width: c_int, fb_height: c_int, titlebar_offset: f32, le
     markdown_preview_renderer.render(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset, 0);
     file_explorer_renderer.render(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
     if (activeAiChat()) |session| {
+        const chat_x = left_panels_w;
+        const chat_w = @as(f32, @floatFromInt(fb_width)) - left_panels_w - right_panels_w;
         ai_chat_renderer.render(
             session,
             @floatFromInt(fb_width),
             @floatFromInt(fb_height),
             titlebar_offset,
-            left_panels_w,
-            right_panels_w,
+            chat_x,
+            chat_w,
         );
     }
+}
+
+fn renderAiCopilotPanel(fb_width: c_int, fb_height: c_int, titlebar_offset: f32) void {
+    if (!aiCopilotVisible()) return;
+    const session = ensureActiveCopilotSession() orelse return;
+    const left = leftPanelsWidth();
+    const bounds = ai_sidebar.boundsForWindow(@intCast(fb_width), @intCast(fb_height), titlebar_offset, left, 0);
+    const chat_x: f32 = @floatFromInt(bounds.left);
+    const chat_w: f32 = @floatFromInt(bounds.right - bounds.left);
+    ai_chat_renderer.render(session, @floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset, chat_x, chat_w);
 }
 
 pub fn activeTab() ?*TabState {
@@ -617,14 +651,73 @@ pub fn leftPanelsWidth() f32 {
     return titlebar.sidebarWidth() + file_explorer.width();
 }
 
+pub fn aiCopilotVisible() bool {
+    return ai_sidebar.g_visible and isActiveTabTerminal();
+}
+
+/// Hide the copilot panel if visible (used by the right-slot arbiter when
+/// another right panel opens). No-op if already hidden.
+pub fn hideAiCopilot() void {
+    if (!ai_sidebar.g_visible) return;
+    ai_sidebar.hide();
+    input.blurAiCopilot();
+    g_force_rebuild = true;
+    g_cells_valid = false;
+}
+
+pub fn aiCopilotWidth(window_width: i32) f32 {
+    if (!aiCopilotVisible()) return 0;
+    return ai_sidebar.panelWidthForWindow(window_width, leftPanelsWidth(), 0);
+}
+
+fn makeCopilotSession() ?*ai_chat.Session {
+    return overlays.makeCopilotSessionForDefaultProfile();
+}
+
+fn ensureActiveCopilotSession() ?*ai_chat.Session {
+    const session = tab.activeCopilotSession(makeCopilotSession) orelse return null;
+    if (g_agent_context_surface_id_len > 0) {
+        session.setBoundSurface(g_agent_context_surface_id[0..g_agent_context_surface_id_len]);
+    }
+    return session;
+}
+
+/// Input layer getter: the active terminal tab's copilot session, only when the
+/// copilot panel is visible. Used by input routing (next task).
+pub fn activeCopilotSessionForInput() ?*ai_chat.Session {
+    if (!aiCopilotVisible()) return null;
+    const t = tab.activeTab() orelse return null;
+    return t.copilot_session;
+}
+
+pub fn toggleAiCopilot() void {
+    if (!isActiveTabTerminal()) return; // copilot is terminal-only
+    if (ai_sidebar.g_visible) {
+        ai_sidebar.hide();
+        input.blurAiCopilot();
+        g_force_rebuild = true;
+        g_cells_valid = false;
+        return;
+    }
+    // Exclusive right slot: close the other right panels first.
+    browser_panel.close();
+    markdown_preview_panel.close();
+    ai_sidebar.show();
+    _ = ensureActiveCopilotSession();
+    input.focusAiCopilot();
+    g_force_rebuild = true;
+    g_cells_valid = false;
+}
+
 pub fn rightPanelsWidth() f32 {
-    return markdown_preview_panel.width() + browser_panel.width();
+    const copilot_w = if (aiCopilotVisible()) ai_sidebar.g_width else 0;
+    return markdown_preview_panel.width() + browser_panel.width() + copilot_w;
 }
 
 pub fn rightPanelsWidthForWindow(window_width: i32) f32 {
     const preview_w = markdown_preview_panel.width();
     const browser_w = browser_panel.panelWidthForWindow(window_width, leftPanelsWidth(), preview_w);
-    return preview_w + browser_w;
+    return preview_w + browser_w + aiCopilotWidth(window_width);
 }
 
 pub fn browserPanelRightOffset() f32 {
@@ -725,6 +818,11 @@ fn syncActiveSurfaceCaches() void {
     if (surface) |s| {
         @memcpy(g_agent_context_surface_id[0..], s.remote_id[0..]);
         g_agent_context_surface_id_len = s.remote_id.len;
+        if (tab.activeTab()) |t| {
+            if (t.kind == .terminal) {
+                if (t.copilot_session) |session| session.setBoundSurface(s.remote_id[0..]);
+            }
+        }
     }
 }
 
@@ -912,34 +1010,55 @@ pub fn configuredLocalShellSessionDetail() []const u8 {
 
 pub fn spawnConfiguredLocalShellTab() bool {
     const shell_cmd = tab.getShellCmd();
+
+    // When the configured shell already is PowerShell/pwsh, launch it directly.
     if (platform_pty_command.shellCommandLooksLikeConfiguredLocalShell(shell_cmd)) {
-        const allocator = g_allocator orelse return false;
-        var cwd_buf: platform_pty_command.CwdBuffer = undefined;
-        const cwd = getActiveCwd(&cwd_buf);
-        if (!tab.spawnTabWithCommandAndCwd(allocator, term_cols, term_rows, shell_cmd, g_cursor_style, g_cursor_blink, cwd)) return false;
-        clearUiStateOnTabChange();
-        return true;
+        if (spawnLocalShellCommandLine(shell_cmd)) return true;
+        // Configured PowerShell/pwsh is unavailable (e.g. removed from PATH):
+        // fall back to cmd.exe so the local-shell tab still opens (issue #65).
+        return spawnTabWithCommandUtf8(platform_pty_command.guaranteedLocalShellCommand());
     }
-    return spawnTabWithCommandUtf8(platform_pty_command.configuredLocalShellCommandForShell(shell_cmd));
+
+    // Otherwise the startup "local shell" tab prefers PowerShell. If that is not
+    // installed/on PATH, fall back to the user's actual configured shell (e.g.
+    // cmd.exe) instead of failing to open any local-shell tab (issue #65).
+    if (spawnTabWithCommandUtf8(platform_pty_command.configuredLocalShellCommandForShell(shell_cmd))) return true;
+    return spawnLocalShellCommandLine(shell_cmd);
+}
+
+fn spawnLocalShellCommandLine(shell_cmd: platform_pty_command.CommandLine) bool {
+    const allocator = g_allocator orelse return false;
+    var cwd_buf: platform_pty_command.CwdBuffer = undefined;
+    const cwd = getActiveCwd(&cwd_buf);
+    if (!tab.spawnTabWithCommandAndCwd(allocator, term_cols, term_rows, shell_cmd, g_cursor_style, g_cursor_blink, cwd)) return false;
+    clearUiStateOnTabChange();
+    return true;
 }
 
 fn spawnDefaultAgentAndLocalShellTabs(allocator: std.mem.Allocator) bool {
     const first_tab_index = tab.g_tab_count;
     const has_ai_profile = overlays.hasAiProfiles();
-    const first_opened = if (has_ai_profile)
+
+    // Open the local shell first so it is the leftmost, default-focused tab.
+    const local_shell_opened = spawnConfiguredLocalShellTab();
+
+    // Then open the Agent session to the right of the shell. With no AI profile
+    // there is no agent to open, so fall back to a second local shell tab.
+    const second_opened = if (has_ai_profile)
         overlays.openDefaultAgentSessionForStartup() == .opened
     else
         spawnTabWithCwd(allocator, null);
 
-    const local_shell_opened = spawnConfiguredLocalShellTab();
-    if (!first_opened and !local_shell_opened) return false;
+    if (!local_shell_opened and !second_opened) return false;
 
-    if (first_opened and local_shell_opened and first_tab_index < tab.g_tab_count) {
+    // Focus the shell (the first tab).
+    if (first_tab_index < tab.g_tab_count) {
         switchTab(first_tab_index);
     }
 
-    if (!has_ai_profile and first_tab_index < tab.g_tab_count) {
-        switchTab(first_tab_index);
+    // No AI profile yet: surface the profile-creation form so the user can set
+    // one up (the form is an overlay, not a tab).
+    if (!has_ai_profile) {
         _ = overlays.openDefaultAgentSessionForStartup();
     }
 
@@ -957,9 +1076,10 @@ pub fn spawnAiChatTab(
     reasoning_effort: []const u8,
     stream_val: []const u8,
     agent_val: []const u8,
+    max_tokens: u32,
 ) bool {
     const allocator = g_allocator orelse return false;
-    if (!tab.spawnAiChatTab(allocator, name, base_url, api_key, model, protocol, system_prompt, thinking, reasoning_effort, stream_val, agent_val)) return false;
+    if (!tab.spawnAiChatTab(allocator, name, base_url, api_key, model, protocol, system_prompt, thinking, reasoning_effort, stream_val, agent_val, max_tokens)) return false;
     clearUiStateOnTabChange();
     return true;
 }
@@ -1250,6 +1370,9 @@ threadlocal var g_agent_context_surface_id_len: usize = 0;
 pub threadlocal var g_copy_on_select: bool = false;
 pub threadlocal var g_right_click_action: Config.RightClickAction = .copy;
 pub threadlocal var g_ssh_legacy_algorithms: bool = false;
+pub threadlocal var g_desktop_notifications: bool = true;
+pub threadlocal var g_weixin_notify_forward: bool = false;
+threadlocal var g_notif_auth_requested: bool = false;
 
 /// Update cursor blink state based on time (call once per frame)
 fn updateCursorBlink() void {
@@ -1475,6 +1598,11 @@ fn onPlatformResize(width: i32, height: i32) void {
         file_explorer_renderer.render(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
     }
 
+    // Copilot panel draws on top of the reserved right region (terminal tabs only;
+    // renderAiCopilotPanel gates on aiCopilotVisible). Placed after the terminal
+    // content + markdown preview so it occupies the exclusive right slot.
+    renderAiCopilotPanel(fb_width, fb_height, titlebar_offset);
+
     overlays.renderBrowserUrlBar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
     overlays.renderCommandPalette(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
     overlays.renderSettingsPage(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
@@ -1505,9 +1633,31 @@ fn resizeWindowToGrid() void {
     if (g_window) |w| window_backend.resizeClientArea(w, win_w, win_h);
 }
 
+fn triggerSkillUpdate() void {
+    if (g_app) |app| app.requestSkillUpdate();
+}
+
 fn pollUpdateCheck(app: *App) void {
     const result = app.consumeUpdateResult();
     if (result.state != .idle) overlays.showUpdateCheckResult(result);
+}
+
+fn pollSkillUpdate(app: *App) void {
+    const result = app.consumeSkillUpdateResult();
+    switch (result.state) {
+        .idle, .downloading => {},
+        .done => {
+            if (result.count == 0) {
+                overlays.showStatusToast("Skills already up to date");
+            } else {
+                var buf: [64]u8 = undefined;
+                const msg: []const u8 = std.fmt.bufPrint(&buf, "Skills updated ({d})", .{result.count}) catch "Skills updated";
+                overlays.showStatusToast(msg);
+            }
+            if (activeAiChat()) |session| session.reloadSkillSuggestions();
+        },
+        .failed => overlays.showStatusToast("Skill update failed"),
+    }
 }
 
 /// Reload config from disk and apply theme/font/cursor/etc. (used after UI writes config).
@@ -1554,9 +1704,9 @@ fn applyReloadedConfig(allocator: std.mem.Allocator, cfg: *const Config) void {
     g_force_rebuild = true;
     g_cursor_style = cfg.@"cursor-style";
     g_cursor_blink = cfg.@"cursor-style-blink";
-    overlays.g_debug_fps = cfg.@"phantty-debug-fps";
-    overlays.g_debug_draw_calls = cfg.@"phantty-debug-draw-calls";
-    g_debug_memory = cfg.@"phantty-debug-memory";
+    overlays.g_debug_fps = cfg.@"wispterm-debug-fps";
+    overlays.g_debug_draw_calls = cfg.@"wispterm-debug-draw-calls";
+    g_debug_memory = cfg.@"wispterm-debug-memory";
 
     // --- Split config ---
     overlays.g_unfocused_split_opacity = cfg.@"unfocused-split-opacity";
@@ -1565,6 +1715,8 @@ fn applyReloadedConfig(allocator: std.mem.Allocator, cfg: *const Config) void {
     g_right_click_action = cfg.@"right-click-action";
     input.g_url_open_mode = cfg.@"url-open-mode";
     g_ssh_legacy_algorithms = cfg.@"ssh-legacy-algorithms";
+    g_desktop_notifications = cfg.@"desktop-notifications";
+    g_weixin_notify_forward = cfg.@"weixin-notify-forward";
     tab.g_ssh_legacy_algorithms = cfg.@"ssh-legacy-algorithms";
     overlays.g_split_divider_color = cfg.@"split-divider-color";
 
@@ -2129,6 +2281,7 @@ const WeixinRequest = struct {
     // send_input input (valid for the duration of the synchronous call):
     surface_id: [16]u8 = [_]u8{0} ** 16,
     bytes: []const u8 = "",
+    reply_context: ?weixin_types.ReplyContext = null,
     // outputs filled by the UI-thread handler:
     found: bool = false,
     out_surface_id: [16]u8 = [_]u8{0} ** 16,
@@ -2217,7 +2370,11 @@ fn handleWeixinControlRequest(req: *WeixinRequest) void {
                 const tab_state = tab.g_tabs[idx] orelse return;
                 if (tab_state.kind != .ai_chat) return;
                 const session = tab_state.ai_chat_session orelse return;
-                session.applyRemoteInput(req.bytes);
+                if (req.reply_context) |ctx| {
+                    session.applyWeixinInput(req.bytes, ctx);
+                } else {
+                    session.applyRemoteInput(req.bytes);
+                }
                 g_force_rebuild = true;
                 req.sent = true;
                 return;
@@ -2269,8 +2426,8 @@ fn wxOpenAiAgent(_: *anyopaque, _: u32) weixin_control.OpenResult {
     return req.open_result;
 }
 
-fn wxSendInput(_: *anyopaque, surface_id: [16]u8, bytes: []const u8) bool {
-    var req = WeixinRequest{ .op = .send_input, .surface_id = surface_id, .bytes = bytes };
+fn wxSendInput(_: *anyopaque, surface_id: [16]u8, bytes: []const u8, reply_context: ?weixin_types.ReplyContext) bool {
+    var req = WeixinRequest{ .op = .send_input, .surface_id = surface_id, .bytes = bytes, .reply_context = reply_context };
     if (!weixinDispatch(&req)) return false;
     return req.sent;
 }
@@ -2929,6 +3086,23 @@ fn handleWindowDpiChanged(
 ) void {
     const new_dpi = window_backend.effectiveDpi(win);
     if (new_dpi == 0) return;
+
+    // Reject a degenerate DPI before it reaches font sizing (see #90). A bogus
+    // value (observed on some multi-monitor / HiDPI setups during the startup
+    // resize) would scale glyph bitmaps to absurd dimensions; while the atlas
+    // packer now rejects oversized glyphs, keeping the old DPI here also avoids
+    // a window full of unrenderable text. The cap is 32x the platform baseline
+    // (display.default_dpi), far above any real display.
+    const max_sane_dpi: u32 = platform_display.default_dpi * 32;
+    if (new_dpi > max_sane_dpi) {
+        render_diagnostics.log(
+            "dpi-change reject implausible new_dpi={} (max={}) keeping font_dpi={}",
+            .{ new_dpi, max_sane_dpi, font.g_dpi },
+        );
+        std.debug.print("Ignoring implausible DPI {} (keeping {})\n", .{ new_dpi, font.g_dpi });
+        return;
+    }
+
     const client_before = window_backend.clientSize(win);
     const fb_before = window_backend.framebufferSize(win);
     render_diagnostics.log(
@@ -3066,8 +3240,25 @@ fn syncImeCaretPosition(win: *window_backend.Window, split_count: usize) void {
         // Freeze the caret during composition so the IMM popup, anchored when
         // the composition started, doesn't drift with local UI relayout.
         if (win.ime_composing) return;
-        syncAiChatImeCaret(win, session);
+        const size = window_backend.clientSize(win);
+        const left = leftPanelsWidth();
+        const chat_w = @max(1.0, @as(f32, @floatFromInt(size.width)) - left - rightPanelsWidthForWindow(size.width));
+        syncAiChatImeCaret(win, session, left, chat_w);
         return;
+    }
+
+    // Copilot sidebar (on a terminal tab): anchor the IME caret to the panel's
+    // composer, not the terminal cursor.
+    if (aiCopilotVisible() and input.aiCopilotFocused()) {
+        if (activeCopilotSessionForInput()) |session| {
+            if (win.ime_composing) return;
+            const size = window_backend.clientSize(win);
+            const bounds = ai_sidebar.boundsForWindow(size.width, size.height, currentTitlebarHeight(), leftPanelsWidth(), 0);
+            const chat_x: f32 = @floatFromInt(bounds.left);
+            const chat_w: f32 = @floatFromInt(bounds.right - bounds.left);
+            syncAiChatImeCaret(win, session, chat_x, chat_w);
+            return;
+        }
     }
 
     const surface = activeSurface() orelse return;
@@ -3204,16 +3395,12 @@ fn isInverseBlankImeCell(p: anytype, cell: anytype) bool {
     return style.flags.inverse;
 }
 
-fn syncAiChatImeCaret(win: *window_backend.Window, session: *ai_chat.Session) void {
+fn syncAiChatImeCaret(win: *window_backend.Window, session: *ai_chat.Session, chat_x: f32, chat_w: f32) void {
     const size = window_backend.clientSize(win);
     const wh: f32 = @floatFromInt(size.height);
-    const ww: f32 = @floatFromInt(size.width);
-    const left_panels_w = leftPanelsWidth();
-    const right_panels_w = rightPanelsWidthForWindow(size.width);
-    const panel_w = @max(1.0, ww - left_panels_w - right_panels_w);
     session.mutex.lock();
     const input_text = session.input();
-    const layout = ai_chat_renderer.inputLayout(left_panels_w, panel_w, input_text);
+    const layout = ai_chat_renderer.inputLayout(chat_x, chat_w, input_text);
     const cursor = ai_chat_renderer.inputCursorRect(input_text, session.input_cursor, layout.text_x, layout.text_w);
     const scrolled_row = session.input_scroll_row;
     const follow_cursor = session.input_scroll_follow_cursor;
@@ -3289,6 +3476,87 @@ fn handleBell(surface: *Surface, win: *window_backend.Window, is_active_tab: boo
     platform_notifications.requestAttention(window_backend.nativeHandle(win));
 }
 
+/// Drain and handle queued desktop notifications for one surface.
+/// `is_active_surface` means this is the focused surface of the active tab.
+/// Window focus is applied separately inside `notif_mod.decideRoute`, which
+/// only suppresses the toast when the window is focused AND this is true.
+fn handleNotification(surface: *Surface, is_active_surface: bool) void {
+    if (!g_desktop_notifications) {
+        // Drain and discard so the queue can't grow while disabled.
+        while (surface.notif_queue.pop() != null) {}
+        return;
+    }
+
+    const native_toast = platform_notifications.supports_desktop_notifications;
+
+    while (surface.notif_queue.pop()) |item| {
+        const now = std.time.milliTimestamp();
+        const h = notif_mod.contentHash(item.title(), item.body());
+        if (!notif_mod.shouldDeliver(now, h, surface.last_notif_time, surface.last_notif_hash)) {
+            continue;
+        }
+
+        // Lazy authorization request (macOS): first time we'd want a toast,
+        // ask once. This delivery falls back to badge until the user answers.
+        if (native_toast and !g_notif_auth_requested) {
+            platform_notifications.requestNotificationAuth();
+            g_notif_auth_requested = true;
+        }
+
+        const auth: notif_mod.AuthStatus = @enumFromInt(
+            @intFromEnum(platform_notifications.notificationAuthStatus()),
+        );
+        const route = notif_mod.decideRoute(
+            true, // g_desktop_notifications already checked above
+            native_toast,
+            auth,
+            window_focused,
+            is_active_surface,
+        );
+
+        switch (route) {
+            .none => {},
+            .toast => {
+                var title_z: [notif_mod.max_title + 1]u8 = undefined;
+                var body_z: [notif_mod.max_body + 1]u8 = undefined;
+                const t = item.title();
+                const b = item.body();
+                @memcpy(title_z[0..t.len], t);
+                title_z[t.len] = 0;
+                @memcpy(body_z[0..b.len], b);
+                body_z[b.len] = 0;
+                platform_notifications.showDesktopNotification(
+                    title_z[0..t.len :0],
+                    body_z[0..b.len :0],
+                );
+                surface.bell_indicator = true; // also badge the tab
+                surface.bell_indicator_time = now;
+                surface.last_notif_hash = h;
+                surface.last_notif_time = now;
+            },
+            .badge => {
+                surface.bell_indicator = true;
+                surface.bell_indicator_time = now;
+                surface.last_notif_hash = h;
+                surface.last_notif_time = now;
+            },
+        }
+
+        // Forward to the bound WeChat owner when the notifier marked it, the
+        // opt-in is on, and you are not looking right at this surface. The
+        // controller self-guards on an active binding + bound owner and sends
+        // off-thread, so this never blocks. (Reaches here only after the
+        // shouldDeliver gate above, so it inherits rate-limit/dedup.)
+        if (item.forward_wechat and g_weixin_notify_forward and
+            !(window_focused and is_active_surface))
+        {
+            if (g_app) |app| {
+                if (app.weixin_controller) |ctrl| ctrl.enqueueNotify(item.title(), item.body());
+            }
+        }
+    }
+}
+
 /// Internal main loop - called by AppWindow.run() after init() has set up globals.
 fn runMainLoop(self: *AppWindow) !void {
     const allocator = self.allocator;
@@ -3335,7 +3603,7 @@ fn runMainLoop(self: *AppWindow) !void {
     var backend_window = window_backend.create(allocator, .{
         .width = 800,
         .height = 600,
-        .title = "Phantty",
+        .title = "WispTerm",
         .x = init_x,
         .y = init_y,
         .maximize = g_start_maximize and !g_start_fullscreen, // Don't maximize if going fullscreen
@@ -3475,8 +3743,11 @@ fn runMainLoop(self: *AppWindow) !void {
         // Clean up glyph cache and atlas
         font.clearGlyphCache(allocator);
         font.clearFallbackFaces(allocator);
-        // Clean up icon cache and icon atlas
+        // Clean up icon cache and icon atlas. Reset to .empty so the
+        // threadlocal slot is safe to re-use if the main thread spawns
+        // another first-window (e.g. macOS Dock reopen).
         font.icon_cache.deinit(allocator);
+        font.icon_cache = .empty;
         if (font.g_icon_atlas) |*a| {
             a.deinit(allocator);
             font.g_icon_atlas = null;
@@ -3487,10 +3758,12 @@ fn runMainLoop(self: *AppWindow) !void {
             font.g_icon_atlas_texture = 0;
         }
 
-        // Clean up titlebar font
+        // Clean up titlebar font. Reset cache to .empty for the same reason
+        // as icon_cache above.
         if (font.g_titlebar_face) |f| f.deinit();
         font.g_titlebar_face = null;
         font.g_titlebar_cache.deinit(allocator);
+        font.g_titlebar_cache = .empty;
         if (font.g_titlebar_atlas) |*a| {
             a.deinit(allocator);
             font.g_titlebar_atlas = null;
@@ -3730,6 +4003,14 @@ fn runMainLoop(self: *AppWindow) !void {
         }
         if (window_backend.closeRequested(win)) {
             window_backend.clearCloseRequested(win);
+            if (!window_backend.closeRequestPromptsConfirmation()) {
+                // Backend tears the window down immediately with no in-app
+                // prompt; closing this window does not necessarily end the app
+                // session (the backend owns process lifecycle).
+                g_should_close = true;
+                running = false;
+                continue;
+            }
             overlays.windowCloseConfirmOpen();
             g_force_rebuild = true;
             g_cells_valid = false;
@@ -3763,6 +4044,7 @@ fn runMainLoop(self: *AppWindow) !void {
         gpu.gl_init.g_draw_call_count = 0;
         overlays.updateFps();
         pollUpdateCheck(self.app);
+        pollSkillUpdate(self.app);
 
         // Sync atlas textures to GPU if modified
         if (font.g_atlas != null) font.syncAtlasTexture(&font.g_atlas, &font.g_atlas_texture, &font.g_atlas_modified);
@@ -3778,6 +4060,11 @@ fn runMainLoop(self: *AppWindow) !void {
                 while (it.next()) |entry| {
                     if (entry.surface.bell_pending.swap(false, .acquire)) {
                         handleBell(entry.surface, win, ti == tab.g_active_tab);
+                    }
+                    {
+                        const is_active_surface = (ti == tab.g_active_tab) and
+                            (if (tb.focusedSurface()) |fs| fs == entry.surface else false);
+                        handleNotification(entry.surface, is_active_surface);
                     }
                 }
             }
@@ -3943,6 +4230,12 @@ fn runMainLoop(self: *AppWindow) !void {
 
         gpu.state.setViewport(0, 0, @intCast(fb_width), @intCast(fb_height));
         gpu.gl_init.setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+        // Copilot panel draws on top of the reserved right region (terminal tabs
+        // only; renderAiCopilotPanel gates on aiCopilotVisible). Placed after the
+        // full-window viewport/projection are restored — so it is unaffected by the
+        // per-split viewport and the post-process framebuffer paths above — and
+        // after terminal content, occupying the exclusive right slot.
+        renderAiCopilotPanel(fb_width, fb_height, titlebar_offset);
         overlays.renderBrowserUrlBar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
         overlays.renderStartupShortcutsOverlay(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
         overlays.renderCommandPalette(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);

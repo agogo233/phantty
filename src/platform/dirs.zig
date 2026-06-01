@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const app_dir_name = "phantty";
-const portable_config_basename = "phantty.conf";
+const app_dir_name = "wispterm";
+const portable_config_basename = "wispterm.conf";
 
 pub const Env = struct {
     appdata: ?[]const u8 = null,
@@ -175,6 +175,18 @@ pub fn skillsDirFromEnvForOs(
     return pathInConfigDirFromEnvForOs(allocator, os_tag, env, "skills");
 }
 
+pub fn commandsDir(allocator: std.mem.Allocator) ![]const u8 {
+    return pathInConfigDir(allocator, "commands");
+}
+
+pub fn commandsDirFromEnvForOs(
+    allocator: std.mem.Allocator,
+    os_tag: std.Target.Os.Tag,
+    env: Env,
+) ![]const u8 {
+    return pathInConfigDirFromEnvForOs(allocator, os_tag, env, "commands");
+}
+
 pub fn pluginSkillsDir(allocator: std.mem.Allocator) ![]const u8 {
     const dir = try configDir(allocator);
     defer allocator.free(dir);
@@ -298,7 +310,7 @@ fn nonEmpty(value: ?[]const u8) ?[]const u8 {
 
 test "configDir uses test override in Zig test processes" {
     const allocator = std.testing.allocator;
-    const override = "/tmp/phantty-test-config";
+    const override = "/tmp/wispterm-test-config";
 
     setTestConfigDirForCurrentThread(override);
     defer clearTestConfigDirForCurrentThread();
@@ -374,9 +386,9 @@ test "platform dirs build config and theme file paths" {
 test "platform dirs build portable config path from executable path" {
     const allocator = std.testing.allocator;
 
-    const path = try portableConfigFilePathFromExePath(allocator, "C:/Apps/Phantty/phantty.exe");
+    const path = try portableConfigFilePathFromExePath(allocator, "C:/Apps/WispTerm/wispterm.exe");
     defer allocator.free(path);
-    const expected = try std.fs.path.join(allocator, &.{ "C:/Apps/Phantty", "phantty.conf" });
+    const expected = try std.fs.path.join(allocator, &.{ "C:/Apps/WispTerm", "wispterm.conf" });
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, path);
 }
@@ -483,6 +495,12 @@ test "platform dirs expose app skill roots" {
     const expected_plugin_skills = try std.fs.path.join(allocator, &.{ "/home/alice", ".config", app_dir_name, "plugins", "skills" });
     defer allocator.free(expected_plugin_skills);
     try std.testing.expectEqualStrings(expected_plugin_skills, plugin_skills);
+
+    const commands = try commandsDirFromEnvForOs(allocator, .linux, env);
+    defer allocator.free(commands);
+    const expected_commands = try std.fs.path.join(allocator, &.{ "/home/alice", ".config", app_dir_name, "commands" });
+    defer allocator.free(expected_commands);
+    try std.testing.expectEqualStrings(expected_commands, commands);
 }
 
 test "platform dirs resolve downloads directory per OS" {

@@ -42,6 +42,10 @@ pub const TabState = struct {
     tree: SplitTree,
     focused: SplitTree.Node.Handle = .root,
     ai_chat_session: ?*ai_chat.Session = null,
+    /// Copilot conversation for a terminal tab (Issue #98). Distinct from
+    /// `ai_chat_session`, which backs a dedicated AI-chat tab. Lazily created
+    /// the first time the copilot sidebar is opened on this tab.
+    copilot_session: ?*ai_chat.Session = null,
 
     pub const Kind = enum {
         terminal,
@@ -69,14 +73,20 @@ pub const TabState = struct {
             const chat_title = chat.title();
             return if (chat_title.len > 0) chat_title else "AI Chat";
         }
-        const surface = self.focusedSurface() orelse return "phantty";
+        const surface = self.focusedSurface() orelse return "wispterm";
         return surface.getTitle();
     }
 
     pub fn deinit(self: *TabState, allocator: std.mem.Allocator) void {
         _ = allocator;
         switch (self.kind) {
-            .terminal => self.tree.deinit(),
+            .terminal => {
+                self.tree.deinit();
+                if (self.copilot_session) |session| {
+                    session.deinit();
+                    self.copilot_session = null;
+                }
+            },
             .ai_chat => {
                 if (self.ai_chat_session) |session| {
                     session.deinit();
@@ -101,6 +111,11 @@ pub threadlocal var g_shell_cmd_len: usize = 0;
 pub threadlocal var g_scrollback_limit: u32 = 10_000_000;
 pub threadlocal var g_remote_client: ?*remote_client.Client = null;
 pub threadlocal var g_ai_history_change_hook: ?ai_chat.HistoryChangeHook = null;
+
+// Restore hook: rebuild an AI Chat tab from its persisted agent-history session
+// id. Registered by AppWindow (which owns the history store), so tab.zig stays
+// free of that dependency. Returns true if the tab was reopened.
+pub threadlocal var g_ai_restore_hook: ?*const fn (session_id: []const u8) bool = null;
 
 // Forced title from config (overrides all tab titles)
 pub threadlocal var g_forced_title: ?[]const u8 = null;
@@ -166,6 +181,20 @@ pub fn activeAiChat() ?*ai_chat.Session {
     return t.ai_chat_session;
 }
 
+/// Get (creating if needed) the copilot session for the active terminal tab.
+/// Returns null on non-terminal tabs or if creation fails. `make` builds a
+/// fresh Session (AppWindow supplies it so this module stays UI-free).
+pub fn activeCopilotSession(
+    make: *const fn () ?*ai_chat.Session,
+) ?*ai_chat.Session {
+    const t = activeTab() orelse return null;
+    if (t.kind != .terminal) return null;
+    if (t.copilot_session == null) {
+        t.copilot_session = make() orelse return null;
+    }
+    return t.copilot_session;
+}
+
 pub fn findAiTabBySessionId(session_id: []const u8) ?usize {
     for (0..g_tab_count) |idx| {
         const t = g_tabs[idx] orelse continue;
@@ -215,6 +244,7 @@ fn splitSshCommand(
         .port = conn.port(),
         .password_auth = conn.password_auth,
         .legacy_algorithms = conn.legacy_algorithms,
+        .proxy_jump = conn.proxyJump(),
     }) orelse return null;
 
     return platform_pty_command.allocCommandLineFromUtf8(allocator, command) catch null;
@@ -293,6 +323,7 @@ pub fn spawnTabWithCommandAndCwd(allocator: std.mem.Allocator, cols: u16, rows: 
     t.tree = tree;
     t.focused = .root;
     t.ai_chat_session = null;
+    t.copilot_session = null;
 
     g_tabs[g_tab_count] = t;
     g_active_tab = g_tab_count;
@@ -314,6 +345,7 @@ pub fn spawnAiChatTab(
     reasoning_effort: []const u8,
     stream_val: []const u8,
     agent_val: []const u8,
+    max_tokens: u32,
 ) bool {
     if (g_tab_count >= MAX_TABS) return false;
 
@@ -333,6 +365,7 @@ pub fn spawnAiChatTab(
         std.debug.print("Failed to create AI Chat session\n", .{});
         return false;
     };
+    session.setMaxTokens(max_tokens);
     installAiChatHistoryHook(session);
 
     const t = allocator.create(TabState) catch {
@@ -343,6 +376,7 @@ pub fn spawnAiChatTab(
     t.tree = .empty;
     t.focused = .root;
     t.ai_chat_session = session;
+    t.copilot_session = null;
 
     g_tabs[g_tab_count] = t;
     g_active_tab = g_tab_count;
@@ -370,6 +404,7 @@ pub fn spawnAiChatTabFromHistoryRecord(allocator: std.mem.Allocator, record: age
     t.tree = .empty;
     t.focused = .root;
     t.ai_chat_session = session;
+    t.copilot_session = null;
 
     g_tabs[g_tab_count] = t;
     g_active_tab = g_tab_count;
@@ -605,7 +640,7 @@ fn splitFocusedSurfaceWithCommand(
 
     if (inherit_ssh_connection) {
         if (focused_surface.ssh_connection) |conn| {
-            new_surface.setSshConnection(conn.user(), conn.host(), conn.port(), conn.password(), conn.password_auth, conn.legacy_algorithms);
+            new_surface.setSshConnection(conn.user(), conn.host(), conn.port(), conn.password(), conn.proxyJump(), conn.password_auth, conn.legacy_algorithms);
         }
     }
 
@@ -933,6 +968,20 @@ pub fn handleRenameChar(codepoint: u21) void {
 /// is the caller's responsibility to free (via Session.deinit pattern, or
 /// shared across all tabs in a session).
 pub fn snapshotTab(arena: std.mem.Allocator, t: *const TabState) !session_persist.TabSnap {
+    // AI Chat tabs persist only their history session id; the conversation
+    // itself lives in the agent history store. `tree` is a required field, so
+    // emit an ignored placeholder leaf — restoreTab routes by ai_session_id.
+    if (t.kind == .ai_chat) {
+        const session = t.ai_chat_session orelse return error.NoAiSession;
+        const sid = try arena.dupe(u8, session.sessionId());
+        return session_persist.TabSnap{
+            .title_override = null,
+            .focused_leaf = 0,
+            .zoomed_leaf = null,
+            .tree = .{ .leaf = .{ .surface = .{ .local_shell = .{} } } },
+            .ai_session_id = sid,
+        };
+    }
     if (t.kind != .terminal) return error.NotTerminalTab;
     if (t.tree.isEmpty()) return error.EmptyTree;
 
@@ -1003,6 +1052,7 @@ fn snapshotSurface(arena: std.mem.Allocator, surface: *const Surface) !session_p
                 .user = try arena.dupe(u8, conn.user()),
                 .host = try arena.dupe(u8, conn.host()),
                 .port = port_num,
+                .proxy_jump = try arena.dupe(u8, conn.proxyJump()),
             } };
         },
     };
@@ -1106,6 +1156,7 @@ fn surfaceFromSnapImpl(
                 .host = s.host,
                 .port = port_slice,
                 .legacy_algorithms = g_ssh_legacy_algorithms,
+                .proxy_jump = s.proxy_jump,
             }) orelse return error.CommandTooLong;
             var final_len: usize = base.len;
 
@@ -1127,7 +1178,7 @@ fn surfaceFromSnapImpl(
             // the native SSH client prompts interactively if key auth fails;
             // the in-app password-autofill flow (which requires password_auth=true)
             // does not engage here.
-            surface.setSshConnection(s.user, s.host, port_slice, "", false, g_ssh_legacy_algorithms);
+            surface.setSshConnection(s.user, s.host, port_slice, "", s.proxy_jump, false, g_ssh_legacy_algorithms);
             return surface;
         },
     }
@@ -1148,6 +1199,15 @@ pub fn restoreTab(
     cursor_blink: bool,
 ) bool {
     if (g_tab_count >= MAX_TABS) return false;
+
+    // AI Chat tab: rebuild from its persisted history session via the hook
+    // AppWindow installed (it owns the history store). The placeholder `tree` in
+    // the snapshot is ignored. If the hook isn't installed or the session is
+    // gone from history, skip this tab rather than restoring a wrong terminal.
+    if (snap.ai_session_id) |sid| {
+        const hook = g_ai_restore_hook orelse return false;
+        return hook(sid);
+    }
 
     // Populate the thread-local restore context so surfaceFromSnap can read
     // these values without changing the SplitTree.fromSnapshot factory ABI.
@@ -1171,6 +1231,7 @@ pub fn restoreTab(
     // Resolve focused_leaf from pre-order index back to a Handle.
     t.focused = handleOfNthLeaf(&t.tree, snap.focused_leaf) orelse .root;
     t.ai_chat_session = null;
+    t.copilot_session = null;
 
     g_tabs[g_tab_count] = t;
     g_active_tab = g_tab_count;
@@ -1311,6 +1372,48 @@ fn makeTestTabState() TabState {
         .focused = .root,
         .ai_chat_session = null,
     };
+}
+
+test "tab: restoreTab routes ai_session_id through the restore hook" {
+    resetTestTabGlobals();
+    const previous_hook = g_ai_restore_hook;
+    defer g_ai_restore_hook = previous_hook;
+
+    const Captured = struct {
+        var session_id: []const u8 = "";
+        var called: bool = false;
+        fn hook(session_id_in: []const u8) bool {
+            session_id = session_id_in;
+            called = true;
+            return true;
+        }
+    };
+    Captured.called = false;
+    Captured.session_id = "";
+    g_ai_restore_hook = Captured.hook;
+
+    const snap = session_persist.TabSnap{
+        .tree = .{ .leaf = .{ .surface = .{ .local_shell = .{} } } },
+        .ai_session_id = "sess-xyz",
+    };
+    try std.testing.expect(restoreTab(std.testing.allocator, &snap, 80, 24, .block, false));
+    try std.testing.expect(Captured.called);
+    try std.testing.expectEqualStrings("sess-xyz", Captured.session_id);
+    // The hook owns tab creation; restoreTab must not also build a terminal tab.
+    try std.testing.expectEqual(@as(usize, 0), g_tab_count);
+}
+
+test "tab: restoreTab skips an ai tab when no restore hook is installed" {
+    resetTestTabGlobals();
+    const previous_hook = g_ai_restore_hook;
+    defer g_ai_restore_hook = previous_hook;
+    g_ai_restore_hook = null;
+
+    const snap = session_persist.TabSnap{
+        .tree = .{ .leaf = .{ .surface = .{ .local_shell = .{} } } },
+        .ai_session_id = "sess-xyz",
+    };
+    try std.testing.expect(!restoreTab(std.testing.allocator, &snap, 80, 24, .block, false));
 }
 
 test "tab: reorder moves active tab forward" {

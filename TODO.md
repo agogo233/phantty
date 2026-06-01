@@ -54,7 +54,13 @@ code only — not the `remote/` web console or packaged `plugins/`.
   regression-locks the decoupled feature files. A small documented residue of
   files still calls `gpu.glTable()` (the GL presentation layer + not-yet-extracted
   plumbing) — to be absorbed as the primitive set grows. → **Phase D** (Metal/Linux
-  backends) is now the gate. See guide §1.
+  backends) is now the gate. See guide §1. **D1.y render-correctness work done:
+  per-pane viewport/scissor (P0, fixes the split bug), blend-mode PSO variants
+  (P1), sampler filter/wrap (P2), and frame throughput (P3) all land + verify on
+  three platforms. The only D1.y item left — FBO render-target switching — is
+  DEFERRED into a separate "macOS custom-shader" feature, because its sole
+  consumer (post-process GLSL) needs a GLSL→MSL layer before an FBO is useful on
+  Metal. See D1.y.**
 - **Giant files conflate presentation + logic.** `ai_chat.zig` (248 KB),
   `input.zig` (3,462 ln), `AppWindow.zig` (3,742 ln), `overlays.zig` (171 KB).
   → **Phase B**.
@@ -289,7 +295,7 @@ services, and `.app` packaging. Ghostty reference: `src/renderer/metal/`,
          registered by `ui_pipeline.init()` (the indirection is needed because
          `test-metal`'s module root sits inside `gpu/metal/`, which forbids
          walking out to `renderer/ui_pipeline.zig` with a static `@import`).
-      2. `phantty_metal_buffer_upload` reused the same `MTLBuffer` storage
+      2. `wispterm_metal_buffer_upload` reused the same `MTLBuffer` storage
          across uploads (`memcpy([buffer contents])`). Metal's
          `setVertexBuffer:offset:atIndex:` captures the buffer pointer at
          encoding time but the GPU only reads its bytes at command-buffer
@@ -310,6 +316,129 @@ services, and `.app` packaging. Ghostty reference: `src/renderer/metal/`,
       simple-textured, overlay). Native proof: `zig build test-metal` compiles
       every bundled MSL shader pair into `MTLRenderPipelineState`.
 
+**D1.y — Metal render-state application (split / scissor / blend) — INCOMPLETE**
+
+> **Found on-device (2026-05-28):** creating a split pane on macOS renders both
+> panes blank and draws the shell prompt over the title bar (the split *logic*
+> is fine — `Split created: ... tree nodes: 3`). Root cause: the Metal backend
+> **records render state into thread-locals but never applies it to the
+> `MTLRenderCommandEncoder`.** A single full-window surface accidentally hides
+> this (origin is `(0,0)`, nothing needs clipping, plain alpha blend is enough);
+> the moment a feature needs a sub-rectangle origin, a clip, or a non-alpha
+> blend, it breaks. So D1's "Metal GPU backend" is functionally complete only
+> for the full-window single-surface path. The state-application layer below is
+> the real gap.
+>
+> **Architecture note vs. Ghostty.** Ghostty renders each terminal surface into
+> its **own** `NSView` + `CAMetalLayer`; AppKit's split container lays the views
+> out, so each Metal renderer instance owns a drawable that *is* the pane — it
+> never needs per-pane viewport/scissor inside one drawable. WispTerm instead
+> keeps **one window / one `CAMetalLayer` / one drawable** and renders every pane
+> in a loop with per-pane viewport + scissor (symmetric with its Windows OpenGL
+> path: `AppWindow.zig:3893-3947`). **Decision: keep WispTerm's single-drawable
+> model and make Metal honor `setViewport:`/`setScissorRect:` per draw** (Option
+> A — symmetric with OpenGL, low risk, no AppKit/host rework). Option B (one
+> layer per surface, Ghostty-style) is a much larger host refactor and is *not*
+> chosen here.
+>
+> **Verified against Ghostty/cmux (2026-05-28).** Ghostty's Metal renderer is
+> one `IOSurfaceLayer` + one renderer instance **per surface**; its
+> `metal/RenderPass.zig` calls **neither** `setViewport` **nor**
+> `setScissorRect` — the drawable *is* the pane, so padding rides in the
+> projection/cell coordinates and clipping is unneeded. cmux is a Ghostty-based
+> macOS terminal (vertical tabs, splits, embedded browser, agent socket API) and
+> inherits this rendering model. WispTerm's single-drawable choice is the
+> deliberate trade for sharing one render loop with Windows; the cost is that
+> WispTerm **must** implement the per-draw `setViewport:`/`setScissorRect:` that
+> Ghostty sidesteps. That is standard Metal usage (an encoder's viewport and
+> scissor are mutable between draws), so **the architecture is sound — only the
+> application step is missing.** Keep Option A; revisit per-surface layers
+> (Option B) only if multi-split frame pacing on the single render thread ever
+> becomes a problem.
+
+- [x] **P0 — Apply viewport origin to the encoder (fixes split positioning).**
+      Done. `render_state.setViewport` now forwards to the C bridge
+      (`wispterm_metal_set_viewport`); `wispterm_metal_apply_viewport_scissor`
+      emits `[encoder setViewport:]` before every draw with the GL bottom-left →
+      Metal top-left flip (`originY = drawable_h - y - h`, drawable size captured
+      at frame begin). `metal/gl_init.zig:setProjection` no longer clobbers the
+      viewport to `(0,0)`; projection stays width/height-only (origin honored by
+      the encoder viewport, like OpenGL's `glViewport`). Proof: `zig build
+      test-metal` (new viewport/scissor assertion), `zig build test-full
+      -Dtarget=aarch64-macos`, `zig build -Dtarget=x86_64-windows-gnu` (no
+      regression). **On-device split visual check still pending.**
+- [x] **P0 — Apply scissor to the encoder (fixes clip overflow).** Done.
+      `setScissor`/`disableScissor`/`restoreScissor` forward to
+      `wispterm_metal_set_scissor`; the apply helper emits
+      `[encoder setScissorRect:]` per draw — enabled → recorded box (y-flipped),
+      disabled → full drawable (Metal has no "scissor off"). The rect is
+      **clamped to the drawable** (an out-of-bounds `MTLScissorRect` raises and
+      kills the command buffer); the test-metal assertion feeds a deliberately
+      out-of-bounds box to lock the clamp. Unblocks
+      `markdown_preview_renderer.zig:610-614` and `ui_pipeline.zig:110-121`.
+- [x] **P1 — Blend modes as pipeline variants (fixes color-emoji / bg image).**
+      Done. `pipeline_create` now builds three `MTLRenderPipelineState` variants
+      per shader via `wispterm_metal_make_pso` (alpha `(src_alpha,1-src_alpha)` /
+      premultiplied `(one,1-src_alpha)` / blending-disabled);
+      `wispterm_metal_set_blend_enabled`/`wispterm_metal_set_blend_mode` record the
+      state and `encode_draw` selects the matching PSO. `render_state.setBlendMode`/
+      `setBlendEnabled` now forward instead of no-op'ing, so `cell_renderer.zig:425`
+      (premultiplied color emoji) and `background_image.zig:215`
+      (`setBlendEnabled(false)` opaque wallpaper) behave like the OpenGL backend.
+      Proof: `zig build test-metal` (new blend-variant assertion). **On-device
+      visual check (emoji brightness, wallpaper) still pending.**
+      *Ghostty does this differently and more simply: `metal/Pipeline.zig` uses
+      **one** blend config everywhere — premultiplied alpha (`src=one`,
+      `dst=one_minus_source_alpha`; comment: "We always use premultiplied alpha
+      blending for now") — and every fragment shader emits premultiplied color.
+      That removes `setBlendMode` entirely and structurally avoids the
+      color-emoji double-multiply. **Long-term WispTerm should consider converging
+      on this** (rewrite each MSL fragment shader to output premultiplied RGB, so
+      one PSO blend config serves all draws) instead of carrying alpha +
+      premultiplied PSO variants; short-term the variants are the lower-risk fix.*
+- [x] **P2 — Sampler filter/wrap state (fixes `nearest` blur).** Done. The four
+      texture-sampling MSL shaders now take `sampler s [[sampler(0)]]` instead of
+      a hard-coded `constexpr sampler`; `bridge.m` lazily builds an
+      `MTLSamplerState` per (filter, wrap) and `encode_draw` binds it with
+      `setFragmentSamplerState:` from the active texture's recorded filter/wrap;
+      `Texture.upload2D` now forwards `o.filter`. Default behavior is unchanged
+      (everything currently uses linear/clamp) but `.nearest` is now honored.
+      Proof: `zig build test-metal`, `zig build test-full -Dtarget=aarch64-macos`.
+      *Mirrors Ghostty's dedicated `metal/Sampler.zig` + `setFragmentSamplerState:`.*
+- [ ] **P2 — Framebuffer render-target switching — DEFERRED (needs a GLSL→MSL
+      path first; not a standalone task).** Evaluated 2026-05-28. The FBO itself
+      has a clean Metal equivalent — render-to-texture (end the current encoder,
+      open a new render pass whose color attachment is the offscreen `MTLTexture`,
+      restore on `unbind`); `metal/Framebuffer.zig` already holds the texture, only
+      `bind`/`unbind` need to switch the render pass. **But its only consumer is
+      `post_process.zig`, whose custom shaders are Shadertoy-style GLSL**
+      (`#version 330 core` + `mainImage`, wrapped in `buildPostFragmentSource`).
+      **Metal cannot compile GLSL** (it runs MSL), so even with the FBO wired up
+      the user's `custom-shader` would not run on macOS — the FBO would have no
+      working consumer. The real macOS work is a **GLSL→MSL translation layer**,
+      exactly what Ghostty does in `src/renderer/shadertoy.zig`: GLSL →SPIR-V
+      (glslang) →MSL (SPIRV-Cross), so one Shadertoy GLSL runs on every backend.
+      → Track this as a separate **"macOS custom-shader support"** feature (FBO
+      render-to-texture **plus** the glslang+SPIRV-Cross translation + the
+      Shadertoy uniform struct), not as part of D1.y's render-correctness scope.
+      `g_post_enabled` defaults off and `fbo.zig` is currently un-wired, so there
+      is no regression today.
+- [x] **P3 — Frame throughput.** Done. `wispterm_metal_frame_end` no longer calls
+      `waitUntilCompleted` every frame (that serialized CPU and GPU with zero
+      overlap); GPU errors are now reported via `addCompletedHandler` and our own
+      command-buffer/drawable refs are released right after `commit` (Metal
+      retains them until the GPU finishes + the frame presents). Proof: `zig build
+      test-metal`, `zig build test-full -Dtarget=aarch64-macos`. **On-device
+      frame-pacing/no-flicker check still pending.** Per-upload fresh `MTLBuffer`
+      allocation (intentional, `bridge.m` comment) can later become a ring buffer
+      if profiling shows it matters.
+
+> **Native proof for D1.y:** extend `zig build test-metal` with viewport-origin,
+> scissor-rect, and blend-variant assertions; keep `zig build test-full
+> -Dtarget=aarch64-macos` green; and verify on-device that a split positions both
+> panes correctly with no clip overflow, color emoji render at full brightness,
+> and the markdown preview / file explorer clip to their regions.
+
 **D2 — AppKit host** (`window_backend_macos.zig` + `window_macos.zig`)
 - [x] `NSApplication`/`NSWindow` + the AppKit run loop (AppKit owns the event
       loop and pumps the core — unlike the Win32 message pump). Add `.macos` to
@@ -329,7 +458,7 @@ services, and `.app` packaging. Ghostty reference: `src/renderer/metal/`,
       smoke paths.
 - [x] Reconcile the app-drawn titlebar / caption buttons with macOS traffic-light
       conventions. macOS uses AppKit's titlebar/traffic lights (`titlebar_height`
-      and caption button width are zero), so Phantty's app-drawn titlebar path
+      and caption button width are zero), so WispTerm's app-drawn titlebar path
       skips itself while Windows keeps the custom caption metrics.
 
 **D3 — CoreText fonts** (`font_discovery_macos.zig`, `font_backend_macos.zig`)
@@ -353,8 +482,8 @@ services, and `.app` packaging. Ghostty reference: `src/renderer/metal/`,
       cursor, display, text, global hotkeys (Carbon `RegisterEventHotKey`),
       AppKit file drops, and update-package current-package detection; existing
       portable/no-op seams cover session_lock and console on macOS; dirs already
-      resolve to `~/Library/Application Support/phantty`; config watching now
-      uses kqueue `EVFILT_VNODE`. Phantty's current notification seam is bell +
+      resolve to `~/Library/Application Support/wispterm`; config watching now
+      uses kqueue `EVFILT_VNODE`. WispTerm's current notification seam is bell +
       window attention (`NSBeep`/`requestUserAttention`); Ghostty's broader
       desktop-notification path uses `UNUserNotificationCenter` in its AppKit
       layer. Native proof: `zig build test-macos-services`,
@@ -388,21 +517,21 @@ services, and `.app` packaging. Ghostty reference: `src/renderer/metal/`,
 - [x] `.app` bundle + `Info.plist`; code signing + notarization; `.dmg`. Updater
       story (adapt the existing portable updater or adopt Sparkle).
       Implemented a `macos-dist` build step, `packaging/macos/package.sh`, and
-      `packaging/macos/Phantty.entitlements`. Local builds ad-hoc sign with
-      hardened runtime and create `zig-out/dist/macos/phantty-macos-vX.Y.Z.dmg`;
-      release builds set `PHANTTY_MACOS_SIGN_IDENTITY` and
-      `PHANTTY_MACOS_NOTARY_PROFILE` to enable Developer ID signing,
+      `packaging/macos/WispTerm.entitlements`. Local builds ad-hoc sign with
+      hardened runtime and create `zig-out/dist/macos/wispterm-macos-vX.Y.Z.dmg`;
+      release builds set `WISPTERM_MACOS_SIGN_IDENTITY` and
+      `WISPTERM_MACOS_NOTARY_PROFILE` to enable Developer ID signing,
       `notarytool submit --wait`, and stapling. The macOS updater story is:
       initial macOS releases publish a matching DMG asset selected by the
-      existing update checker (`phantty-macos-{tag}.dmg`) and saved to
+      existing update checker (`wispterm-macos-{tag}.dmg`) and saved to
       Downloads; a full automatic updater should follow Ghostty's Sparkle
       approach once the macOS release-update flow is ready for unattended
       replacement. Ghostty
       reference: its release workflow signs nested code and app with hardened
       runtime, creates a DMG, notarizes/staples app + DMG, and generates Sparkle
       appcast metadata. Proof: `zig build macos-dist -Dtarget=aarch64-macos`,
-      `codesign -dvvv --entitlements :- zig-out/bin/Phantty.app`,
-      `hdiutil verify zig-out/dist/macos/phantty-macos-v0.32.0.dmg`,
+      `codesign -dvvv --entitlements :- zig-out/bin/WispTerm.app`,
+      `hdiutil verify zig-out/dist/macos/wispterm-macos-v0.32.0.dmg`,
       `zig test build.zig`, `zig build test`, `zig build test-macos-services`,
       `zig build test-full`, and `zig build test-full -Dtarget=aarch64-macos`.
 
@@ -411,12 +540,12 @@ layer neutralization) → D2 (AppKit host + drawable seam) → D3 (CoreText) →
 macOS pty constants in D4.** Services / webview / packaging follow.
 
 **D7 — Native macOS app menu (NSMenu)**
-- [x] **D7.1 NSMenu skeleton.** Phantty had no application menu on macOS — the
+- [x] **D7.1 NSMenu skeleton.** WispTerm had no application menu on macOS — the
       only way to reach the command center, settings, or sidebar toggle was the
       keyboard shortcut, which gets eaten by IME/remote-control software
       (ToDesk, etc.). Added a thin Objective-C bridge
       (`src/platform/menu_macos_bridge.m`) that builds the standard macOS
-      menu set (`Phantty / File / Edit / View / Window`) with menu items wired
+      menu set (`WispTerm / File / Edit / View / Window`) with menu items wired
       to the existing keybind `Action` enum: Open Command Center
       (`⌃⇧P`), Settings… (`⌘,`), New Tab (`⌃⇧T`), New Window (`⌃⇧N`),
       Toggle Tab Sidebar (`⌃⇧B`), Toggle File Explorer (`⌃⇧⌥E`), Split Right
@@ -435,20 +564,115 @@ macOS pty constants in D4.** Services / webview / packaging follow.
       configured shortcut text from `keybind.Set` instead of hardcoded
       equivalents (so user remaps show in the menu).
 - [ ] **D7.3 Localize menu titles.** Currently English-only; add a localized
-      string table that matches the rest of Phantty's locale story.
+      string table that matches the rest of WispTerm's locale story.
 
-### macOS UI status (post D1.x + D7.1)
+### Phase D8 — macOS window lifecycle, native title bar & CJK fallback
+
+Polish/bugfix pass after the D-phase skeleton landed. Surfaced by real on-device
+use; the Windows port (`builtin.os.tag != .macos`) is unchanged throughout —
+every behavior is gated behind a macOS check. Status: implemented, builds clean
+for both `aarch64-macos` and the default `x86_64-windows-gnu`; on-device
+verification in progress.
+
+- [x] **D8.1 Close button keeps the process alive (Terminal.app / VS Code
+      semantics).** The red traffic-light used to tear down the whole process.
+      Added `WispTermAppDelegate` in `window_macos_bridge.m`:
+      `applicationShouldTerminateAfterLastWindowClosed:` → NO,
+      `applicationShouldHandleReopen:hasVisibleWindows:` sets an atomic reopen
+      flag, `applicationShouldTerminate:` sets a quit flag and `performClose:`-es
+      every live window then returns `NSTerminateCancel` (zig owns shutdown).
+      Bridge exposes `consume_reopen` / `consume_quit` / `request_quit` /
+      `pump_events(timeout)`; wired through `window_macos.zig` → `window.zig`
+      facade → `window_backend.zig` (no-op stubs for Windows/unsupported). On
+      macOS the close button now sets `g_should_close` directly (no confirm
+      overlay). `App.run()` runs the first window on the main thread, then enters
+      `macIdleUntilQuit()`: blocks in `pumpAppEvents(0.25)`, spawns a fresh window
+      on Dock reopen, returns on quit.
+- [x] **D8.2 Dock reopen spawns on a worker thread, not the main thread.**
+      Reusing the main thread for a second window session resurfaced
+      "single-run" thread-local state (font caches, atlas handles, UI flags).
+      Reopen now calls `requestNewWindow(null, null)` (same path as `⌃⇧N`), so
+      the new window's thread-locals start at their declared defaults. Also fixed
+      two latent single-run bugs this exposed: `AppWindow.zig` shutdown defer now
+      resets `font.icon_cache` / `font.g_titlebar_cache` to `.empty` after
+      `deinit` (a re-entrant `clearTitlebarFont` was double-freeing dangling
+      hash-map metadata → `incorrectAlignment` panic).
+- [x] **D8.3 NSWindow operations marshalled to the main thread (crash fix).**
+      Root macOS-port architecture bug: every `AppWindow` runs its event/render
+      loop on a spawned thread but called NSWindow APIs directly, tripping
+      AppKit's "Must only be used from the main thread" assertion (crashed in
+      `setContentSize` → `-[NSWMWindowCoordinator performTransactionUsingBlock:]`
+      on resize/reopen). Added `wispterm_macos_run_on_main(block)` (inline on the
+      main thread, else `dispatch_sync` to the main queue) and wrapped
+      `set_content_size` / `set_frame` / `show` / `hide` / `make_key` / `zoom` /
+      `destroy`. `window_poll` only pumps `[NSApp nextEvent]` on the main thread
+      (worker threads just sync the Metal layer; AppKit dispatches their events to
+      the window delegate which fills the per-window buffer). `pump_events` gained
+      a blocking `timeout` so the main run loop drains the GCD main queue —
+      otherwise worker `dispatch_sync` would deadlock against a spin-sleep.
+- [ ] **D8.3a Event buffer cross-thread safety (follow-up).** The per-window
+      key/char/mouse/file-drop/message ring buffers in `window_macos_bridge.m` are
+      SPSC and lock-free; with D8.3 the producer is now the main thread (AppKit
+      delegate) and the consumer is the worker thread. Add an `os_unfair_lock` (or
+      atomic head/count) before relying on this under load — watch for dropped
+      keystrokes / input lag as the symptom.
+- [x] **D8.4 Unified title bar + traffic-light-aware toggle placement.** macOS no
+      longer shows the empty native title strip above WispTerm's own bar. NSWindow
+      gains `NSWindowStyleMaskFullSizeContentView` + `titlebarAppearsTransparent`
+      + `titleVisibility = NSWindowTitleHidden`, so the app-drawn titlebar extends
+      under the traffic lights (Codex / VS Code style). `titlebar.zig` reserves a
+      DPI-scaled strip on the left (`titlebarLeftReserved()` = 80 logical px ×
+      `g_dpi/96`, in framebuffer pixels) so the sidebar-toggle hamburger and tab
+      title sit to the right of the red/yellow/green controls; `input.zig`
+      hit-tests shift to match. (Supersedes the D2 note that macOS skips the
+      app-drawn titlebar entirely.)
+- [ ] **D8.4a Draggable titlebar region (follow-up).** With the native title bar
+      hidden the window is only draggable via the traffic-light gaps. Give the
+      non-interactive part of the app-drawn titlebar a window-drag affordance
+      (`-mouseDownCanMoveWindow` / a hit-test drag region).
+- [x] **D8.5 CJK fallback no longer renders tofu.** macOS 26 moved PingFang into
+      `PrivateFrameworks/.../Reserved/PingFangUI.ttc`, a system-reserved `.ttc`
+      that FreeType cannot open (`FT_New_Face` → err 144) — and CoreText's default
+      cascade prefers exactly that font, so every CJK glyph fell through to a
+      blank box. `font/manager.zig`: `preferredFallbackFamilies` gained a macOS
+      branch listing FreeType-loadable public system fonts (`Hiragino Sans GB`,
+      `Songti SC`, `Heiti SC`, `STHeiti`, …); `findOrLoadFallbackFace` was
+      restructured to try candidates in priority order (config → preferred →
+      CoreText default), each validated by `openFallbackFreetypeFace` which
+      actually opens the file with FreeType and confirms the glyph exists — so an
+      unloadable reserved font no longer aborts the lookup. First candidate
+      (`Hiragino Sans GB` → `/System/Library/Fonts/Hiragino Sans GB.ttc`) resolves
+      cleanly.
+- [ ] **D8.6 Window position persistence is wrong on macOS (known bug, not yet
+      fixed).** `window_state.zig` saves `rect.left/top`, but on macOS
+      `wispterm_macos_rect_from_nsrect` stores `NSMinY` (the window's *bottom* edge
+      in AppKit's bottom-left origin) into the `top` field. Combined with
+      `isPointOnAnyDisplay` only validating a single `(x+50, y+50)` point, a
+      previously off-screen / multi-monitor position can be restored off-screen.
+      Fix: translate NSRect into Windows-style top-left semantics (or persist
+      native AppKit coords separately), validate the whole frame against
+      `visibleFrame`, and default new windows to `[NSWindow center]` / cascade
+      instead of the hard-coded `(120, 120)`.
+
+### macOS UI status (post D1.x + D7.1 + D8)
 
 | Feature | Status on macOS |
 |---|---|
 | Terminal text rendering | ✅ works (cell pipeline + CoreText/FreeType) |
+| CJK / 中文 rendering | ✅ fixed in D8.5 (public-font fallback; PingFang reserved-ttc was unloadable) |
 | Default shell | ✅ `zsh` (was `sh` until 2026-05-27) |
-| NSMenu (Phantty / File / Edit / View / Window) | ✅ visible, clickable, key equivalents fire |
+| NSMenu (WispTerm / File / Edit / View / Window) | ✅ visible, clickable, key equivalents fire |
+| Window title bar | ✅ unified — app-drawn bar extends under traffic lights (D8.4) |
+| Close button (red) | ✅ closes window, keeps process in Dock; Dock icon reopens (D8.1) |
+| cmd+Q | ✅ tears down the whole app (D8.1) |
+| Window resize / reopen | ✅ no longer crashes — NSWindow ops marshalled to main thread (D8.3) |
 | Command center / settings page / SSH form / AI form / session launcher | ✅ render fully (panels, borders, selection highlights, text) |
 | Tab sidebar | ✅ renders rows, selection highlight, tab numbers |
 | File explorer panel | ✅ unblocked by D1.x; verify icons/scroll on real workloads |
 | Markdown / image preview | ✅ unblocked by D1.x; verify chrome on real previews |
 | Quake-style drop-down | ✅ window position + overlay rendering |
+| Window position restore | ⚠️ buggy on macOS (D8.6 — coordinate-system mismatch) |
+| Draggable titlebar | ⚠️ only via traffic-light gaps until D8.4a |
 | Embedded browser panel | ❌ disabled (D5 — no WKWebView backend yet) |
 
 ### Linux — deferred

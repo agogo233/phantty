@@ -5,6 +5,7 @@
 //! Uses AppWindow's GL context for GPU texture operations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const freetype = @import("freetype");
 const harfbuzz = @import("harfbuzz");
 const sprite = @import("sprite.zig");
@@ -13,9 +14,25 @@ const font_backend = @import("../platform/font_backend.zig");
 const embedded = @import("embedded.zig");
 const Config = @import("../config.zig");
 const AppWindow = @import("../AppWindow.zig");
+const render_diagnostics = @import("../render_diagnostics.zig");
 
 const gpu = AppWindow.gpu;
 const c = gpu.c;
+
+/// Hard ceiling on a single glyph bitmap dimension (in pixels).
+///
+/// Real glyphs at any sane font size and DPI stay far below this. A value
+/// above it means the face is in a degenerate state — most commonly a bogus
+/// DPI computed during a startup resize on some multi-monitor / HiDPI setups
+/// (see issue #90) — which would make the size arithmetic below
+/// (`width * height [* depth]`, all `u32`) overflow. In a ReleaseFast build
+/// that overflow silently wraps to a tiny value, the destination buffer is
+/// under-allocated, and the per-row `@memcpy` scribbles past it, corrupting
+/// the heap. The corruption later surfaces as an unrelated crash (e.g. deep
+/// inside FreeType's autofitter). Rejecting the glyph here keeps that wrapping
+/// from ever happening and turns a silent heap smash into a skipped glyph plus
+/// a diagnostic log line.
+pub const MAX_GLYPH_DIM: u32 = 4096;
 
 pub const FontAtlas = @import("Atlas.zig");
 
@@ -125,12 +142,42 @@ pub threadlocal var g_bell_emoji_face: ?freetype.Face = null;
 /// High-DPI monitors need a higher-resolution glyph atlas instead of relying on
 /// platform display scaling from the baseline DPI.
 pub fn setFacePointSize(face: freetype.Face, font_size: u32) !void {
-    try face.setCharSize(
+    face.setCharSize(
         0,
         @as(i32, @intCast(font_size)) * 64,
         @intCast(g_dpi),
         @intCast(g_dpi),
-    );
+    ) catch |err| {
+        // Bitmap-only fonts (Apple Color Emoji's sbix strikes etc.) reject
+        // FT_Set_Char_Size because they aren't scalable; we have to pick the
+        // best matching fixed strike via FT_Select_Size instead. Without this
+        // emoji fallback faces fail to load and the cells render blank.
+        if (!face.hasFixedSizes()) return err;
+        try selectClosestFixedStrike(face, font_size);
+    };
+}
+
+fn selectClosestFixedStrike(face: freetype.Face, font_size: u32) !void {
+    const num = face.handle.*.num_fixed_sizes;
+    if (num <= 0) return error.NoFixedSizes;
+
+    // Target pixel-per-em from the requested point size at the active DPI.
+    const target_ppem: i32 = @intCast(@divTrunc(font_size * g_dpi + 36, 72));
+
+    var best_idx: i32 = 0;
+    var best_diff: i32 = std.math.maxInt(i32);
+    var i: i32 = 0;
+    while (i < num) : (i += 1) {
+        const bs = face.handle.*.available_sizes[@intCast(i)];
+        // y_ppem is in 26.6 fixed-point pixels; >>6 gives integer ppem.
+        const ppem: i32 = @intCast(bs.y_ppem >> 6);
+        const diff: i32 = if (ppem >= target_ppem) ppem - target_ppem else target_ppem - ppem;
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_idx = i;
+        }
+    }
+    try face.selectSize(best_idx);
 }
 
 /// Convert FreeType 26.6 fixed-point to f64 (like Ghostty)
@@ -303,6 +350,26 @@ fn isCjkCodepoint(codepoint: u32) bool {
 
 fn preferredFallbackFamilies(codepoint: u32) []const []const u8 {
     if (isCjkCodepoint(codepoint)) {
+        if (builtin.os.tag == .macos) {
+            // macOS 26 moved PingFang into PrivateFrameworks/.../Reserved as a
+            // system-reserved .ttc that FreeType cannot open (FT_New_Face fails),
+            // and CoreText's default cascade prefers exactly that reserved font —
+            // which is why CJK rendered as tofu. List the public system CJK
+            // families (all FreeType-loadable from /System/Library/Fonts) first
+            // so findOrLoadFallbackFace resolves a usable face before falling
+            // back to the broken CoreText default. Third-party families follow
+            // for users who installed them.
+            return &.{
+                "Hiragino Sans GB",
+                "Songti SC",
+                "Heiti SC",
+                "STHeiti",
+                "Hiragino Sans",
+                "Apple SD Gothic Neo",
+                "Sarasa Mono SC",
+                "Noto Sans CJK SC",
+            };
+        }
         return &.{
             "Maple Mono NF CN",
             "Sarasa Mono SC",
@@ -442,14 +509,25 @@ pub fn packBitmapIntoAtlas(
         return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
     }
 
+    // Reject degenerate bitmap sizes before any size arithmetic (see #90).
+    if (width > MAX_GLYPH_DIM or height > MAX_GLYPH_DIM) {
+        render_diagnostics.log(
+            "atlas-pack reject oversized glyph {}x{} (max={}) dpi={} font_size={}",
+            .{ width, height, MAX_GLYPH_DIM, g_dpi, g_font_size },
+        );
+        return null;
+    }
+
     // Ensure atlas exists
     if (atlas_ptr.* == null) {
         atlas_ptr.* = FontAtlas.init(alloc, 512, .grayscale) catch return null;
     }
     var atlas = &atlas_ptr.*.?;
 
-    // Copy source bitmap to tightly-packed buffer (FreeType pitch may != width)
-    const tight = alloc.alloc(u8, width * height) catch return null;
+    // Copy source bitmap to tightly-packed buffer (FreeType pitch may != width).
+    // `width`/`height` are bounded by MAX_GLYPH_DIM above, so the usize product
+    // cannot overflow.
+    const tight = alloc.alloc(u8, @as(usize, width) * height) catch return null;
     defer alloc.free(tight);
     const src = src_buffer orelse return null;
     for (0..height) |row| {
@@ -492,6 +570,15 @@ pub fn packPixelsIntoAtlas(
         return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
     }
 
+    // Reject degenerate sizes before any atlas arithmetic (see #90).
+    if (width > MAX_GLYPH_DIM or height > MAX_GLYPH_DIM) {
+        render_diagnostics.log(
+            "atlas-pack-pixels reject oversized {}x{} (max={}) dpi={} font_size={}",
+            .{ width, height, MAX_GLYPH_DIM, g_dpi, g_font_size },
+        );
+        return null;
+    }
+
     if (atlas_ptr.* == null) {
         atlas_ptr.* = FontAtlas.init(alloc, 512, .grayscale) catch return null;
     }
@@ -528,14 +615,24 @@ pub fn packColorBitmapIntoAtlas(
         return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
     }
 
+    // Reject degenerate bitmap sizes before any size arithmetic (see #90).
+    if (width > MAX_GLYPH_DIM or height > MAX_GLYPH_DIM) {
+        render_diagnostics.log(
+            "atlas-pack-color reject oversized {}x{} (max={}) dpi={} font_size={}",
+            .{ width, height, MAX_GLYPH_DIM, g_dpi, g_font_size },
+        );
+        return null;
+    }
+
     if (g_color_atlas == null) {
         g_color_atlas = FontAtlas.init(alloc, 512, .bgra) catch return null;
     }
     var atlas = &g_color_atlas.?;
 
-    // Copy source bitmap to tightly-packed BGRA buffer
+    // Copy source bitmap to tightly-packed BGRA buffer. `width`/`height` are
+    // bounded by MAX_GLYPH_DIM above, so the usize product cannot overflow.
     const depth: u32 = 4; // BGRA
-    const tight = alloc.alloc(u8, width * height * depth) catch return null;
+    const tight = alloc.alloc(u8, @as(usize, width) * height * depth) catch return null;
     defer alloc.free(tight);
     const src = src_buffer orelse return null;
     for (0..height) |row| {
@@ -1119,6 +1216,47 @@ pub fn loadBellEmoji() ?BellCache {
 // ============================================================================
 
 /// Find or load a fallback font that contains the given codepoint
+/// Resolve a FallbackFont to a FreeType face, verifying FreeType can actually
+/// open the file AND that the face contains `codepoint`. Returns null (after
+/// cleaning up) if either check fails, so callers can try the next candidate.
+/// This is the crux of the macOS CJK fix: CoreText happily hands back the
+/// reserved PingFangUI.ttc which FreeType cannot open, so we must validate the
+/// load rather than trust the discovery result.
+fn openFallbackFreetypeFace(
+    ft_lib: freetype.Library,
+    font: *font_backend.FallbackFont,
+    codepoint: u32,
+    alloc: std.mem.Allocator,
+) ?freetype.Face {
+    var font_path = font_backend.fontFilePathAlloc(alloc, font) orelse return null;
+    defer font_path.deinit();
+
+    const ft_face = ft_lib.initFace(font_path.path, @intCast(font_path.face_index)) catch return null;
+    if ((ft_face.getCharIndex(codepoint) orelse 0) == 0) {
+        ft_face.deinit();
+        return null;
+    }
+    return ft_face;
+}
+
+/// Try each family in order; return the first one FreeType can load with a
+/// glyph for `codepoint`.
+fn tryFamiliesForFallback(
+    discovery: *font_backend.FontDiscovery,
+    ft_lib: freetype.Library,
+    codepoint: u32,
+    families: []const []const u8,
+    alloc: std.mem.Allocator,
+) ?freetype.Face {
+    for (families) |family_name| {
+        const font = (discovery.findFont(family_name, .NORMAL, .NORMAL) catch null) orelse continue;
+        defer font.release();
+        if (!font.hasCharacter(codepoint)) continue;
+        if (openFallbackFreetypeFace(ft_lib, font, codepoint, alloc)) |face| return face;
+    }
+    return null;
+}
+
 pub fn findOrLoadFallbackFace(codepoint: u32, alloc: std.mem.Allocator) ?freetype.Face {
     // Check if we already have a fallback for this codepoint
     if (g_fallback_faces.get(codepoint)) |face| {
@@ -1134,26 +1272,31 @@ pub fn findOrLoadFallbackFace(codepoint: u32, alloc: std.mem.Allocator) ?freetyp
     const discovery = g_font_discovery orelse return null;
     const ft_lib = g_ft_lib orelse return null;
 
-    const preferred_families = preferredFallbackFamilies(codepoint);
-    const maybe_font = findConfiguredFallbackFont(discovery, codepoint) orelse if (preferred_families.len > 0)
-        ((discovery.findPreferredFallbackFont(codepoint, preferred_families) catch null) orelse
-            (discovery.findFallbackFont(codepoint) catch null))
-    else
-        (discovery.findFallbackFont(codepoint) catch null);
+    // Resolve a FreeType-loadable face, trying candidates in priority order.
+    // Each candidate is validated by actually opening it with FreeType (see
+    // openFallbackFreetypeFace) so an unloadable system-reserved font does not
+    // abort the whole lookup.
+    const ft_face: freetype.Face = blk: {
+        // 1. Explicit user configuration (cjk-font / fallback CSV).
+        if (findConfiguredFallbackFont(discovery, codepoint)) |font| {
+            defer font.release();
+            if (openFallbackFreetypeFace(ft_lib, font, codepoint, alloc)) |face| break :blk face;
+        }
 
-    // Use the system font backend to find a font with this codepoint
-    const font = maybe_font orelse {
-        // Cache the negative result to avoid repeated system font queries
+        // 2. Platform preferred families (FreeType-loadable system fonts).
+        const preferred = preferredFallbackFamilies(codepoint);
+        if (tryFamiliesForFallback(discovery, ft_lib, codepoint, preferred, alloc)) |face| break :blk face;
+
+        // 3. CoreText / platform default cascade as a last resort.
+        if (discovery.findFallbackFont(codepoint) catch null) |font| {
+            defer font.release();
+            if (openFallbackFreetypeFace(ft_lib, font, codepoint, alloc)) |face| break :blk face;
+        }
+
+        // Nothing usable — cache the negative result to avoid repeated queries.
         g_no_fallback.put(alloc, codepoint, {}) catch {};
         return null;
     };
-    defer font.release();
-
-    var font_path = font_backend.fontFilePathAlloc(alloc, font) orelse return null;
-    defer font_path.deinit();
-
-    // Load with FreeType
-    const ft_face = ft_lib.initFace(font_path.path, @intCast(font_path.face_index)) catch return null;
 
     // Start from the primary point size, then normalize fallback metrics to
     // the active terminal face. This follows Ghostty's overall approach of
@@ -1163,13 +1306,30 @@ pub fn findOrLoadFallbackFace(codepoint: u32, alloc: std.mem.Allocator) ?freetyp
         return null;
     };
 
-    if (glyph_face) |primary_face| {
+    if (ft_face.hasColor() and ft_face.hasFixedSizes()) {
+        // Color bitmap fonts (Apple Color Emoji's sbix strikes, Noto CBDT,
+        // etc.): pin a fixed strike explicitly. On these faces FT_Set_Char_Size
+        // can *succeed* without selecting a strike (e.g. Apple Color Emoji at
+        // Retina DPI), leaving the face in scalable mode — FT_LOAD_COLOR then
+        // renders a tiny gray outline instead of the color bitmap, so the cell
+        // appears blank. We must also skip the metric rescale below: its
+        // FT_Set_Char_Size would unpin the strike again. The renderer scales
+        // the BGRA bitmap down to cell height at draw time.
+        selectClosestFixedStrike(ft_face, g_font_size) catch {
+            ft_face.deinit();
+            return null;
+        };
+    } else if (glyph_face) |primary_face| {
         const scale = fallbackScaleFactor(primary_face, ft_face, codepoint);
         if (@abs(scale - 1.0) > 0.01) {
             const scaled_size = @max(8.0, @round(@as(f64, @floatFromInt(g_font_size)) * scale));
             ft_face.setCharSize(0, @intFromFloat(scaled_size * 64.0), @intCast(g_dpi), @intCast(g_dpi)) catch {
-                ft_face.deinit();
-                return null;
+                // Non-color bitmap-only fallbacks can't be rescaled here; the
+                // strike already chosen in setFacePointSize stays in effect.
+                if (!ft_face.hasFixedSizes()) {
+                    ft_face.deinit();
+                    return null;
+                }
             };
         }
     }

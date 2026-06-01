@@ -128,12 +128,25 @@ test "platform process exposes current process id" {
     try std.testing.expectEqual(u32, @typeInfo(@TypeOf(currentProcessId)).@"fn".return_type.?);
 }
 
-pub fn childExited(id: std.process.Child.Id, timeout_ms: u32) bool {
+pub const ChildExit = shared.ChildExit;
+
+/// Poll a child for exit, blocking up to `timeout_ms`. On POSIX this reaps the
+/// zombie (so the caller must take std.process.Child.wait()'s term-already-set
+/// fast path rather than waitpid()-ing again). On Windows the process object is
+/// not consumed.
+pub fn childExited(id: std.process.Child.Id, timeout_ms: u32) ChildExit {
     return impl.childExited(id, timeout_ms);
 }
 
 pub fn terminateChild(id: std.process.Child.Id) void {
     impl.terminateChild(id);
+}
+
+/// Best-effort current working directory of a live process by pid (caller owns
+/// the returned slice). Used to resolve relative preview paths for shells that
+/// don't emit OSC 7. macOS/Linux query the OS; Windows returns null.
+pub fn processCwd(allocator: std.mem.Allocator, pid: i32) ?[]u8 {
+    return impl.processCwd(allocator, pid);
 }
 
 pub const PipeWriteError = shared.PipeWriteError;
@@ -145,9 +158,9 @@ pub fn writeAllToPipe(file: std.fs.File, data: []const u8) PipeWriteError!void {
 pub fn sshAskPassScriptBodyForOs(os_tag: std.Target.Os.Tag) []const u8 {
     return switch (os_tag) {
         .windows => "@echo off\r\n" ++
-            "powershell.exe -NoLogo -NoProfile -Command \"[Console]::Out.Write($env:PHANTTY_SSH_PASSWORD)\"\r\n",
+            "powershell.exe -NoLogo -NoProfile -Command \"[Console]::Out.Write($env:WISPTERM_SSH_PASSWORD)\"\r\n",
         else => "#!/bin/sh\n" ++
-            "printf %s \"$PHANTTY_SSH_PASSWORD\"\n",
+            "printf %s \"$WISPTERM_SSH_PASSWORD\"\n",
     };
 }
 
@@ -163,8 +176,8 @@ pub fn sshAskPassScriptPathFromTempDirForOs(
     temp_dir: []const u8,
 ) ![]const u8 {
     const basename = switch (os_tag) {
-        .windows => "phantty-ssh-askpass.cmd",
-        else => "phantty-ssh-askpass.sh",
+        .windows => "wispterm-ssh-askpass.cmd",
+        else => "wispterm-ssh-askpass.sh",
     };
     return std.fs.path.join(allocator, &.{ temp_dir, basename });
 }
@@ -177,6 +190,17 @@ pub fn ensureSshAskPassScript(allocator: std.mem.Allocator) ?[]const u8 {
     defer file.close();
 
     file.writeAll(sshAskPassScriptBodyForOs(builtin.os.tag)) catch return null;
+
+    // POSIX: ssh refuses to run a SSH_ASKPASS helper that is not executable
+    // and silently falls back to a tty password prompt. That breaks the
+    // non-interactive ssh/scp that markdown preview and transfers spawn (no
+    // tty -> no way to type the password), and even makes the interactive
+    // connection prompt for the password by hand. Windows .cmd scripts run by
+    // extension and need no mode bit. (createFileAbsolute leaves the file
+    // mode at the umask default, so set it explicitly here.)
+    if (builtin.os.tag != .windows) {
+        file.chmod(0o700) catch {};
+    }
     return path;
 }
 
@@ -199,13 +223,13 @@ pub fn spawnDetachedWithOptions(allocator: std.mem.Allocator, options: DetachedS
 
 test "platform process exposes typed detached spawn options" {
     const options = DetachedSpawnOptions{
-        .argv = &.{ "phantty.exe", "--detached" },
-        .cwd = "C:/Phantty",
+        .argv = &.{ "wispterm.exe", "--detached" },
+        .cwd = "C:/WispTerm",
         .create_no_window = true,
     };
 
-    try std.testing.expectEqualStrings("phantty.exe", options.argv[0]);
-    try std.testing.expectEqualStrings("C:/Phantty", options.cwd.?);
+    try std.testing.expectEqualStrings("wispterm.exe", options.argv[0]);
+    try std.testing.expectEqualStrings("C:/WispTerm", options.cwd.?);
     try std.testing.expect(options.create_no_window);
     try std.testing.expectEqual(@as(usize, 2), @typeInfo(@TypeOf(spawnDetachedWithOptions)).@"fn".params.len);
 }
@@ -214,17 +238,17 @@ test "platform process wait exposes a child exit poll API" {
     const ChildId = std.process.Child.Id;
     try std.testing.expect(@typeInfo(@TypeOf(childExited)).@"fn".params[0].type.? == ChildId);
     try std.testing.expect(@typeInfo(@TypeOf(childExited)).@"fn".params[1].type.? == u32);
-    try std.testing.expect(@typeInfo(@TypeOf(childExited)).@"fn".return_type.? == bool);
+    try std.testing.expect(@typeInfo(@TypeOf(childExited)).@"fn".return_type.? == ChildExit);
 }
 
 test "platform process exposes SSH askpass script helpers" {
     const script = sshAskPassScriptBodyForOs(.windows);
-    try std.testing.expect(std.mem.indexOf(u8, script, "PHANTTY_SSH_PASSWORD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "WISPTERM_SSH_PASSWORD") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "powershell.exe") != null);
 
     const path = try sshAskPassScriptPathFromTempDirForOs(std.testing.allocator, .windows, "C:/Temp");
     defer std.testing.allocator.free(path);
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ "C:/Temp", "phantty-ssh-askpass.cmd" });
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ "C:/Temp", "wispterm-ssh-askpass.cmd" });
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, path);
 }

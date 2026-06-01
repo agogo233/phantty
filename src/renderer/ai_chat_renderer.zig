@@ -35,7 +35,7 @@ const PERMISSION_CHIP_H: f32 = 24;
 const STATUS_SLOT_W: f32 = 280;
 const STOP_BUTTON_W: f32 = 104;
 const STOP_BUTTON_H: f32 = 28;
-const MODE_SLOT_W: f32 = 112;
+const MODE_SLOT_W: f32 = 76;
 const INPUT_SCROLLBAR_GUTTER: f32 = 10;
 const INPUT_SCROLLBAR_W: f32 = 4;
 const INPUT_SCROLLBAR_PAD: f32 = 7;
@@ -57,8 +57,10 @@ const TABLE_MIN_COL_W: f32 = 56;
 const SUGGESTION_ROW_H: f32 = 28;
 const SUGGESTION_PAD_Y: f32 = 6;
 const SUGGESTION_GAP: f32 = 6;
-const SUGGESTION_MAX_W: f32 = 560;
-const SUGGESTION_COMMAND_W: f32 = 148;
+const SUGGESTION_MAX_W: f32 = 1120;
+const SUGGESTION_COMMAND_W: f32 = 420;
+const SUGGESTION_PAD_X: f32 = 18;
+const SUGGESTION_COLUMN_GAP: f32 = 34;
 const MISSING_API_KEY_ACTION_TEXT = "Missing API key. Click to configure";
 
 pub const HitTarget = union(enum) {
@@ -116,8 +118,8 @@ pub fn render(
     window_width: f32,
     window_height: f32,
     titlebar_offset: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
 ) void {
     const bg = AppWindow.g_theme.background;
     const fg = AppWindow.g_theme.foreground;
@@ -126,8 +128,8 @@ pub fn render(
     const panel = mixColor(bg, fg, 0.045);
     const line = mixColor(bg, fg, 0.18);
 
-    const x = @round(left_panels_w);
-    const w = @round(@max(1.0, window_width - left_panels_w - right_panels_w));
+    const x = @round(chat_x);
+    const w = @round(@max(1.0, chat_w));
     const top = @round(titlebar_offset);
     const h = @round(@max(1.0, window_height - top));
     if (w <= 1 or h <= 1) return;
@@ -140,12 +142,19 @@ pub fn render(
     const header_y = window_height - top - HEADER_H;
     ui_pipeline.fillQuadAlpha(x, header_y, w, HEADER_H, panel, 0.95);
     ui_pipeline.fillQuadAlpha(x, header_y, w, 1, line, 0.8);
-    _ = titlebar.renderTextLimited(session.model(), x + LINE_PAD_X, header_y + 10, mixColor(fg, accent, 0.12), w * 0.48);
-
     const permission = ai_chat.agentPermission();
     const chip_x = permissionChipX(x, w);
     const mode_text = if (session.agent_enabled) "Agent" else "Chat";
-    const mode_x = chip_x - MODE_SLOT_W - 8;
+    const mode_x = @max(x + LINE_PAD_X, chip_x - MODE_SLOT_W - 8);
+
+    // Model label fills the space left of the mode slot; it is hidden when the
+    // panel (e.g. the narrow copilot sidebar) is too tight to show it without
+    // overlapping the controls.
+    const model_x = x + LINE_PAD_X;
+    const model_limit = mode_x - model_x - 12;
+    if (model_limit > 24) {
+        _ = titlebar.renderTextLimited(session.model(), model_x, header_y + 10, mixColor(fg, accent, 0.12), model_limit);
+    }
     _ = titlebar.renderTextLimited(mode_text, mode_x, header_y + 10, mixColor(fg, accent, 0.18), MODE_SLOT_W);
 
     const perm_text = permissionDisplayName(permission);
@@ -321,7 +330,11 @@ pub fn render(
     if (approval) |view| {
         renderApprovalCard(view, x + LINE_PAD_X, input_h + APPROVAL_GAP, w - LINE_PAD_X * 2, APPROVAL_H);
     }
-    renderComposerSuggestions(session, layout);
+    if (session.rewind_open) {
+        renderRewindPicker(session, layout);
+    } else {
+        renderComposerSuggestions(session, layout, window_width);
+    }
 }
 
 pub fn interactionHitTest(
@@ -331,11 +344,12 @@ pub fn interactionHitTest(
     window_width: f32,
     window_height: f32,
     titlebar_offset: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
 ) ?HitTarget {
-    const x = @round(left_panels_w);
-    const w = @round(@max(1.0, window_width - left_panels_w - right_panels_w));
+    _ = window_width;
+    const x = @round(chat_x);
+    const w = @round(@max(1.0, chat_w));
     if (w <= 1) return null;
 
     session.mutex.lock();
@@ -410,11 +424,12 @@ pub fn transcriptTextHitTest(
     window_width: f32,
     window_height: f32,
     titlebar_offset: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
 ) ?TranscriptTextHit {
-    const x = @round(left_panels_w);
-    const w = @round(@max(1.0, window_width - left_panels_w - right_panels_w));
+    _ = window_width;
+    const x = @round(chat_x);
+    const w = @round(@max(1.0, chat_w));
     if (w <= 1) return null;
 
     session.mutex.lock();
@@ -484,16 +499,17 @@ pub fn stopButtonHitTest(
     ypos: f64,
     window_width: f32,
     titlebar_offset: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
 ) bool {
+    _ = window_width;
     session.mutex.lock();
     const visible = session.request_inflight;
     session.mutex.unlock();
     if (!visible) return false;
 
-    const x = @round(left_panels_w);
-    const w = @round(@max(1.0, window_width - left_panels_w - right_panels_w));
+    const x = @round(chat_x);
+    const w = @round(@max(1.0, chat_w));
     const rect = stopButtonRect(x, w, titlebar_offset);
     return pointInRect(@floatCast(xpos), @floatCast(ypos), rect);
 }
@@ -503,11 +519,12 @@ pub fn permissionChipHitTest(
     ypos: f64,
     window_width: f32,
     titlebar_offset: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
 ) bool {
-    const x = @round(left_panels_w);
-    const w = @round(@max(1.0, window_width - left_panels_w - right_panels_w));
+    _ = window_width;
+    const x = @round(chat_x);
+    const w = @round(@max(1.0, chat_w));
     const chip_x = permissionChipX(x, w);
     return pointInRect(@floatCast(xpos), @floatCast(ypos), .{
         .x = chip_x,
@@ -523,16 +540,17 @@ pub fn missingApiKeyStatusHitTest(
     ypos: f64,
     window_width: f32,
     titlebar_offset: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
 ) bool {
+    _ = window_width;
     session.mutex.lock();
     const clickable = !session.request_inflight and session.missingApiKey();
     session.mutex.unlock();
     if (!clickable) return false;
 
-    const x = @round(left_panels_w);
-    const w = @round(@max(1.0, window_width - left_panels_w - right_panels_w));
+    const x = @round(chat_x);
+    const w = @round(@max(1.0, chat_w));
     const rect = statusActionRect(x, w, titlebar_offset, MISSING_API_KEY_ACTION_TEXT);
     return pointInRect(@floatCast(xpos), @floatCast(ypos), rect);
 }
@@ -543,11 +561,12 @@ pub fn inputFieldMetricsAt(
     ypos: f64,
     window_width: f32,
     window_height: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
 ) ?InputFieldMetrics {
-    const x = @round(left_panels_w);
-    const w = @round(@max(1.0, window_width - left_panels_w - right_panels_w));
+    _ = window_width;
+    const x = @round(chat_x);
+    const w = @round(@max(1.0, chat_w));
     if (w <= 1) return null;
 
     session.mutex.lock();
@@ -572,11 +591,12 @@ pub fn inputScrollbarHitTest(
     ypos: f64,
     window_width: f32,
     window_height: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
 ) ?InputScrollbarHit {
-    const x = @round(left_panels_w);
-    const w = @round(@max(1.0, window_width - left_panels_w - right_panels_w));
+    _ = window_width;
+    const x = @round(chat_x);
+    const w = @round(@max(1.0, chat_w));
     if (w <= 1) return null;
 
     session.mutex.lock();
@@ -607,12 +627,13 @@ pub fn inputScrollbarDragRowAt(
     ypos: f64,
     window_width: f32,
     window_height: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
     drag_offset_px: f32,
 ) ?InputScrollbarDrag {
-    const x = @round(left_panels_w);
-    const w = @round(@max(1.0, window_width - left_panels_w - right_panels_w));
+    _ = window_width;
+    const x = @round(chat_x);
+    const w = @round(@max(1.0, chat_w));
     if (w <= 1) return null;
 
     session.mutex.lock();
@@ -648,11 +669,12 @@ fn transcriptLayoutLocked(
     window_width: f32,
     window_height: f32,
     titlebar_offset: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
 ) ?TranscriptLayout {
-    const x = @round(left_panels_w);
-    const w = @round(@max(1.0, window_width - left_panels_w - right_panels_w));
+    _ = window_width;
+    const x = @round(chat_x);
+    const w = @round(@max(1.0, chat_w));
     if (w <= 1) return null;
 
     const approval = session.approvalView();
@@ -693,11 +715,11 @@ pub fn transcriptScrollbarHitTest(
     window_width: f32,
     window_height: f32,
     titlebar_offset: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
 ) ?f32 {
     session.mutex.lock();
-    const layout = transcriptLayoutLocked(session, window_width, window_height, titlebar_offset, left_panels_w, right_panels_w);
+    const layout = transcriptLayoutLocked(session, window_width, window_height, titlebar_offset, chat_x, chat_w);
     const scroll_px = session.scroll_px;
     session.mutex.unlock();
 
@@ -716,12 +738,12 @@ pub fn transcriptScrollbarScrollPxAt(
     window_width: f32,
     window_height: f32,
     titlebar_offset: f32,
-    left_panels_w: f32,
-    right_panels_w: f32,
+    chat_x: f32,
+    chat_w: f32,
     drag_offset: f32,
 ) ?f32 {
     session.mutex.lock();
-    const layout = transcriptLayoutLocked(session, window_width, window_height, titlebar_offset, left_panels_w, right_panels_w);
+    const layout = transcriptLayoutLocked(session, window_width, window_height, titlebar_offset, chat_x, chat_w);
     const scroll_px = session.scroll_px;
     session.mutex.unlock();
 
@@ -1062,7 +1084,11 @@ fn copyButtonRectForBubble(bubble_x: f32, top_px: f32, bubble_w: f32) CopyButton
 }
 
 fn permissionChipX(x: f32, w: f32) f32 {
-    return ai_chat_layout.permissionChipX(x, w, LINE_PAD_X, STATUS_SLOT_W, 12, PERMISSION_CHIP_W);
+    // Reserve a status slot that shrinks on narrow panels (the copilot sidebar)
+    // so the right-anchored [mode][chip] cluster can't collapse onto the
+    // left-aligned model label. On wide tabs this matches the old ~280 reserve.
+    const status_reserve = @min(STATUS_SLOT_W, @max(72.0, w * 0.22));
+    return ai_chat_layout.permissionChipX(x, w, LINE_PAD_X, status_reserve, 12, PERMISSION_CHIP_W);
 }
 
 fn stopButtonRect(x: f32, w: f32, titlebar_offset: f32) HeaderButtonRect {
@@ -1070,9 +1096,14 @@ fn stopButtonRect(x: f32, w: f32, titlebar_offset: f32) HeaderButtonRect {
 }
 
 fn statusActionRect(x: f32, w: f32, titlebar_offset: f32, text: []const u8) Rect {
-    const status_w = @min(measureText(text), STATUS_SLOT_W);
+    // Keep status to the right of the permission chip; clamp its width to the
+    // space available there so long status text can't overlap the chip on a
+    // narrow panel.
+    const right = x + w - LINE_PAD_X;
+    const avail = @max(1.0, right - (permissionChipX(x, w) + PERMISSION_CHIP_W + 12));
+    const status_w = @min(@min(measureText(text), STATUS_SLOT_W), avail);
     return .{
-        .x = x + w - LINE_PAD_X - status_w,
+        .x = right - status_w,
         .top_px = titlebar_offset + 8,
         .w = @max(1.0, status_w),
         .h = 32,
@@ -1106,10 +1137,33 @@ fn permissionDisplayName(permission: ai_chat.AgentPermission) []const u8 {
     };
 }
 
-fn renderComposerSuggestions(session: *ai_chat.Session, layout: InputLayout) void {
-    const input_text = session.input();
-    const count = ai_chat.composerSuggestionCountForInput(input_text, session.input_cursor, session.skill_suggestions);
-    if (count == 0) return;
+const REWIND_MAX_ROWS: usize = 8;
+const REWIND_PAD_X: f32 = 14;
+const REWIND_PAD_Y: f32 = 8;
+const REWIND_HEADER_EXTRA: f32 = 10;
+const REWIND_ROW_EXTRA: f32 = 12;
+
+fn firstLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return text[0..end];
+}
+
+fn renderRewindPicker(session: *ai_chat.Session, layout: InputLayout) void {
+    var total: usize = 0;
+    for (session.messages.items) |msg| {
+        if (msg.role == .user) total += 1;
+    }
+    if (total == 0) return;
+
+    const selected = @min(session.rewind_selected, total - 1);
+    const visible = @min(total, REWIND_MAX_ROWS);
+
+    // Recency 0 is the newest prompt. The picker displays newest-to-oldest
+    // from top to bottom, matching ordinary list navigation.
+    const selected_r = total - 1 - selected;
+    var r_lo: usize = 0;
+    if (selected_r >= visible) r_lo = selected_r - visible + 1;
+    if (r_lo > total - visible) r_lo = total - visible;
 
     const bg = AppWindow.g_theme.background;
     const fg = AppWindow.g_theme.foreground;
@@ -1117,8 +1171,77 @@ fn renderComposerSuggestions(session: *ai_chat.Session, layout: InputLayout) voi
     const popup_w = @min(layout.field_w, SUGGESTION_MAX_W);
     const popup_x = layout.field_x;
     const popup_y = layout.field_y + layout.field_h + SUGGESTION_GAP;
-    const popup_h = SUGGESTION_PAD_Y * 2 + SUGGESTION_ROW_H * @as(f32, @floatFromInt(count));
-    const popup_bg = mixColor(bg, fg, 0.085);
+    const header_h = @max(SUGGESTION_ROW_H + 2, font.g_titlebar_cell_height + REWIND_HEADER_EXTRA);
+    const row_h = @max(SUGGESTION_ROW_H + 8, font.g_titlebar_cell_height + REWIND_ROW_EXTRA);
+    const popup_h = REWIND_PAD_Y * 2 + header_h + row_h * @as(f32, @floatFromInt(visible));
+    const popup_bg = mixColor(bg, fg, 0.105);
+    const border = mixColor(bg, accent, 0.36);
+
+    ui_pipeline.fillQuadAlpha(popup_x, popup_y, popup_w, popup_h, popup_bg, 0.98);
+    ui_pipeline.fillQuadAlpha(popup_x, popup_y + popup_h - 1, popup_w, 1, border, 0.78);
+    ui_pipeline.fillQuadAlpha(popup_x, popup_y, popup_w, 1, mixColor(bg, fg, 0.20), 0.82);
+    ui_pipeline.fillQuadAlpha(popup_x, popup_y, 1, popup_h, mixColor(bg, fg, 0.16), 0.72);
+    ui_pipeline.fillQuadAlpha(popup_x + popup_w - 1, popup_y, 1, popup_h, mixColor(bg, fg, 0.16), 0.72);
+
+    const top = popup_y + popup_h - REWIND_PAD_Y;
+
+    const title_row_y = top - header_h;
+    const title_text_y = title_row_y + @round((header_h - font.g_titlebar_cell_height) / 2);
+    _ = titlebar.renderTextLimited(
+        "Rewind",
+        popup_x + REWIND_PAD_X,
+        title_text_y,
+        mixColor(fg, accent, 0.16),
+        popup_w - REWIND_PAD_X * 2,
+    );
+    _ = titlebar.renderTextLimited(
+        "Enter confirm  Esc cancel",
+        popup_x + REWIND_PAD_X + 104,
+        title_text_y,
+        mixColor(bg, fg, 0.52),
+        @max(24.0, popup_w - REWIND_PAD_X * 2 - 104),
+    );
+
+    var ord: usize = 0; // 用户消息序号（0 = 最早）
+    for (session.messages.items) |msg| {
+        if (msg.role != .user) continue;
+        const this_ord = ord;
+        ord += 1;
+        const r = total - 1 - this_ord; // recency：0 = 最近
+        if (r < r_lo or r >= r_lo + visible) continue;
+        const row = r - r_lo; // 0 = visual top
+        const row_y = top - header_h - @as(f32, @floatFromInt(row + 1)) * row_h;
+        if (this_ord == selected) {
+            ui_pipeline.fillQuadAlpha(popup_x + 5, row_y + 4, popup_w - 10, row_h - 8, mixColor(bg, accent, 0.22), 0.92);
+            ui_pipeline.fillQuadAlpha(popup_x + 5, row_y + 4, 3, row_h - 8, accent, 0.82);
+        }
+        const text_y = row_y + @round((row_h - font.g_titlebar_cell_height) / 2);
+        _ = titlebar.renderTextLimited(
+            firstLine(msg.content),
+            popup_x + REWIND_PAD_X,
+            text_y,
+            if (this_ord == selected) mixColor(fg, accent, 0.14) else fg,
+            popup_w - REWIND_PAD_X * 2,
+        );
+    }
+}
+
+fn renderComposerSuggestions(session: *ai_chat.Session, layout: InputLayout, window_width: f32) void {
+    const input_text = session.input();
+    const count = ai_chat.composerSuggestionCountForInput(input_text, session.input_cursor, session.skill_suggestions, session.custom_command_suggestions);
+    if (count == 0) return;
+
+    const bg = AppWindow.g_theme.background;
+    const fg = AppWindow.g_theme.foreground;
+    const accent = AppWindow.g_theme.cursor_color;
+    const available_w = @max(layout.field_w, window_width - layout.field_x - LINE_PAD_X);
+    const popup_w = @min(available_w, SUGGESTION_MAX_W);
+    const popup_x = layout.field_x;
+    const popup_y = layout.field_y + layout.field_h + SUGGESTION_GAP;
+    const row_h = @round(@max(SUGGESTION_ROW_H, font.g_titlebar_cell_height + 14.0));
+    const command_w = @min(@max(SUGGESTION_COMMAND_W, font.g_titlebar_cell_width * 16.0), popup_w * 0.58);
+    const popup_h = SUGGESTION_PAD_Y * 2 + row_h * @as(f32, @floatFromInt(count));
+    const popup_bg = mixColor(bg, fg, 0.105);
     const border = mixColor(bg, accent, 0.36);
     const selected = @min(session.suggestion_selected, count - 1);
 
@@ -1130,29 +1253,30 @@ fn renderComposerSuggestions(session: *ai_chat.Session, layout: InputLayout) voi
 
     const top = popup_y + popup_h - SUGGESTION_PAD_Y;
     for (0..count) |i| {
-        const row_y = top - @as(f32, @floatFromInt(i + 1)) * SUGGESTION_ROW_H;
+        const row_y = top - @as(f32, @floatFromInt(i + 1)) * row_h;
         if (i == selected) {
-            ui_pipeline.fillQuadAlpha(popup_x + 4, row_y + 2, popup_w - 8, SUGGESTION_ROW_H - 4, mixColor(bg, accent, 0.18), 0.90);
-            ui_pipeline.fillQuadAlpha(popup_x + 4, row_y + 2, 3, SUGGESTION_ROW_H - 4, accent, 0.82);
+            ui_pipeline.fillQuadAlpha(popup_x + 5, row_y + 4, popup_w - 10, row_h - 8, mixColor(bg, accent, 0.20), 0.90);
+            ui_pipeline.fillQuadAlpha(popup_x + 5, row_y + 4, 3, row_h - 8, accent, 0.82);
         }
-        const suggestion = ai_chat.composerSuggestionAtForInput(input_text, session.input_cursor, session.skill_suggestions, i) orelse continue;
-        const text_y = row_y + @round((SUGGESTION_ROW_H - font.g_titlebar_cell_height) / 2);
+        const suggestion = ai_chat.composerSuggestionAtForInput(input_text, session.input_cursor, session.skill_suggestions, session.custom_command_suggestions, i) orelse continue;
+        const text_y = row_y + @round((row_h - font.g_titlebar_cell_height) / 2);
         var label_buf: [160]u8 = undefined;
         const label = suggestionLabel(&label_buf, suggestion);
         _ = titlebar.renderTextLimited(
             label,
-            popup_x + 14,
+            popup_x + SUGGESTION_PAD_X,
             text_y,
             if (i == selected) mixColor(fg, accent, 0.14) else fg,
-            @min(SUGGESTION_COMMAND_W, popup_w - 28),
+            @min(command_w, popup_w - SUGGESTION_PAD_X * 2),
         );
-        if (popup_w > SUGGESTION_COMMAND_W + 44) {
+        const desc_x = popup_x + SUGGESTION_PAD_X + command_w + SUGGESTION_COLUMN_GAP;
+        if (desc_x < popup_x + popup_w - SUGGESTION_PAD_X) {
             _ = titlebar.renderTextLimited(
                 suggestion.description,
-                popup_x + 14 + SUGGESTION_COMMAND_W,
+                desc_x,
                 text_y,
-                mixColor(bg, fg, 0.62),
-                popup_w - SUGGESTION_COMMAND_W - 28,
+                mixColor(bg, fg, 0.58),
+                popup_x + popup_w - SUGGESTION_PAD_X - desc_x,
             );
         }
     }

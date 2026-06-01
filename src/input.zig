@@ -17,6 +17,7 @@ const markdown_preview = @import("markdown_preview.zig");
 const markdown_preview_panel = AppWindow.markdown_preview_panel;
 const preview_token = @import("preview_token.zig");
 const browser_panel = AppWindow.browser_panel;
+const ai_sidebar = @import("ai_sidebar.zig");
 const ui_perf = AppWindow.ui_perf;
 const render_diagnostics = @import("render_diagnostics.zig");
 const link_open = @import("link_open.zig");
@@ -44,6 +45,7 @@ const clipboard = @import("input/clipboard.zig");
 const click_tracker = @import("input/click_tracker.zig");
 const hit_test = @import("input/hit_test.zig");
 const preview_source = @import("input/preview_source.zig");
+const mouse_report = @import("input/mouse_report.zig");
 const writeToPty = clipboard.writeToPty;
 pub const copyTextToClipboard = clipboard.copyTextToClipboard;
 const activeTerminalSelectionExists = clipboard.activeTerminalSelectionExists;
@@ -95,10 +97,27 @@ test "panel toggles request coalesced layout resize" {
     try std.testing.expectEqual(LayoutResizeUrgency.coalesced, panelToggleResizeUrgency());
 }
 
-fn terminalPathClickAction(launch_kind: Surface.LaunchKind, has_ssh_conn: bool, ctrl: bool, shift: bool, alt: bool) TerminalPathClickAction {
-    if (ctrl and shift and !alt and launch_kind == .ssh and has_ssh_conn) return .download_ssh_file;
-    if (ctrl and !shift and !alt) return .open_url_or_preview;
+/// The modifier that opens URLs / previews files / downloads SSH paths when
+/// clicking or hovering terminal text. macOS uses Cmd (super) — Ctrl+click is
+/// the system secondary-click — while other platforms use Ctrl.
+fn primaryOpenMod(ctrl: bool, super: bool) bool {
+    return if (builtin.target.os.tag == .macos) super else ctrl;
+}
+
+fn terminalPathClickAction(launch_kind: Surface.LaunchKind, has_ssh_conn: bool, mod: bool, shift: bool, alt: bool) TerminalPathClickAction {
+    if (mod and shift and !alt and launch_kind == .ssh and has_ssh_conn) return .download_ssh_file;
+    if (mod and !shift and !alt) return .open_url_or_preview;
     return .pass_through;
+}
+
+test "primary open modifier is Cmd on macOS, Ctrl elsewhere" {
+    if (builtin.target.os.tag == .macos) {
+        try std.testing.expect(primaryOpenMod(false, true)); // Cmd-click opens
+        try std.testing.expect(!primaryOpenMod(true, false)); // Ctrl-click does not
+    } else {
+        try std.testing.expect(primaryOpenMod(true, false)); // Ctrl-click opens
+        try std.testing.expect(!primaryOpenMod(false, true)); // Win/Super does not
+    }
 }
 
 test "terminal path click action maps ctrl shift ssh to download" {
@@ -170,7 +189,7 @@ test "input: WeChat QR panel consumes text input while visible" {
     try std.testing.expect(weixinQrPanelConsumesChar());
 }
 
-test "input: Ctrl+Shift+P toggles command center" {
+test "input: command palette shortcut toggles command center" {
     const previous_keybinds = AppWindow.g_keybinds;
     defer AppWindow.g_keybinds = previous_keybinds;
     defer overlays.commandPaletteClose();
@@ -178,14 +197,25 @@ test "input: Ctrl+Shift+P toggles command center" {
     AppWindow.g_keybinds = keybind.Set.defaults();
     overlays.commandPaletteClose();
 
-    handleKey(.{ .key_code = 'P', .ctrl = true, .shift = true, .alt = false });
+    // macOS migrates app shortcuts to Cmd (the super modifier); other platforms
+    // keep Ctrl. So the command palette is Cmd+Shift+P on macOS, Ctrl+Shift+P else.
+    const is_macos = builtin.os.tag == .macos;
+    const palette_key = platform_input.KeyEvent{
+        .key_code = 'P',
+        .ctrl = !is_macos,
+        .shift = true,
+        .alt = false,
+        .super = is_macos,
+    };
+
+    handleKey(palette_key);
     try std.testing.expect(overlays.commandPaletteVisible());
 
-    handleKey(.{ .key_code = 'P', .ctrl = true, .shift = true, .alt = false });
+    handleKey(palette_key);
     try std.testing.expect(!overlays.commandPaletteVisible());
 }
 
-test "macOS UI smoke: Ctrl+Shift+B toggles the tab sidebar" {
+test "macOS UI smoke: Cmd+Shift+B toggles the tab sidebar" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
 
     const previous_keybinds = AppWindow.g_keybinds;
@@ -196,10 +226,19 @@ test "macOS UI smoke: Ctrl+Shift+B toggles the tab sidebar" {
     AppWindow.g_keybinds = keybind.Set.defaults();
     tab.g_sidebar_visible = false;
 
-    handleKey(.{ .key_code = 'B', .ctrl = true, .shift = true, .alt = false });
+    // macOS uses Cmd (super) for the sidebar toggle, not Ctrl.
+    const sidebar_key = platform_input.KeyEvent{
+        .key_code = 'B',
+        .ctrl = false,
+        .shift = true,
+        .alt = false,
+        .super = true,
+    };
+
+    handleKey(sidebar_key);
     try std.testing.expect(tab.g_sidebar_visible);
 
-    handleKey(.{ .key_code = 'B', .ctrl = true, .shift = true, .alt = false });
+    handleKey(sidebar_key);
     try std.testing.expect(!tab.g_sidebar_visible);
 }
 
@@ -212,6 +251,15 @@ pub threadlocal var g_selecting: bool = false; // True while mouse button is hel
 pub threadlocal var g_click_x: f64 = 0; // X position of initial click (for threshold calculation)
 pub threadlocal var g_click_y: f64 = 0; // Y position of initial click
 var g_selection_changed_for_copy: bool = false;
+
+// Terminal mouse reporting drag state. When a press is delivered to the PTY
+// (the focused program enabled mouse tracking and Shift wasn't held), the
+// matching drag-motion and release are routed to the PTY too — until the
+// button lifts — instead of driving local text selection. See
+// input/mouse_report.zig for the protocol encoder.
+threadlocal var g_mouse_report_button: ?mouse_report.Button = null;
+threadlocal var g_mouse_report_surface: ?*Surface = null;
+threadlocal var g_mouse_report_last_cell: ?CellPos = null;
 threadlocal var g_left_click_tracker: click_tracker.ClickTracker = .{};
 const MULTI_CLICK_INTERVAL_MS: i64 = 500;
 const MAX_SELECTION_COLS: usize = 4096;
@@ -271,7 +319,25 @@ threadlocal var g_markdown_preview_image_drag_last_x: f64 = 0;
 threadlocal var g_markdown_preview_image_drag_last_y: f64 = 0;
 pub threadlocal var g_browser_resize_hover: bool = false; // Mouse is over the embedded browser edge
 pub threadlocal var g_browser_resize_dragging: bool = false; // Currently dragging the browser edge
+pub threadlocal var g_ai_copilot_resize_hover: bool = false; // Mouse is over the AI copilot left edge
+pub threadlocal var g_ai_copilot_resize_dragging: bool = false; // Currently dragging the AI copilot edge
 pub threadlocal var g_url_open_mode: link_open.Mode = .embedded;
+
+/// Whether the AI copilot sidebar currently owns keyboard/mouse focus. Set by
+/// AppWindow.toggleAiCopilot; full key/mouse routing lands in a later task.
+threadlocal var g_ai_copilot_focused: bool = false;
+
+pub fn focusAiCopilot() void {
+    g_ai_copilot_focused = true;
+}
+
+pub fn blurAiCopilot() void {
+    g_ai_copilot_focused = false;
+}
+
+pub fn aiCopilotFocused() bool {
+    return g_ai_copilot_focused;
+}
 const SIDEBAR_TAB_DRAG_THRESHOLD_PX: f64 = 6.0;
 threadlocal var g_sidebar_tab_drag_pressed: ?usize = null;
 threadlocal var g_sidebar_tab_drag_current: ?usize = null;
@@ -385,6 +451,8 @@ pub fn cancelTransientMouseState(win: anytype) void {
     g_markdown_preview_image_drag_last_y = 0;
     g_browser_resize_hover = false;
     g_browser_resize_dragging = false;
+    g_ai_copilot_resize_hover = false;
+    g_ai_copilot_resize_dragging = false;
     g_selecting = false;
     plus_btn_pressed = false;
     tab.g_tab_close_pressed = null;
@@ -444,6 +512,7 @@ pub fn toggleBrowserPanel() void {
         _ = platform_open_url.open(allocator, .{ .url = target });
         return;
     }
+    if (!browser_panel.isVisibleForActiveTab()) AppWindow.hideAiCopilot();
     if (!browser_panel.toggleForSurface(allocator, parent, surface)) return;
     if (AppWindow.g_window) |win| {
         syncPanelGridFromWindow(win);
@@ -796,6 +865,20 @@ fn handleChar(ev: platform_input.CharEvent) void {
         }
         return;
     }
+    // AI copilot sidebar (terminal tabs): when the copilot owns focus, route
+    // text input to its composer. `activeCopilotSessionForInput` is non-null
+    // only when the panel is visible on the active terminal tab.
+    if (aiCopilotFocused()) {
+        if (AppWindow.activeCopilotSessionForInput()) |chat| {
+            if (!ev.ctrl and !ev.alt) {
+                AppWindow.resetCursorBlink();
+                chat.handleChar(ev.codepoint);
+                AppWindow.g_force_rebuild = true;
+                AppWindow.g_cells_valid = false;
+            }
+            return;
+        }
+    }
     if (!AppWindow.isActiveTabTerminal()) return;
     // Skip chars when Alt is held without Ctrl — those are part of Alt+key
     // combos (e.g. Shift+Alt+4) and shouldn't produce text input.
@@ -803,6 +886,9 @@ fn handleChar(ev: platform_input.CharEvent) void {
     // we must allow chars when both Ctrl and Alt are held (AltGr chars).
     // This matches Ghostty's consumed_mods / effectiveMods approach.
     if (ev.alt and !ev.ctrl) return;
+    // Cmd / Super shortcuts (macOS Cmd+C, Win key on other platforms) are
+    // commands, not text input — never inject them into the PTY.
+    if (ev.super) return;
     const surface = AppWindow.activeSurface() orelse return;
     AppWindow.resetCursorBlink();
     {
@@ -819,7 +905,7 @@ const KeybindPhase = command_dispatch.Phase;
 
 fn triggerFromKeyEvent(ev: platform_input.KeyEvent) keybind.Trigger {
     return .{
-        .mods = .{ .ctrl = ev.ctrl, .shift = ev.shift, .alt = ev.alt },
+        .mods = .{ .ctrl = ev.ctrl, .shift = ev.shift, .alt = ev.alt, .win = ev.super },
         .key_code = @intCast(ev.key_code),
     };
 }
@@ -933,6 +1019,7 @@ fn executeCommand(cmd: command_dispatch.Command) bool {
         .split_right => AppWindow.splitFocused(.right),
         .toggle_file_explorer => toggleFileExplorer(),
         .toggle_sidebar => toggleSidebar(),
+        .toggle_ai_copilot => AppWindow.toggleAiCopilot(),
         .close_panel_or_tab => closePanelOrTab(),
         .toggle_maximize => toggleMaximize(),
         .font_size => |delta| adjustFontSize(delta),
@@ -941,6 +1028,12 @@ fn executeCommand(cmd: command_dispatch.Command) bool {
         .paste => {
             if (AppWindow.activeAiChat()) |chat| {
                 pasteFromClipboardIntoAiChat(chat);
+            } else if (aiCopilotFocused()) {
+                if (AppWindow.activeCopilotSessionForInput()) |chat| {
+                    pasteFromClipboardIntoAiChat(chat);
+                } else {
+                    pasteFromClipboard();
+                }
             } else {
                 pasteFromClipboard();
             }
@@ -1060,19 +1153,42 @@ fn handleKey(ev: platform_input.KeyEvent) void {
         return;
     }
     if (AppWindow.activeAiChat()) |chat| {
-        if (ev.ctrl and !ev.alt and ev.key_code == 0x41) { // Ctrl+A
+        // Accept Cmd (super, macOS) or Ctrl (Windows) for chat editing keys.
+        const mod = ev.ctrl or ev.super;
+        if (mod and !ev.alt and ev.key_code == 0x41) { // select all
             chat.selectAll();
             AppWindow.g_force_rebuild = true;
             AppWindow.g_cells_valid = false;
             return;
         }
-        if (ev.ctrl and !ev.alt and ev.key_code == 0x43) { // Ctrl+C / Ctrl+Shift+C
+        if (mod and !ev.alt and ev.key_code == 0x43) { // copy
             copyAiChatToClipboard(chat);
             return;
         }
-        if (ev.ctrl and !ev.alt and ev.key_code == 0x58) { // Ctrl+X (cut input)
+        if (mod and !ev.alt and ev.key_code == 0x58) { // cut input
             copyAiChatCutToClipboard(chat);
             return;
+        }
+    }
+    // AI copilot sidebar editing-mod keys (select-all / copy / cut), mirroring
+    // the ai_chat tab block above but for the copilot session.
+    if (aiCopilotFocused()) {
+        if (AppWindow.activeCopilotSessionForInput()) |chat| {
+            const mod = ev.ctrl or ev.super;
+            if (mod and !ev.alt and ev.key_code == 0x41) { // select all
+                chat.selectAll();
+                AppWindow.g_force_rebuild = true;
+                AppWindow.g_cells_valid = false;
+                return;
+            }
+            if (mod and !ev.alt and ev.key_code == 0x43) { // copy
+                copyAiChatToClipboard(chat);
+                return;
+            }
+            if (mod and !ev.alt and ev.key_code == 0x58) { // cut input
+                copyAiChatCutToClipboard(chat);
+                return;
+            }
         }
     }
     if (action) |app_action| {
@@ -1086,6 +1202,38 @@ fn handleKey(ev: platform_input.KeyEvent) void {
             AppWindow.g_force_rebuild = true;
             AppWindow.g_cells_valid = false;
             return;
+        }
+    }
+
+    // AI copilot sidebar (terminal tabs): route editing/navigation keys to the
+    // copilot composer. Esc is intercepted specially so it never reaches the
+    // terminal — it stops an in-flight request, or hides the panel when idle.
+    if (aiCopilotFocused()) {
+        if (AppWindow.activeCopilotSessionForInput()) |chat| {
+            if (ev.key_code == platform_input.key_escape) {
+                // Progressive Esc: stop an in-flight request, else clear an
+                // active selection, else hide the panel. Matches the AI-chat
+                // tab's stop/clear behavior; closing is only the final step,
+                // so Esc never abruptly dismisses a panel that still has a
+                // selection to clear.
+                if (chat.requestState().inflight) {
+                    chat.stopRequest();
+                } else if (chat.hasSelection()) {
+                    chat.clearSelection();
+                } else {
+                    AppWindow.hideAiCopilot();
+                }
+                AppWindow.g_force_rebuild = true;
+                AppWindow.g_cells_valid = false;
+                return;
+            }
+            if (isAiChatKey(ev)) {
+                AppWindow.resetCursorBlink();
+                chat.handleKeyWithWrapCols(key_event, aiCopilotInputWrapCols());
+                AppWindow.g_force_rebuild = true;
+                AppWindow.g_cells_valid = false;
+                return;
+            }
         }
     }
 
@@ -1196,13 +1344,25 @@ fn aiChatInputWrapCols() usize {
     return AppWindow.ai_chat_renderer.inputWrapColumns(panel_w);
 }
 
+/// Wrap columns for the AI copilot sidebar's composer. Mirrors
+/// `aiChatInputWrapCols` but uses the sidebar/copilot panel width rather than
+/// the full-tab chat width.
+fn aiCopilotInputWrapCols() usize {
+    const win = AppWindow.g_window orelse return std.math.maxInt(usize);
+    const size = clientSize(win);
+    const panel_w = AppWindow.aiCopilotWidth(size.width);
+    return AppWindow.ai_chat_renderer.inputWrapColumns(panel_w);
+}
+
 fn handleBrowserUrlBarKey(ev: platform_input.KeyEvent) void {
-    if (ev.ctrl and !ev.shift and !ev.alt and ev.key_code == 0x41) { // Ctrl+A
+    // Accept Cmd (super, macOS) or Ctrl (Windows) for text-field editing keys.
+    const mod = ev.ctrl or ev.super;
+    if (mod and !ev.shift and !ev.alt and ev.key_code == 0x41) { // Ctrl/Cmd+A
         browser_panel.selectAllUrlBar();
         markBrowserUrlBarDirty();
         return;
     }
-    if (ev.ctrl and !ev.shift and !ev.alt and ev.key_code == 0x56) { // Ctrl+V
+    if (mod and !ev.shift and !ev.alt and ev.key_code == 0x56) { // Ctrl/Cmd+V
         if (pasteClipboardIntoBrowserUrlBar()) markBrowserUrlBarDirty();
         return;
     }
@@ -1398,6 +1558,41 @@ fn applyBrowserWidthFromMouse(xpos: f64) void {
     AppWindow.g_cells_valid = false;
 }
 
+// AI copilot panel resize grip. The copilot is right-docked (right_offset 0)
+// and its bounds are computed against framebufferSize everywhere (renderer +
+// click handling), so the hit-test/apply mirror the browser resize structure
+// but read the framebuffer size to track the panel's actual left edge.
+fn hitTestAiCopilotResizeHandle(xpos: f64, ypos: f64) bool {
+    if (!AppWindow.aiCopilotVisible()) return false;
+    if (ypos < titlebarHeight()) return false;
+    const win = AppWindow.g_window orelse return false;
+    const fb = window_backend.framebufferSize(win);
+    const bounds = ai_sidebar.boundsForWindow(
+        @intCast(fb.width),
+        @intCast(fb.height),
+        @floatCast(titlebarHeight()),
+        AppWindow.leftPanelsWidth(),
+        0,
+    );
+    const panel_x: f64 = @floatFromInt(bounds.left);
+    const half_hit: f64 = @as(f64, @floatCast(ai_sidebar.RESIZE_HIT_WIDTH)) / 2;
+    return xpos >= panel_x - half_hit and xpos <= panel_x + half_hit;
+}
+
+fn applyAiCopilotWidthFromMouse(xpos: f64) void {
+    const win = AppWindow.g_window orelse return;
+    const fb = window_backend.framebufferSize(win);
+    // Right-docked at the far right edge (right_offset 0): width grows as the
+    // mouse moves left, same as the browser's right-edge math.
+    const right_edge = @as(f64, @floatFromInt(fb.width));
+    const new_width = right_edge - xpos;
+    const available_width: f32 = @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth();
+    if (!ai_sidebar.setWidth(@floatCast(new_width), available_width)) return;
+    syncGridFromWindow(win);
+    AppWindow.g_force_rebuild = true;
+    AppWindow.g_cells_valid = false;
+}
+
 fn hitTestMarkdownPreviewResizeHandle(xpos: f64, ypos: f64) bool {
     if (!markdown_preview_panel.isVisibleForActiveTab()) return false;
     if (ypos < titlebarHeight()) return false;
@@ -1494,14 +1689,14 @@ fn handleFileExplorerKey(ev: platform_input.KeyEvent) bool {
             return true;
         },
         0x52 => { // 'R' key = rename
-            if (!ev.ctrl and !ev.alt) {
+            if (!ev.ctrl and !ev.alt and !ev.super) {
                 file_explorer.startRename();
                 return true;
             }
             return false;
         },
         0x4E => { // 'N' key = new file, Shift+N = new dir
-            if (!ev.ctrl and !ev.alt) {
+            if (!ev.ctrl and !ev.alt and !ev.super) {
                 if (ev.shift) {
                     file_explorer.startNewDir();
                 } else {
@@ -1512,14 +1707,14 @@ fn handleFileExplorerKey(ev: platform_input.KeyEvent) bool {
             return false;
         },
         0x44 => { // 'D' key = delete
-            if (!ev.ctrl and !ev.alt and !ev.shift) {
+            if (!ev.ctrl and !ev.alt and !ev.shift and !ev.super) {
                 file_explorer.startDelete();
                 return true;
             }
             return false;
         },
-        0x53 => { // 'S' key: Ctrl+S = download selected file
-            if (ev.ctrl and !ev.alt and !ev.shift) {
+        0x53 => { // 'S' key: Ctrl/Cmd+S = download selected file
+            if ((ev.ctrl or ev.super) and !ev.alt and !ev.shift) {
                 if (file_explorer.g_mode == .remote) {
                     // Download to user's Downloads folder
                     var dl_buf: [260]u8 = undefined;
@@ -1533,7 +1728,7 @@ fn handleFileExplorerKey(ev: platform_input.KeyEvent) bool {
             return false;
         },
         0x55 => { // 'U' key = upload local file to remote
-            if (!ev.ctrl and !ev.alt and !ev.shift) {
+            if (!ev.ctrl and !ev.alt and !ev.shift and !ev.super) {
                 if (file_explorer.g_mode == .remote) {
                     openFileDialogAndUpload();
                     return true;
@@ -1568,7 +1763,7 @@ fn handleAgentHistoryKey(ev: platform_input.KeyEvent) bool {
             return true;
         },
         0x44 => { // 'D' key = delete history row
-            if (!ev.ctrl and !ev.alt and !ev.shift) {
+            if (!ev.ctrl and !ev.alt and !ev.shift and !ev.super) {
                 deleteSelectedAgentHistoryRow();
                 return true;
             }
@@ -1603,7 +1798,7 @@ fn openFileDialogAndUpload() void {
     file_explorer.uploadFile(path);
 }
 
-fn handleFileExplorerPress(xpos: f64, ypos: f64, ctrl: bool, shift: bool, alt: bool) void {
+fn handleFileExplorerPress(xpos: f64, ypos: f64, ctrl: bool, shift: bool, alt: bool, super: bool) void {
     file_explorer.g_focused = true;
 
     // Check resize handle first
@@ -1641,7 +1836,7 @@ fn handleFileExplorerPress(xpos: f64, ypos: f64, ctrl: bool, shift: bool, alt: b
     if (row_idx < file_explorer.g_entry_count) {
         const click_count = nextLeftClickCount(xpos, ypos);
         file_explorer.g_selected = row_idx;
-        if (!file_explorer.g_entries[row_idx].is_dir and ((ctrl and !shift and !alt) or click_count == 2)) {
+        if (!file_explorer.g_entries[row_idx].is_dir and ((primaryOpenMod(ctrl, super) and !shift and !alt) or click_count == 2)) {
             if (openFileExplorerPreview(row_idx)) {
                 AppWindow.g_force_rebuild = true;
                 return;
@@ -1721,7 +1916,9 @@ fn hitTestHelpButton(xpos: f64, ypos: f64) bool {
 }
 
 fn handleTopbarPress(xpos: f64) void {
-    if (xpos >= 0 and xpos < @as(f64, titlebar.TITLEBAR_TOGGLE_W)) {
+    const toggle_x: f64 = @floatCast(titlebar.titlebarLeftReserved());
+    const toggle_end: f64 = toggle_x + @as(f64, titlebar.TITLEBAR_TOGGLE_W);
+    if (xpos >= toggle_x and xpos < toggle_end) {
         toggleSidebar();
         return;
     }
@@ -2100,7 +2297,7 @@ fn openUrlAtCell(surface: *Surface, cell_pos: CellPos) bool {
     return opened;
 }
 
-fn updateInteractiveUnderlineAtMouse(xpos: f64, ypos: f64, ctrl: bool, shift: bool, alt: bool) void {
+fn updateInteractiveUnderlineAtMouse(xpos: f64, ypos: f64, ctrl: bool, shift: bool, alt: bool, super: bool) void {
     if (g_selecting or overlays.scrollbar.g_scrollbar_dragging or g_divider_dragging) {
         clearUrlUnderline();
         return;
@@ -2121,7 +2318,7 @@ fn updateInteractiveUnderlineAtMouse(xpos: f64, ypos: f64, ctrl: bool, shift: bo
     const allocator = AppWindow.g_allocator orelse return;
     const cell_pos = mouseToSurfaceCell(surface, xpos, ypos);
 
-    const action = terminalPathClickAction(surface.launch_kind, surface.ssh_connection != null, ctrl, shift, alt);
+    const action = terminalPathClickAction(surface.launch_kind, surface.ssh_connection != null, primaryOpenMod(ctrl, super), shift, alt);
     const token = extractInteractiveUnderlineRangeAtCell(allocator, surface, cell_pos, action) orelse {
         clearUrlUnderline();
         return;
@@ -2135,6 +2332,7 @@ fn openPreviewAsync(kind: markdown_preview.Kind, title: []const u8, path: []cons
     const perf = ui_perf.begin("input.open_preview_async");
     defer perf.end();
 
+    AppWindow.hideAiCopilot();
     if (!markdown_preview_panel.beginAsyncLoad(kind, title, path, source_kind)) {
         file_explorer.setTransferStatus(.failed, "Preview failed");
         return true;
@@ -2359,19 +2557,36 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             return;
         }
     }
+
+    // Terminal mouse reporting (xterm 1000/1002/1003). When the focused
+    // program has enabled mouse tracking, deliver button events to the PTY
+    // instead of driving local selection / paste / context-menu. A release
+    // always finishes an in-progress reported drag — any modifier, anywhere —
+    // so state never leaks. A press starts reporting only over terminal
+    // content, with Shift up (Shift forces the terminal's own selection) and
+    // without the link-open modifier (Ctrl/Cmd keeps opening links/previews
+    // through the existing path below).
+    if (ev.action == .release) {
+        if (finishTerminalMouseReport(ev)) return;
+    } else if (!ev.shift and !(primaryOpenMod(ev.ctrl, ev.super) and !ev.alt)) {
+        if (beginTerminalMouseReport(ev)) return;
+    }
+
     // Double-click on tab text to rename, elsewhere to maximize
     if (ev.button == .left and ev.action == .double_click) {
         const xpos: f64 = @floatFromInt(ev.x);
         const titlebar_h: f64 = titlebarHeight();
         const ypos: f64 = @floatFromInt(ev.y);
         if (hitTestFileExplorer(xpos, ypos)) {
-            handleFileExplorerPress(xpos, ypos, ev.ctrl, ev.shift, ev.alt);
+            handleFileExplorerPress(xpos, ypos, ev.ctrl, ev.shift, ev.alt, ev.super);
             return;
         }
         if (ypos < titlebar_h) {
             if (hitTestConfigButton(xpos, ypos)) {
                 overlays.settingsPageOpen();
-            } else if (xpos >= @as(f64, titlebar.TITLEBAR_TOGGLE_W)) {
+            } else if (xpos >= @as(f64, titlebar.titlebarLeftReserved() + titlebar.TITLEBAR_TOGGLE_W)) {
+                // Double-clicking on bare titlebar (not on the toggle, and not
+                // on the macOS traffic-light strip) zooms / unzooms.
                 toggleMaximize();
             }
         } else if (hitTestSidebarTab(xpos, ypos)) |tab_idx| {
@@ -2404,7 +2619,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                 @floatFromInt(fb.width),
                 @floatFromInt(fb.height),
                 AppWindow.leftPanelsWidth(),
-                AppWindow.rightPanelsWidthForWindow(fb.width),
+                @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
             ) != null) {
                 pasteFromClipboardIntoAiChat(chat);
                 return;
@@ -2462,6 +2677,12 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                 platform_cursor.set(.size_we);
                 return;
             }
+            if (hitTestAiCopilotResizeHandle(xpos, ypos)) {
+                g_ai_copilot_resize_dragging = true;
+                g_ai_copilot_resize_hover = true;
+                platform_cursor.set(.size_we);
+                return;
+            }
 
             if (over_browser_url_bar) {
                 file_explorer.g_focused = false;
@@ -2487,7 +2708,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
 
             // File explorer left sidebar click
             if (hitTestFileExplorer(xpos, ypos)) {
-                handleFileExplorerPress(xpos, ypos, ev.ctrl, ev.shift, ev.alt);
+                handleFileExplorerPress(xpos, ypos, ev.ctrl, ev.shift, ev.alt, ev.super);
                 return;
             }
 
@@ -2508,6 +2729,109 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             file_explorer.g_focused = false;
             if (file_explorer.g_op_mode != .none) file_explorer.cancelOp();
 
+            // AI copilot sidebar (terminal tabs). When the panel is visible,
+            // a click inside its rect focuses the copilot and routes one-shot
+            // interactions (stop / missing-api-key / message toggle / copy /
+            // permission chip). A click outside the panel blurs the copilot and
+            // falls through to normal terminal handling. Drag-based interactions
+            // (transcript text selection, scrollbar drags) are intentionally not
+            // wired here: their continue-handlers recompute the full-tab rect and
+            // would mis-track against the narrower sidebar rect.
+            if (AppWindow.aiCopilotVisible()) {
+                if (AppWindow.activeCopilotSessionForInput()) |chat| {
+                    const win = AppWindow.g_window orelse return;
+                    const fb = window_backend.framebufferSize(win);
+                    const bounds = ai_sidebar.boundsForWindow(
+                        @intCast(fb.width),
+                        @intCast(fb.height),
+                        @floatCast(titlebarHeight()),
+                        AppWindow.leftPanelsWidth(),
+                        0,
+                    );
+                    const bx_left: f64 = @floatFromInt(bounds.left);
+                    const bx_right: f64 = @floatFromInt(bounds.right);
+                    const by_top: f64 = @floatFromInt(bounds.top);
+                    const by_bottom: f64 = @floatFromInt(bounds.bottom);
+                    if (xpos >= bx_left and xpos < bx_right and ypos >= by_top and ypos < by_bottom) {
+                        focusAiCopilot();
+                        const chat_x: f32 = @floatFromInt(bounds.left);
+                        const chat_w: f32 = @floatFromInt(bounds.right - bounds.left);
+                        if (AppWindow.ai_chat_renderer.stopButtonHitTest(
+                            chat,
+                            xpos,
+                            ypos,
+                            @floatFromInt(fb.width),
+                            @floatCast(titlebarHeight()),
+                            chat_x,
+                            chat_w,
+                        )) {
+                            chat.stopRequest();
+                            AppWindow.g_force_rebuild = true;
+                            AppWindow.g_cells_valid = false;
+                            return;
+                        }
+                        if (AppWindow.ai_chat_renderer.missingApiKeyStatusHitTest(
+                            chat,
+                            xpos,
+                            ypos,
+                            @floatFromInt(fb.width),
+                            @floatCast(titlebarHeight()),
+                            chat_x,
+                            chat_w,
+                        )) {
+                            overlays.openAiConfigForSession(chat);
+                            AppWindow.g_force_rebuild = true;
+                            AppWindow.g_cells_valid = false;
+                            return;
+                        }
+                        if (AppWindow.ai_chat_renderer.interactionHitTest(
+                            chat,
+                            xpos,
+                            ypos,
+                            @floatFromInt(fb.width),
+                            @floatFromInt(fb.height),
+                            @floatCast(titlebarHeight()),
+                            chat_x,
+                            chat_w,
+                        )) |target| {
+                            switch (target) {
+                                .copy_message => |message_index| copyAiChatMessageToClipboard(chat, message_index),
+                                .toggle_tool => |message_index| {
+                                    chat.toggleToolMessageCollapsed(message_index);
+                                    AppWindow.g_force_rebuild = true;
+                                    AppWindow.g_cells_valid = false;
+                                },
+                                .toggle_reasoning => |message_index| {
+                                    chat.toggleReasoningCollapsed(message_index);
+                                    AppWindow.g_force_rebuild = true;
+                                    AppWindow.g_cells_valid = false;
+                                },
+                            }
+                            return;
+                        }
+                        if (AppWindow.ai_chat_renderer.permissionChipHitTest(
+                            xpos,
+                            ypos,
+                            @floatFromInt(fb.width),
+                            @floatCast(titlebarHeight()),
+                            chat_x,
+                            chat_w,
+                        )) {
+                            toggleAiAgentPermission();
+                            return;
+                        }
+                        // Click landed in the panel but not on an interactive
+                        // element: keep focus, clear any selection, consume it.
+                        chat.clearSelection();
+                        AppWindow.g_force_rebuild = true;
+                        AppWindow.g_cells_valid = false;
+                        return;
+                    }
+                    // Click outside the sidebar: hand focus back to the terminal.
+                    blurAiCopilot();
+                }
+            }
+
             if (AppWindow.activeAiChat()) |chat| {
                 const win = AppWindow.g_window orelse return;
                 const fb = window_backend.framebufferSize(win);
@@ -2518,7 +2842,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     @floatFromInt(fb.width),
                     @floatCast(titlebarHeight()),
                     AppWindow.leftPanelsWidth(),
-                    AppWindow.rightPanelsWidthForWindow(fb.width),
+                    @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
                 )) {
                     chat.stopRequest();
                     AppWindow.g_force_rebuild = true;
@@ -2532,7 +2856,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     @floatFromInt(fb.width),
                     @floatCast(titlebarHeight()),
                     AppWindow.leftPanelsWidth(),
-                    AppWindow.rightPanelsWidthForWindow(fb.width),
+                    @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
                 )) {
                     overlays.openAiConfigForSession(chat);
                     AppWindow.g_force_rebuild = true;
@@ -2547,7 +2871,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     @floatFromInt(fb.height),
                     @floatCast(titlebarHeight()),
                     AppWindow.leftPanelsWidth(),
-                    AppWindow.rightPanelsWidthForWindow(fb.width),
+                    @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
                 )) |target| {
                     switch (target) {
                         .copy_message => |message_index| copyAiChatMessageToClipboard(chat, message_index),
@@ -2570,7 +2894,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     @floatFromInt(fb.width),
                     @floatCast(titlebarHeight()),
                     AppWindow.leftPanelsWidth(),
-                    AppWindow.rightPanelsWidthForWindow(fb.width),
+                    @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
                 )) {
                     toggleAiAgentPermission();
                     return;
@@ -2583,7 +2907,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     @floatFromInt(fb.height),
                     @floatCast(titlebarHeight()),
                     AppWindow.leftPanelsWidth(),
-                    AppWindow.rightPanelsWidthForWindow(fb.width),
+                    @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
                 )) |drag_offset| {
                     g_ai_transcript_scroll_dragging = true;
                     g_ai_transcript_scroll_chat = chat;
@@ -2603,7 +2927,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                         @floatFromInt(fb.height),
                         @floatCast(titlebarHeight()),
                         AppWindow.leftPanelsWidth(),
-                        AppWindow.rightPanelsWidthForWindow(fb.width),
+                        @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
                     )) |hit| {
                         chat.beginTranscriptSelection(hit.message_index, hit.byte_offset);
                         g_ai_transcript_selecting = true;
@@ -2622,7 +2946,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     @floatFromInt(fb.width),
                     @floatFromInt(fb.height),
                     AppWindow.leftPanelsWidth(),
-                    AppWindow.rightPanelsWidthForWindow(fb.width),
+                    @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
                 )) |hit| {
                     g_ai_input_scroll_dragging = true;
                     g_ai_input_scroll_chat = chat;
@@ -2710,7 +3034,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             }
 
             const cell_pos = mouseToSurfaceCell(clicked_surface, xpos, ypos);
-            switch (terminalPathClickAction(clicked_surface.launch_kind, clicked_surface.ssh_connection != null, ev.ctrl, ev.shift, ev.alt)) {
+            switch (terminalPathClickAction(clicked_surface.launch_kind, clicked_surface.ssh_connection != null, primaryOpenMod(ev.ctrl, ev.super), ev.shift, ev.alt)) {
                 .download_ssh_file => {
                     if (downloadTerminalFileAtCell(clicked_surface, cell_pos)) return;
                 },
@@ -2802,6 +3126,12 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                 g_browser_resize_dragging = false;
                 g_browser_resize_hover = hitTestBrowserResizeHandle(xpos, ypos);
                 platform_cursor.set(if (g_browser_resize_hover) .size_we else .arrow);
+                return;
+            }
+            if (g_ai_copilot_resize_dragging) {
+                g_ai_copilot_resize_dragging = false;
+                g_ai_copilot_resize_hover = hitTestAiCopilotResizeHandle(xpos, ypos);
+                platform_cursor.set(if (g_ai_copilot_resize_hover) .size_we else .arrow);
                 return;
             }
 
@@ -2969,7 +3299,7 @@ fn applyAiInputScrollbarDrag(chat: *AppWindow.ai_chat.Session, ypos: f64) void {
         @floatFromInt(size.width),
         @floatFromInt(size.height),
         AppWindow.leftPanelsWidth(),
-        AppWindow.rightPanelsWidthForWindow(size.width),
+        @as(f32, @floatFromInt(size.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(size.width),
         g_ai_input_scroll_drag_offset,
     )) |drag| {
         _ = chat.setInputScrollRow(drag.row, drag.max_cols, drag.visible_rows);
@@ -2988,7 +3318,7 @@ fn applyAiTranscriptScrollbarDrag(chat: *AppWindow.ai_chat.Session, ypos: f64) v
         @floatFromInt(size.height),
         @floatCast(titlebarHeight()),
         AppWindow.leftPanelsWidth(),
-        AppWindow.rightPanelsWidthForWindow(size.width),
+        @as(f32, @floatFromInt(size.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(size.width),
         g_ai_transcript_scroll_drag_offset,
     )) |px| {
         chat.scrollToPx(px);
@@ -3008,7 +3338,7 @@ fn updateAiTranscriptSelectionDrag(chat: *AppWindow.ai_chat.Session, xpos: f64, 
         @floatFromInt(fb.height),
         @floatCast(titlebarHeight()),
         AppWindow.leftPanelsWidth(),
-        AppWindow.rightPanelsWidthForWindow(fb.width),
+        @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
     )) |hit| {
         chat.updateTranscriptSelection(hit.message_index, hit.byte_offset);
         AppWindow.g_force_rebuild = true;
@@ -3039,6 +3369,11 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
         platform_cursor.set(.size_we);
         return;
     }
+    if (g_ai_copilot_resize_dragging) {
+        applyAiCopilotWidthFromMouse(xpos);
+        platform_cursor.set(.size_we);
+        return;
+    }
     if (g_ai_input_scroll_dragging) {
         if (g_ai_input_scroll_chat) |chat| applyAiInputScrollbarDrag(chat, ypos);
         return;
@@ -3064,6 +3399,13 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
         return;
     }
 
+    // Reported mouse drag: stream motion to the PTY (button/any tracking
+    // modes) and suppress local hover/selection while the button is held.
+    if (g_mouse_report_button) |button| {
+        if (g_mouse_report_surface) |surface| reportMouseMotion(surface, button, ev);
+        return;
+    }
+
     if (AppWindow.g_window) |hover_win| {
         if (AppWindow.activeAiChat()) |chat| {
             const hover_fb = window_backend.framebufferSize(hover_win);
@@ -3075,7 +3417,7 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
                 @floatFromInt(hover_fb.height),
                 @floatCast(titlebarHeight()),
                 AppWindow.leftPanelsWidth(),
-                AppWindow.rightPanelsWidthForWindow(hover_fb.width),
+                @as(f32, @floatFromInt(hover_fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(hover_fb.width),
             ) != null;
             if (over != AppWindow.ai_chat_renderer.g_transcript_scrollbar_hover) {
                 AppWindow.ai_chat_renderer.g_transcript_scrollbar_hover = over;
@@ -3183,6 +3525,15 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
             platform_cursor.set(.arrow);
             g_browser_resize_hover = false;
         }
+        const over_ai_copilot_resize = hitTestAiCopilotResizeHandle(xpos, ypos);
+        if (over_ai_copilot_resize) {
+            platform_cursor.set(.size_we);
+            g_ai_copilot_resize_hover = true;
+            return;
+        } else if (g_ai_copilot_resize_hover) {
+            platform_cursor.set(.arrow);
+            g_ai_copilot_resize_hover = false;
+        }
     }
 
     if (hitTestBrowserPanel(xpos, ypos)) {
@@ -3194,7 +3545,7 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
     if (AppWindow.g_focus_follows_mouse) {
         updateFocusFromMouse(@intFromFloat(xpos), @intFromFloat(ypos));
     }
-    updateInteractiveUnderlineAtMouse(xpos, ypos, ev.ctrl, ev.shift, ev.alt);
+    updateInteractiveUnderlineAtMouse(xpos, ypos, ev.ctrl, ev.shift, ev.alt, ev.super);
 
     // Update scrollbar hover state
     const win = AppWindow.g_window orelse return;
@@ -3315,6 +3666,168 @@ fn appendAlternateScrollKeys(surface: *Surface, ev: platform_input.MouseWheelEve
     return true;
 }
 
+// --- Terminal mouse button reporting --------------------------------------
+// Companion to appendMouseWheelReport: encodes button presses, releases and
+// drags so mouse-aware TUIs (nvim, tmux, htop) receive clicks, not just wheel
+// scrolls. The pure protocol encoder lives in input/mouse_report.zig; these
+// helpers map ghostty-vt's flags onto it and deliver the bytes to the PTY.
+
+// Map ghostty-vt's mouse flags onto the local encoder enums. Typed `anytype`
+// because the enums aren't re-exported from the ghostty-vt module root; the
+// switch over enum literals coerces to whatever enum the flags field holds
+// (the same literals the wheel path compares against in appendMouseWheelReport).
+fn mouseReportEvent(mode: anytype) mouse_report.Event {
+    return switch (mode) {
+        .none => .none,
+        .x10 => .x10,
+        .normal => .normal,
+        .button => .button,
+        .any => .any,
+    };
+}
+
+fn mouseReportFormat(fmt: anytype) mouse_report.Format {
+    return switch (fmt) {
+        .x10 => .x10,
+        .utf8 => .utf8,
+        .sgr => .sgr,
+        .urxvt => .urxvt,
+        .sgr_pixels => .sgr_pixels,
+    };
+}
+
+fn platformMouseButton(button: platform_input.MouseButton) mouse_report.Button {
+    return switch (button) {
+        .left => .left,
+        .middle => .middle,
+        .right => .right,
+    };
+}
+
+/// Encode and deliver one mouse button/motion event to the surface's PTY.
+/// Returns true if bytes were written (false when the active mode does not
+/// report this event — e.g. motion in normal mode, or no tracking at all).
+fn sendTerminalMouseReport(
+    surface: *Surface,
+    action: mouse_report.Action,
+    button: ?mouse_report.Button,
+    x_px: i32,
+    y_px: i32,
+    mods: mouse_report.Mods,
+) bool {
+    var buf: [512]u8 = undefined;
+    var len: usize = 0;
+    surface.render_state.mutex.lock();
+    const mode = mouseReportEvent(surface.terminal.flags.mouse_event);
+    const fmt = mouseReportFormat(surface.terminal.flags.mouse_format);
+    if (mode == .none) {
+        surface.render_state.mutex.unlock();
+        return false;
+    }
+    const cell = mouseToSurfaceCell(surface, @floatFromInt(x_px), @floatFromInt(y_px));
+    const pixel = mouseToSurfacePixel(surface, x_px, y_px);
+    _ = mouse_report.encode(mode, fmt, action, button, mods, cell.col, cell.row, pixel.x, pixel.y, &buf, &len);
+    surface.render_state.mutex.unlock();
+    if (len == 0) return false;
+    writeToPty(surface, buf[0..len]);
+    return true;
+}
+
+/// True when the AI copilot sidebar is shown and covers (xf, yf).
+fn aiCopilotRegionContains(xf: f64, yf: f64) bool {
+    if (!AppWindow.aiCopilotVisible()) return false;
+    const win = AppWindow.g_window orelse return false;
+    const fb = window_backend.framebufferSize(win);
+    const bounds = ai_sidebar.boundsForWindow(
+        @intCast(fb.width),
+        @intCast(fb.height),
+        @floatCast(titlebarHeight()),
+        AppWindow.leftPanelsWidth(),
+        0,
+    );
+    return xf >= @as(f64, @floatFromInt(bounds.left)) and xf < @as(f64, @floatFromInt(bounds.right)) and
+        yf >= @as(f64, @floatFromInt(bounds.top)) and yf < @as(f64, @floatFromInt(bounds.bottom));
+}
+
+/// The surface that should receive a mouse report for an event at (x, y), or
+/// null when the point is over window chrome / side panels or the focused
+/// program has not enabled mouse tracking. Mirrors the chrome exclusions the
+/// left-press path walks before it reaches terminal content.
+fn terminalMouseReportTarget(x_i: i32, y_i: i32) ?*Surface {
+    const xf: f64 = @floatFromInt(x_i);
+    const yf: f64 = @floatFromInt(y_i);
+    if (yf < titlebarHeight()) return null; // titlebar
+    if (AppWindow.activeAiChat() != null) return null; // AI chat tab: no terminal
+    if (tab.g_sidebar_visible and xf < @as(f64, @floatCast(titlebar.sidebarWidth()))) return null;
+    if (hitTestFileExplorer(xf, yf)) return null;
+    if (hitTestBrowserUrlBar(xf, yf)) return null;
+    if (hitTestBrowserPanel(xf, yf)) return null;
+    if (hitTestMarkdownPreviewPanel(xf, yf)) return null;
+    if (aiCopilotRegionContains(xf, yf)) return null;
+    const surface = split_layout.surfaceAtPoint(x_i, y_i) orelse return null;
+    surface.render_state.mutex.lock();
+    const mode = surface.terminal.flags.mouse_event;
+    surface.render_state.mutex.unlock();
+    if (mode == .none) return null;
+    return surface;
+}
+
+/// Begin a reported press for an event that landed on terminal content.
+/// Returns true if the press was consumed (delivered to the PTY).
+fn beginTerminalMouseReport(ev: platform_input.MouseButtonEvent) bool {
+    const surface = terminalMouseReportTarget(ev.x, ev.y) orelse return false;
+    const button = platformMouseButton(ev.button);
+    updateFocusFromMouse(ev.x, ev.y);
+    _ = sendTerminalMouseReport(surface, .press, button, ev.x, ev.y, .{
+        .shift = ev.shift,
+        .alt = ev.alt,
+        .ctrl = ev.ctrl,
+    });
+    g_mouse_report_button = button;
+    g_mouse_report_surface = surface;
+    g_mouse_report_last_cell = null;
+    return true;
+}
+
+/// Finish a reported drag on button release (wherever the pointer ends up, and
+/// regardless of modifiers) so the app always sees button-up and state never
+/// leaks. Returns true if a matching reported press was in progress.
+fn finishTerminalMouseReport(ev: platform_input.MouseButtonEvent) bool {
+    const active = g_mouse_report_button orelse return false;
+    if (active != platformMouseButton(ev.button)) return false;
+    const surface = g_mouse_report_surface;
+    g_mouse_report_button = null;
+    g_mouse_report_surface = null;
+    g_mouse_report_last_cell = null;
+    if (surface) |s| {
+        _ = sendTerminalMouseReport(s, .release, active, ev.x, ev.y, .{
+            .shift = ev.shift,
+            .alt = ev.alt,
+            .ctrl = ev.ctrl,
+        });
+    }
+    return true;
+}
+
+/// Stream a drag-motion report while a reported press is held, deduplicated by
+/// cell so we don't flood the PTY with one report per pixel.
+fn reportMouseMotion(surface: *Surface, button: mouse_report.Button, ev: platform_input.MouseMoveEvent) void {
+    const cell = blk: {
+        surface.render_state.mutex.lock();
+        defer surface.render_state.mutex.unlock();
+        break :blk mouseToSurfaceCell(surface, @floatFromInt(ev.x), @floatFromInt(ev.y));
+    };
+    if (g_mouse_report_last_cell) |last| {
+        if (last.col == cell.col and last.row == cell.row) return;
+    }
+    g_mouse_report_last_cell = cell;
+    _ = sendTerminalMouseReport(surface, .motion, button, ev.x, ev.y, .{
+        .shift = ev.shift,
+        .alt = ev.alt,
+        .ctrl = ev.ctrl,
+    });
+}
+
 fn handleMouseWheel(ev: platform_input.MouseWheelEvent) void {
     overlays.startupShortcutsDismiss();
     if (tab.g_sidebar_visible and ev.xpos >= 0 and ev.xpos < @as(i32, @intFromFloat(titlebar.sidebarWidth()))) return;
@@ -3352,7 +3865,7 @@ fn handleMouseWheel(ev: platform_input.MouseWheelEvent) void {
                 @floatFromInt(size.width),
                 @floatFromInt(size.height),
                 AppWindow.leftPanelsWidth(),
-                AppWindow.rightPanelsWidthForWindow(size.width),
+                @as(f32, @floatFromInt(size.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(size.width),
             )) |metrics| {
                 const units: i32 = @intCast(mouseWheelUnits(ev.delta));
                 const rows = if (ev.delta > 0) -units else units;
@@ -3365,6 +3878,47 @@ fn handleMouseWheel(ev: platform_input.MouseWheelEvent) void {
             chat.scrollBy(delta);
             AppWindow.g_force_rebuild = true;
             return;
+        }
+    }
+    // AI copilot sidebar (terminal tabs): scroll the copilot transcript (or its
+    // composer when the cursor is over the input field) when the wheel event
+    // falls inside the sidebar rect. Uses the same clientSize source as the
+    // ai_chat-tab wheel path above so the rect matches what was hit-tested.
+    if (AppWindow.aiCopilotVisible()) {
+        if (AppWindow.activeCopilotSessionForInput()) |chat| {
+            const win = AppWindow.g_window orelse return;
+            const size = clientSize(win);
+            const bounds = ai_sidebar.boundsForWindow(
+                size.width,
+                size.height,
+                @floatCast(titlebarHeight()),
+                AppWindow.leftPanelsWidth(),
+                0,
+            );
+            if (ev.xpos >= bounds.left and ev.xpos < bounds.right and ev.ypos >= bounds.top and ev.ypos < bounds.bottom) {
+                const chat_x: f32 = @floatFromInt(bounds.left);
+                const chat_w: f32 = @floatFromInt(bounds.right - bounds.left);
+                if (AppWindow.ai_chat_renderer.inputFieldMetricsAt(
+                    chat,
+                    @floatFromInt(ev.xpos),
+                    @floatFromInt(ev.ypos),
+                    @floatFromInt(size.width),
+                    @floatFromInt(size.height),
+                    chat_x,
+                    chat_w,
+                )) |metrics| {
+                    const units: i32 = @intCast(mouseWheelUnits(ev.delta));
+                    const rows = if (ev.delta > 0) -units else units;
+                    _ = chat.scrollInputRows(rows, metrics.max_cols, metrics.visible_rows);
+                    AppWindow.g_force_rebuild = true;
+                    AppWindow.g_cells_valid = false;
+                    return;
+                }
+                const delta: f32 = -@as(f32, @floatFromInt(ev.delta)) * 72.0 / 120.0;
+                chat.scrollBy(delta);
+                AppWindow.g_force_rebuild = true;
+                return;
+            }
         }
     }
     // Scroll the surface under the mouse cursor (like Ghostty), not the focused surface.

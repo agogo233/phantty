@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const AppWindow = @import("../AppWindow.zig");
+const ai_chat = @import("../ai_chat.zig");
 const titlebar = AppWindow.titlebar;
 const font = AppWindow.font;
 const tab = AppWindow.tab;
@@ -113,7 +114,7 @@ threadlocal var g_transfer_cancel_confirm_visible: bool = false;
 
 const UPDATE_PROMPT_DURATION_MS: i64 = 10000;
 const UPDATE_STATUS_DURATION_MS: i64 = 2500;
-const SSH_CWD_HELP_URL = "https://github.com/xuzhougeng/phantty#ssh-current-directory-for-downloads-and-uploads";
+const SSH_CWD_HELP_URL = "https://github.com/xuzhougeng/wispterm#ssh-current-directory-for-downloads-and-uploads";
 const UpdatePromptAction = enum { none, open_release, download_update };
 threadlocal var g_update_prompt_until_ms: i64 = 0;
 threadlocal var g_update_prompt_buf: [128]u8 = undefined;
@@ -481,6 +482,14 @@ fn executeCommand(action: CommandAction) void {
             }
         },
         .open_latest_release => openLatestRelease(),
+        .update_skills => {
+            if (AppWindow.g_app) |app| {
+                showStatusToast("Updating skills...");
+                app.requestSkillUpdate();
+            } else {
+                showStatusToast("Update Skills unavailable");
+            }
+        },
     }
 }
 
@@ -623,7 +632,7 @@ pub fn weixinQrPanelHandleAction(action: weixin_qr_panel.Action) void {
     }
 }
 
-fn commandPaletteOpenAgentHistory() void {
+pub fn commandPaletteOpenAgentHistory() void {
     var state = commandCenterStateSnapshot();
     state.commandPaletteOpenAgentHistory();
     commandCenterStateCommit(state);
@@ -1335,11 +1344,11 @@ pub fn renderCommandPalette(window_width: f32, window_height: f32, top_offset: f
 // New session / SSH launcher
 // ============================================================================
 
-const SSH_FIELD_COUNT = 5;
+const SSH_FIELD_COUNT = 6;
 const SSH_FIELD_MAX = 128;
 const SSH_PROFILE_MAX = 16;
 const SSH_PROFILE_NONE = std.math.maxInt(usize);
-const AI_FIELD_COUNT = 10;
+const AI_FIELD_COUNT = 11;
 const AI_FIELD_MAX = 8192;
 const AI_PROFILE_MAX = 16;
 const AI_PROFILE_NONE = std.math.maxInt(usize);
@@ -1349,6 +1358,7 @@ const SshField = enum(usize) {
     user = 2,
     password = 3,
     port = 4,
+    proxy_jump = 5,
 };
 
 const AiField = enum(usize) {
@@ -1362,6 +1372,7 @@ const AiField = enum(usize) {
     stream = 7,
     agent = 8,
     protocol = 9,
+    max_tokens = 10,
 };
 
 const SessionAction = enum {
@@ -1619,6 +1630,12 @@ pub fn sessionLauncherHandleKey(ev: input_key.KeyEvent) void {
         switch (ev.key) {
             .tab, .arrow_down => g_ai_focus = (g_ai_focus + 1) % (AI_FIELD_COUNT + 3),
             .arrow_up => g_ai_focus = if (g_ai_focus == 0) AI_FIELD_COUNT + 2 else g_ai_focus - 1,
+            .arrow_right => {
+                if (g_ai_focus == @intFromEnum(AiField.protocol)) cycleAiFormProtocol(true);
+            },
+            .arrow_left => {
+                if (g_ai_focus == @intFromEnum(AiField.protocol)) cycleAiFormProtocol(false);
+            },
             .backspace => {
                 if (g_ai_focus < AI_FIELD_COUNT) backspaceAiFormField(g_ai_focus);
             },
@@ -1911,9 +1928,11 @@ pub fn agentSaveSshProfile(allocator: std.mem.Allocator, args: AppWindow.ai_chat
     const name_raw = std.mem.trim(u8, args.name, " \t\r\n");
     const port_raw = std.mem.trim(u8, args.port, " \t\r\n");
     const port = if (port_raw.len > 0) port_raw else "22";
+    const proxy_jump = std.mem.trim(u8, args.proxy_jump, " \t\r\n");
     if (host.len == 0 or user.len == 0) return error.InvalidProfile;
     if (!isSshTokenSafe(host) or !isSshTokenSafe(user)) return error.InvalidProfile;
     if (!isPortTokenSafe(port)) return error.InvalidProfile;
+    if (!command_palette_model.isProxyJumpSafe(proxy_jump)) return error.InvalidProfile;
 
     const lookup = if (name_raw.len > 0) name_raw else host;
     const found_idx = findSshProfileIndex(lookup) orelse findSshProfileIndex(host);
@@ -1938,6 +1957,9 @@ pub fn agentSaveSshProfile(allocator: std.mem.Allocator, args: AppWindow.ai_chat
     copySshProfileField(profile, .user, user);
     if (args.password.len > 0 or !updated_existing) {
         copySshProfileField(profile, .password, args.password);
+    }
+    if (proxy_jump.len > 0 or !updated_existing) {
+        copySshProfileField(profile, .proxy_jump, proxy_jump);
     }
     copySshProfileField(profile, .port, port);
 
@@ -2044,6 +2066,7 @@ fn saveSshFormProfile() ?usize {
     if (ip.len == 0 or user.len == 0) return null;
     if (!isSshTokenSafe(ip) or !isSshTokenSafe(user)) return null;
     if (port.len > 0 and !isPortTokenSafe(port)) return null;
+    if (!command_palette_model.isProxyJumpSafe(sshField(.proxy_jump))) return null;
 
     const idx = if (g_ssh_edit_index != SSH_PROFILE_NONE)
         g_ssh_edit_index
@@ -2081,10 +2104,12 @@ fn connectSshProfileReturningSurface(idx: usize) ?*Surface {
     const user = profileField(profile, .user);
     const port = profileField(profile, .port);
     const password = profileField(profile, .password);
+    const proxy_jump = profileField(profile, .proxy_jump);
     const server_name = profileField(profile, .name);
     if (ip.len == 0 or user.len == 0) return null;
     if (!isSshTokenSafe(ip) or !isSshTokenSafe(user)) return null;
     if (port.len > 0 and !isPortTokenSafe(port)) return null;
+    if (!command_palette_model.isProxyJumpSafe(proxy_jump)) return null;
 
     var command_buf: [512]u8 = undefined;
     const command = platform_pty_command.sshInteractiveCommand(command_buf[0..], .{
@@ -2093,11 +2118,12 @@ fn connectSshProfileReturningSurface(idx: usize) ?*Surface {
         .port = port,
         .password_auth = password.len > 0,
         .legacy_algorithms = AppWindow.g_ssh_legacy_algorithms,
+        .proxy_jump = proxy_jump,
     }) orelse return null;
 
     sessionLauncherClose();
     if (AppWindow.spawnTabWithCommandUtf8ReturningSurface(command)) |surface| {
-        surface.setSshConnection(user, ip, port, password, password.len > 0, AppWindow.g_ssh_legacy_algorithms);
+        surface.setSshConnection(user, ip, port, password, proxy_jump, password.len > 0, AppWindow.g_ssh_legacy_algorithms);
         if (server_name.len > 0) {
             surface.setTitleOverride(server_name);
         }
@@ -2345,6 +2371,10 @@ pub fn openAiConfigForSession(session: *AppWindow.ai_chat.Session) void {
     setAiDefault(.stream, session.streamConfigValue());
     setAiDefault(.agent, session.agentConfigValue());
     setAiDefault(.protocol, session.apiProtocolName());
+    var max_tokens_buf: [16]u8 = undefined;
+    if (std.fmt.bufPrint(max_tokens_buf[0..], "{d}", .{session.maxTokens()})) |s| {
+        setAiDefault(.max_tokens, s);
+    } else |_| {}
     session.mutex.unlock();
 
     g_ai_edit_index = AI_PROFILE_NONE;
@@ -2407,10 +2437,13 @@ fn clearAiForm() void {
     setAiDefault(.stream, AppWindow.ai_chat.DEFAULT_STREAM);
     setAiDefault(.agent, AppWindow.ai_chat.DEFAULT_AGENT);
     setAiDefault(.protocol, AppWindow.ai_chat.DEFAULT_PROTOCOL);
+    setAiDefault(.max_tokens, AppWindow.ai_chat.DEFAULT_MAX_TOKENS);
 }
 
 fn appendAiFormCodepoint(field: usize, codepoint: u21) void {
     if (field >= AI_FIELD_COUNT) return;
+    // Protocol is a ←/→ toggle over the valid protocols, not a free-text field.
+    if (field == @intFromEnum(AiField.protocol)) return;
     var buf: [4]u8 = undefined;
     const len = std.unicode.utf8Encode(codepoint, &buf) catch return;
     if (g_ai_lens[field] + len > AI_FIELD_MAX) return;
@@ -2450,10 +2483,31 @@ fn appendSshFormText(field: usize, text: []const u8) void {
 
 fn backspaceAiFormField(field: usize) void {
     if (field >= AI_FIELD_COUNT or g_ai_lens[field] == 0) return;
+    // Protocol is a toggle field; it is not text-editable.
+    if (field == @intFromEnum(AiField.protocol)) return;
     g_ai_lens[field] -= 1;
     while (g_ai_lens[field] > 0 and (g_ai_bufs[field][g_ai_lens[field]] & 0xC0) == 0x80) {
         g_ai_lens[field] -= 1;
     }
+}
+
+/// Cycle the Protocol form field to the next/previous valid protocol. The field
+/// is constrained to valid values (chat_completions / responses / anthropic),
+/// so users toggle with ←/→ instead of typing an arbitrary string.
+fn cycleAiFormProtocol(forward: bool) void {
+    const idx = @intFromEnum(AiField.protocol);
+    const current = AppWindow.ai_chat.ApiProtocol.parse(g_ai_bufs[idx][0..g_ai_lens[idx]]);
+    setAiDefault(.protocol, current.cycle(forward).name());
+}
+
+/// Protocol row display: the current protocol name plus a small ASCII toggle
+/// affordance (←/→ switches between the three valid protocols).
+fn aiProtocolDisplay() []const u8 {
+    const S = struct {
+        threadlocal var buf: [48]u8 = undefined;
+    };
+    const p = AppWindow.ai_chat.ApiProtocol.parse(aiField(.protocol));
+    return std.fmt.bufPrint(&S.buf, "{s}   <-/->", .{p.name()}) catch p.name();
 }
 
 fn handleAiListKey(ev: input_key.KeyEvent) void {
@@ -2632,11 +2686,50 @@ fn spawnAiProfileWithAgentOverride(idx: usize, agent_override: ?[]const u8) bool
     const stream_val = aiProfileField(profile, .stream);
     const agent_val = agent_override orelse aiProfileField(profile, .agent);
     const protocol = aiProfileField(profile, .protocol);
+    const max_tokens = std.fmt.parseInt(u32, std.mem.trim(u8, aiProfileField(profile, .max_tokens), " \t"), 10) catch 8192;
     if (base_url.len == 0 or model.len == 0) return false;
     if (!isHttpUrlish(base_url)) return false;
 
     sessionLauncherClose();
-    return AppWindow.spawnAiChatTab(name, base_url, api_key, model, protocol, system_prompt, thinking, reasoning_effort, stream_val, agent_val);
+    return AppWindow.spawnAiChatTab(name, base_url, api_key, model, protocol, system_prompt, thinking, reasoning_effort, stream_val, agent_val, max_tokens);
+}
+
+/// Build a standalone copilot Session from the default AI profile (Issue #98).
+/// Mirrors spawnAiProfileWithAgentOverride's profile reading but returns a
+/// Session with copilot mode + the copilot system prompt, instead of a tab.
+pub fn makeCopilotSessionForDefaultProfile() ?*ai_chat.Session {
+    loadAiProfiles();
+    if (g_ai_profile_count == 0) return null;
+    const idx = defaultAiProfileIndex();
+    if (idx >= g_ai_profile_count) return null;
+    const profile = &g_ai_profiles[idx];
+    const base_url = aiProfileField(profile, .base_url);
+    const api_key = aiProfileField(profile, .api_key);
+    const model = aiProfileField(profile, .model);
+    const thinking = aiProfileField(profile, .thinking);
+    const reasoning_effort = aiProfileField(profile, .reasoning_effort);
+    const stream_val = aiProfileField(profile, .stream);
+    const protocol = aiProfileField(profile, .protocol);
+    const max_tokens = std.fmt.parseInt(u32, std.mem.trim(u8, aiProfileField(profile, .max_tokens), " \t"), 10) catch 8192;
+    if (base_url.len == 0 or model.len == 0) return null;
+    if (!isHttpUrlish(base_url)) return null;
+    const allocator = AppWindow.g_allocator orelse return null;
+    const session = ai_chat.Session.initWithProtocol(
+        allocator,
+        "Copilot",
+        base_url,
+        api_key,
+        model,
+        protocol,
+        ai_chat.COPILOT_SYSTEM_PROMPT,
+        thinking,
+        reasoning_effort,
+        stream_val,
+        "true", // agent_enabled
+    ) catch return null;
+    session.max_tokens = max_tokens;
+    session.copilot = true;
+    return session;
 }
 
 threadlocal var g_ai_default_name_buf: [256]u8 = undefined;
@@ -2708,27 +2801,35 @@ fn loadAiProfiles() void {
         if (g_ai_profile_count >= AI_PROFILE_MAX) break;
         const line = std.mem.trimRight(u8, line_raw, "\r");
         if (line.len == 0 or line[0] == '#') continue;
-        var profile = AiProfile{};
-        var parts = std.mem.splitScalar(u8, line, '\t');
-        var field_idx: usize = 0;
-        var ok = true;
-        while (field_idx < AI_FIELD_COUNT) : (field_idx += 1) {
-            const part = parts.next() orelse break;
-            const decoded = decodeHexFieldToSlice(part, profile.fields[field_idx][0..]) orelse {
-                ok = false;
-                break;
-            };
-            profile.lens[field_idx] = decoded;
-        }
-        if (!ok or field_idx < 5) continue;
-        if (profile.lens[@intFromEnum(AiField.thinking)] == 0) setProfileDefault(&profile, .thinking, AppWindow.ai_chat.DEFAULT_THINKING);
-        if (profile.lens[@intFromEnum(AiField.reasoning_effort)] == 0) setProfileDefault(&profile, .reasoning_effort, AppWindow.ai_chat.DEFAULT_REASONING_EFFORT);
-        if (profile.lens[@intFromEnum(AiField.stream)] == 0) setProfileDefault(&profile, .stream, AppWindow.ai_chat.DEFAULT_STREAM);
-        if (profile.lens[@intFromEnum(AiField.agent)] == 0) setProfileDefault(&profile, .agent, AppWindow.ai_chat.DEFAULT_AGENT);
-        if (profile.lens[@intFromEnum(AiField.protocol)] == 0) setProfileDefault(&profile, .protocol, AppWindow.ai_chat.DEFAULT_PROTOCOL);
+        const profile = decodeAiProfileLine(line) orelse continue;
         g_ai_profiles[g_ai_profile_count] = profile;
         g_ai_profile_count += 1;
     }
+}
+
+/// Decode one tab-separated, hex-encoded AI profile line into an `AiProfile`,
+/// then fill defaults for any empty optional field. Returns null when a present
+/// field contains malformed hex or fewer than five fields are present. Trailing
+/// fields absent from the line (e.g. `protocol`/`max_tokens` from older builds)
+/// are defaulted rather than misaligned, so profiles written before the schema
+/// grew still load correctly.
+fn decodeAiProfileLine(line: []const u8) ?AiProfile {
+    var profile = AiProfile{};
+    var parts = std.mem.splitScalar(u8, line, '\t');
+    var field_idx: usize = 0;
+    while (field_idx < AI_FIELD_COUNT) : (field_idx += 1) {
+        const part = parts.next() orelse break;
+        const decoded = decodeHexFieldToSlice(part, profile.fields[field_idx][0..]) orelse return null;
+        profile.lens[field_idx] = decoded;
+    }
+    if (field_idx < 5) return null;
+    if (profile.lens[@intFromEnum(AiField.thinking)] == 0) setProfileDefault(&profile, .thinking, AppWindow.ai_chat.DEFAULT_THINKING);
+    if (profile.lens[@intFromEnum(AiField.reasoning_effort)] == 0) setProfileDefault(&profile, .reasoning_effort, AppWindow.ai_chat.DEFAULT_REASONING_EFFORT);
+    if (profile.lens[@intFromEnum(AiField.stream)] == 0) setProfileDefault(&profile, .stream, AppWindow.ai_chat.DEFAULT_STREAM);
+    if (profile.lens[@intFromEnum(AiField.agent)] == 0) setProfileDefault(&profile, .agent, AppWindow.ai_chat.DEFAULT_AGENT);
+    if (profile.lens[@intFromEnum(AiField.protocol)] == 0) setProfileDefault(&profile, .protocol, AppWindow.ai_chat.DEFAULT_PROTOCOL);
+    if (profile.lens[@intFromEnum(AiField.max_tokens)] == 0) setProfileDefault(&profile, .max_tokens, AppWindow.ai_chat.DEFAULT_MAX_TOKENS);
+    return profile;
 }
 
 fn saveAiProfiles(allocator: std.mem.Allocator) void {
@@ -2740,7 +2841,7 @@ fn saveAiProfiles(allocator: std.mem.Allocator) void {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
-    out.appendSlice(allocator, "# Phantty AI Chat profiles. Fields are hex encoded: name, base_url, api_key, model, system_prompt, thinking, reasoning_effort, stream, agent, protocol.\n") catch return;
+    out.appendSlice(allocator, "# WispTerm AI Chat profiles. Fields are hex encoded: name, base_url, api_key, model, system_prompt, thinking, reasoning_effort, stream, agent, protocol, max_tokens.\n") catch return;
     for (g_ai_profiles[0..g_ai_profile_count]) |profile| {
         for (0..AI_FIELD_COUNT) |i| {
             if (i > 0) out.append(allocator, '\t') catch return;
@@ -2773,25 +2874,26 @@ fn loadSshProfiles() void {
         if (g_ssh_profile_count >= SSH_PROFILE_MAX) break;
         const line = std.mem.trimRight(u8, line_raw, "\r");
         if (line.len == 0 or line[0] == '#') continue;
-        var profile = SshProfile{};
-        var parts = std.mem.splitScalar(u8, line, '\t');
-        var field_idx: usize = 0;
-        var ok = true;
-        while (field_idx < SSH_FIELD_COUNT) : (field_idx += 1) {
-            const part = parts.next() orelse {
-                ok = false;
-                break;
-            };
-            const decoded = decodeHexField(part, &profile.fields[field_idx]) orelse {
-                ok = false;
-                break;
-            };
-            profile.lens[field_idx] = decoded;
-        }
-        if (!ok) continue;
+        const profile = decodeSshProfileLine(line) orelse continue;
         g_ssh_profiles[g_ssh_profile_count] = profile;
         g_ssh_profile_count += 1;
     }
+}
+
+/// Decode one tab-separated, hex-encoded SSH profile line into an `SshProfile`.
+/// Returns null only when a present field contains malformed hex; trailing
+/// fields absent from the line are left empty so profiles written by older
+/// builds (with fewer fields) still load after the schema grows.
+fn decodeSshProfileLine(line: []const u8) ?SshProfile {
+    var profile = SshProfile{};
+    var parts = std.mem.splitScalar(u8, line, '\t');
+    var field_idx: usize = 0;
+    while (field_idx < SSH_FIELD_COUNT) : (field_idx += 1) {
+        const part = parts.next() orelse break;
+        const decoded = decodeHexField(part, &profile.fields[field_idx]) orelse return null;
+        profile.lens[field_idx] = decoded;
+    }
+    return profile;
 }
 
 fn saveSshProfiles(allocator: std.mem.Allocator) void {
@@ -2803,7 +2905,7 @@ fn saveSshProfiles(allocator: std.mem.Allocator) void {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
-    out.appendSlice(allocator, "# Phantty SSH profiles. Fields are hex encoded: name, host, user, password, port.\n") catch return;
+    out.appendSlice(allocator, "# WispTerm SSH profiles. Fields are hex encoded: name, host, user, password, port, proxy_jump.\n") catch return;
     for (g_ssh_profiles[0..g_ssh_profile_count]) |profile| {
         for (0..SSH_FIELD_COUNT) |i| {
             if (i > 0) out.append(allocator, '\t') catch return;
@@ -2912,7 +3014,8 @@ fn sessionDesiredBoxWidth() f32 {
         desired = @max(desired, sessionTwoColumnWidth("Thinking", aiField(.thinking)));
         desired = @max(desired, sessionTwoColumnWidth("Effort", aiField(.reasoning_effort)));
         desired = @max(desired, sessionTwoColumnWidth("Stream", aiField(.stream)));
-        desired = @max(desired, sessionTwoColumnWidth("Protocol", aiField(.protocol)));
+        desired = @max(desired, sessionTwoColumnWidth("Protocol", aiProtocolDisplay()));
+        desired = @max(desired, sessionTwoColumnWidth("Max Tokens", aiField(.max_tokens)));
         desired = @max(desired, sessionTwoColumnWidth("Save & Open", "agent"));
         desired = @max(desired, sessionTwoColumnWidth("Save", "profile"));
         desired = @max(desired, sessionTwoColumnWidth("Cancel", "Esc"));
@@ -2925,6 +3028,7 @@ fn sessionDesiredBoxWidth() f32 {
         desired = @max(desired, sessionTwoColumnWidth("User", sshField(.user)));
         desired = @max(desired, sessionTwoColumnWidth("Password", sshField(.password)));
         desired = @max(desired, sessionTwoColumnWidth("Port", sshField(.port)));
+        desired = @max(desired, sessionTwoColumnWidth("Jump host", sshField(.proxy_jump)));
         desired = @max(desired, sessionTwoColumnWidth("Save & Connect", platform_pty_command.sshLauncherDetail()));
         desired = @max(desired, sessionTwoColumnWidth("Save", "profile"));
         desired = @max(desired, sessionTwoColumnWidth("Cancel", "Esc"));
@@ -3285,7 +3389,8 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
         renderAiSessionField(layout, window_height, @intFromEnum(AiField.reasoning_effort), "Effort", aiField(.reasoning_effort), false);
         renderAiSessionField(layout, window_height, @intFromEnum(AiField.stream), "Stream", aiField(.stream), false);
         renderAiSessionField(layout, window_height, @intFromEnum(AiField.agent), "Agent", aiField(.agent), false);
-        renderAiSessionField(layout, window_height, @intFromEnum(AiField.protocol), "Protocol", aiField(.protocol), false);
+        renderAiSessionField(layout, window_height, @intFromEnum(AiField.protocol), "Protocol", aiProtocolDisplay(), false);
+        renderAiSessionField(layout, window_height, @intFromEnum(AiField.max_tokens), "Max Tokens", aiField(.max_tokens), false);
         renderSessionRow(layout, window_height, AI_FIELD_COUNT, "Save & Open", "agent", g_ai_focus == AI_FIELD_COUNT);
         renderSessionRow(layout, window_height, AI_FIELD_COUNT + 1, "Save", "profile", g_ai_focus == AI_FIELD_COUNT + 1);
         renderSessionRow(layout, window_height, AI_FIELD_COUNT + 2, "Cancel", "Esc", g_ai_focus == AI_FIELD_COUNT + 2);
@@ -3297,6 +3402,7 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
     renderSessionField(layout, window_height, @intFromEnum(SshField.user), "User", sshField(.user), false);
     renderSessionField(layout, window_height, @intFromEnum(SshField.password), "Password", sshField(.password), true);
     renderSessionField(layout, window_height, @intFromEnum(SshField.port), "Port", sshField(.port), false);
+    renderSessionField(layout, window_height, @intFromEnum(SshField.proxy_jump), "Jump host", sshField(.proxy_jump), false);
     renderSessionRow(layout, window_height, SSH_FIELD_COUNT, "Save & Connect", platform_pty_command.sshLauncherDetail(), g_ssh_focus == SSH_FIELD_COUNT);
     renderSessionRow(layout, window_height, SSH_FIELD_COUNT + 1, "Save", "profile", g_ssh_focus == SSH_FIELD_COUNT + 1);
     renderSessionRow(layout, window_height, SSH_FIELD_COUNT + 2, "Cancel", "Esc", g_ssh_focus == SSH_FIELD_COUNT + 2);
@@ -3313,7 +3419,7 @@ const ThemePreset = struct {
 };
 
 const SETTINGS_THEME_PRESETS = [_]ThemePreset{
-    .{ .label = "Phantty Default", .theme = null, .detail = "Warm balanced dark" },
+    .{ .label = "WispTerm Default", .theme = null, .detail = "Warm balanced dark" },
     .{ .label = "Catppuccin Mocha", .theme = "Catppuccin Mocha", .detail = "Soft popular dark" },
     .{ .label = "TokyoNight Night", .theme = "TokyoNight Night", .detail = "Deep blue coding" },
     .{ .label = "GitHub Light", .theme = "GitHub Light Default", .detail = "Clean white" },
@@ -3322,7 +3428,7 @@ const SETTINGS_THEME_PRESETS = [_]ThemePreset{
 
 const SETTINGS_THEME_ROW = 1;
 const SETTINGS_CONTROL_ROW_START = SETTINGS_THEME_ROW + 1;
-const SETTINGS_ROW_COUNT = SETTINGS_CONTROL_ROW_START + 7;
+const SETTINGS_ROW_COUNT = SETTINGS_CONTROL_ROW_START + 8;
 
 const SettingsAction = enum {
     font_size_minus,
@@ -3333,6 +3439,7 @@ const SettingsAction = enum {
     toggle_focus_follows_mouse,
     cycle_shell,
     cycle_default_ai_profile,
+    toggle_weixin_direct,
     open_raw_config,
     close,
 };
@@ -3471,8 +3578,9 @@ fn settingsHitTest(xpos: f64, ypos: f64, window_width: f32, window_height: f32, 
         2 => .toggle_focus_follows_mouse,
         3 => .cycle_shell,
         4 => .cycle_default_ai_profile,
-        5 => .open_raw_config,
-        6 => .close,
+        5 => .toggle_weixin_direct,
+        6 => .open_raw_config,
+        7 => .close,
         else => null,
     };
 }
@@ -3504,6 +3612,7 @@ fn executeSettingsAction(action: SettingsAction) void {
                 invalidateAiDefaultName();
             }
         },
+        .toggle_weixin_direct => Config.setConfigValue(allocator, "weixin-direct-enabled", if (cfg.@"weixin-direct-enabled") "false" else "true") catch {},
         .open_raw_config => Config.openConfigInEditor(allocator),
         .close => settingsPageClose(),
     }
@@ -3526,8 +3635,9 @@ fn runSettingsFocusPrimary() void {
         SETTINGS_CONTROL_ROW_START + 2 => executeSettingsAction(.toggle_focus_follows_mouse),
         SETTINGS_CONTROL_ROW_START + 3 => executeSettingsAction(.cycle_shell),
         SETTINGS_CONTROL_ROW_START + 4 => executeSettingsAction(.cycle_default_ai_profile),
-        SETTINGS_CONTROL_ROW_START + 5 => executeSettingsAction(.open_raw_config),
-        SETTINGS_CONTROL_ROW_START + 6 => executeSettingsAction(.close),
+        SETTINGS_CONTROL_ROW_START + 5 => executeSettingsAction(.toggle_weixin_direct),
+        SETTINGS_CONTROL_ROW_START + 6 => executeSettingsAction(.open_raw_config),
+        SETTINGS_CONTROL_ROW_START + 7 => executeSettingsAction(.close),
         else => {},
     }
 }
@@ -3726,8 +3836,9 @@ pub fn renderSettingsPage(window_width: f32, window_height: f32, top_offset: f32
     else
         "Add profiles via Command Center";
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 4, "Default AI", ai_default_value, ai_default_hint, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 4);
-    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 5, "Raw config file", "open", "Advanced editor", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 5);
-    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 6, "Close settings", "Esc", "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 6);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 5, "WeChat direct", boolText(cfg.@"weixin-direct-enabled"), "Enter / Right", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 5);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 6, "Raw config file", "open", "Advanced editor", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 6);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 7, "Close settings", "Esc", "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 7);
 }
 
 // ============================================================================
@@ -4045,6 +4156,48 @@ test "macOS UI smoke: command center opens settings and settings writes config" 
     try std.testing.expect(std.mem.indexOf(u8, content, "font-size = 14") != null);
 }
 
+test "macOS UI smoke: settings toggles WeChat direct" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const config_dir = try std.fs.path.join(allocator, &.{ tmp_root, "config" });
+    defer allocator.free(config_dir);
+
+    platform_dirs.setTestConfigDirForCurrentThread(config_dir);
+    defer platform_dirs.clearTestConfigDirForCurrentThread();
+
+    try tmp.dir.makePath("config");
+    {
+        const file = try tmp.dir.createFile("config/config", .{});
+        defer file.close();
+        try file.writeAll(
+            \\weixin-direct-enabled = false
+            \\
+        );
+    }
+
+    const previous_allocator = AppWindow.g_allocator;
+    defer AppWindow.g_allocator = previous_allocator;
+    AppWindow.g_allocator = allocator;
+
+    settingsPageOpen();
+    defer settingsPageClose();
+
+    executeSettingsAction(.toggle_weixin_direct);
+
+    const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config" });
+    defer allocator.free(config_path);
+    const content = try std.fs.cwd().readFileAlloc(allocator, config_path, 1024 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "weixin-direct-enabled = true") != null);
+}
+
 test "overlays: active download toast can be clicked for interruption" {
     showTransferToast(.download, .in_progress, "file.txt - 1.5 MB/s");
     try std.testing.expect(transferToastHitTestForTest(780, 534, 800, 600));
@@ -4147,6 +4300,88 @@ test "overlays: SSH list filter backspace restores matching rows" {
     try std.testing.expectEqual(@as(usize, 1), sshVisibleProfileCount());
     try std.testing.expectEqual(@as(?usize, 0), sshVisibleProfileIndexAt(0));
     try std.testing.expectEqual(@as(usize, 2), sshListRowCount());
+}
+
+fn testEncodeProfileLine(buf: []u8, fields: []const []const u8) []const u8 {
+    const hex = "0123456789ABCDEF";
+    var len: usize = 0;
+    for (fields, 0..) |field, fi| {
+        if (fi > 0) {
+            buf[len] = '\t';
+            len += 1;
+        }
+        for (field) |ch| {
+            buf[len] = hex[ch >> 4];
+            buf[len + 1] = hex[ch & 0x0f];
+            len += 2;
+        }
+    }
+    return buf[0..len];
+}
+
+test "overlays: SSH profile line decode preserves all fields including proxy jump" {
+    var buf: [512]u8 = undefined;
+    const line = testEncodeProfileLine(&buf, &.{ "Prod", "10.0.0.9", "root", "secret", "2222", "admin@jump.test:22" });
+    const profile = decodeSshProfileLine(line) orelse return error.ExpectedProfile;
+    try std.testing.expectEqualStrings("Prod", profileField(&profile, .name));
+    try std.testing.expectEqualStrings("10.0.0.9", profileField(&profile, .ip));
+    try std.testing.expectEqualStrings("root", profileField(&profile, .user));
+    try std.testing.expectEqualStrings("secret", profileField(&profile, .password));
+    try std.testing.expectEqualStrings("2222", profileField(&profile, .port));
+    try std.testing.expectEqualStrings("admin@jump.test:22", profileField(&profile, .proxy_jump));
+}
+
+test "overlays: SSH profile line decode accepts legacy lines without a proxy jump field" {
+    // Profiles saved before ProxyJump existed have only the first five fields.
+    // They must still load, with an empty proxy jump, rather than being dropped.
+    var buf: [512]u8 = undefined;
+    const legacy = testEncodeProfileLine(&buf, &.{ "Old", "10.0.0.1", "user", "", "22" });
+    const profile = decodeSshProfileLine(legacy) orelse return error.ExpectedProfile;
+    try std.testing.expectEqualStrings("Old", profileField(&profile, .name));
+    try std.testing.expectEqualStrings("10.0.0.1", profileField(&profile, .ip));
+    try std.testing.expectEqualStrings("22", profileField(&profile, .port));
+    try std.testing.expectEqualStrings("", profileField(&profile, .proxy_jump));
+}
+
+test "overlays: SSH profile line decode rejects malformed hex" {
+    try std.testing.expect(decodeSshProfileLine("not-hex\tzz") == null);
+}
+
+test "overlays: AI profile line decode round-trips all fields including max_tokens" {
+    var buf: [1024]u8 = undefined;
+    const line = testEncodeProfileLine(&buf, &.{
+        "Claude", "https://api.anthropic.com", "sk-key", "claude-x",
+        "sys", "enabled", "high", "false", "true", "anthropic", "4096",
+    });
+    const profile = decodeAiProfileLine(line) orelse return error.ExpectedProfile;
+    try std.testing.expectEqualStrings("Claude", aiProfileField(&profile, .name));
+    try std.testing.expectEqualStrings("anthropic", aiProfileField(&profile, .protocol));
+    try std.testing.expectEqualStrings("4096", aiProfileField(&profile, .max_tokens));
+}
+
+test "overlays: AI profile line decode defaults max_tokens for legacy 10-field profiles" {
+    // Profiles written before max_tokens existed have only the first ten fields
+    // (indices 0-9). They must still load, with the new trailing field defaulted
+    // to 8192, and the existing positional fields staying aligned.
+    var buf: [1024]u8 = undefined;
+    const legacy = testEncodeProfileLine(&buf, &.{
+        "Legacy", "https://api.anthropic.com", "sk-key", "claude-x",
+        "sys", "enabled", "high", "false", "true", "anthropic",
+    });
+    const profile = decodeAiProfileLine(legacy) orelse return error.ExpectedProfile;
+    try std.testing.expectEqualStrings("Legacy", aiProfileField(&profile, .name));
+    try std.testing.expectEqualStrings("anthropic", aiProfileField(&profile, .protocol));
+    try std.testing.expectEqualStrings("8192", aiProfileField(&profile, .max_tokens));
+}
+
+test "overlays: AI profile line decode defaults max_tokens when the field is empty" {
+    var buf: [1024]u8 = undefined;
+    const line = testEncodeProfileLine(&buf, &.{
+        "Empty", "https://api.anthropic.com", "sk-key", "claude-x",
+        "sys", "enabled", "high", "false", "true", "anthropic", "",
+    });
+    const profile = decodeAiProfileLine(line) orelse return error.ExpectedProfile;
+    try std.testing.expectEqualStrings("8192", aiProfileField(&profile, .max_tokens));
 }
 
 fn showVersionToast() void {
@@ -4264,7 +4499,7 @@ pub fn renderWindowCloseConfirm(window_width: f32, window_height: f32) void {
 
     const text_x = icon_x + icon_size + 18;
     const text_right = layout.panel_x + layout.panel_w - pad;
-    renderTitlebarTextStrongLimited("Close Phantty?", text_x, title_y, fg, text_right - text_x);
+    renderTitlebarTextStrongLimited("Close WispTerm?", text_x, title_y, fg, text_right - text_x);
 
     const body_y = title_y - overlayTextHeight() - 16;
     renderTitlebarTextLimited("Running panels in this window will be terminated.", text_x, body_y, body, text_right - text_x);
@@ -4339,7 +4574,7 @@ pub fn renderCloseShortcutConfirm(window_width: f32, window_height: f32) void {
     var shortcut_buf: [64]u8 = undefined;
     const shortcut = keybind.formatActionShortcut(&AppWindow.g_keybinds, .close_panel_or_tab, &shortcut_buf) orelse "close shortcut";
     var text_buf: [128]u8 = undefined;
-    const text = std.fmt.bufPrint(&text_buf, "Press {s} again to close Phantty", .{shortcut}) catch "Press close shortcut again to close Phantty";
+    const text = std.fmt.bufPrint(&text_buf, "Press {s} again to close WispTerm", .{shortcut}) catch "Press close shortcut again to close WispTerm";
 
     const pad_h: f32 = 18;
     const pad_v: f32 = 8;

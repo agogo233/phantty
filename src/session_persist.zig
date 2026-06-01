@@ -27,6 +27,10 @@ pub const SurfaceSnap = union(enum) {
         user: []const u8,
         host: []const u8,
         port: u16 = 22,
+        // OpenSSH ProxyJump spec ([user@]host[:port], comma-separated for
+        // multi-hop). Defaulted so older session files without it still load.
+        // Not a secret, so persisting it does not violate invariant I1.
+        proxy_jump: []const u8 = "",
         // SECURITY INVARIANT (I1): NO password field. Adding one would
         // cause SSH passwords to be persisted to disk on every close.
     };
@@ -53,6 +57,11 @@ pub const TabSnap = struct {
     focused_leaf: u32 = 0,
     zoomed_leaf: ?u32 = null,
     tree: NodeSnap,
+    // When non-null this tab is an AI Chat tab: it is restored by reopening the
+    // agent history session of this id (the conversation lives in the persisted
+    // agent history store, not in this snapshot), and `tree` is an ignored
+    // placeholder. Absent in older snapshots → null → ordinary terminal tab.
+    ai_session_id: ?[]const u8 = null,
 };
 
 pub const Session = struct {
@@ -201,6 +210,44 @@ test "session_persist: round-trip simple local-shell session via JSON" {
     try std.testing.expect(sh.command == null);
 }
 
+test "session_persist: AI chat tab round-trips its ai_session_id" {
+    const allocator = std.testing.allocator;
+
+    const placeholder = NodeSnap{ .leaf = .{ .surface = .{ .local_shell = .{} } } };
+    const tabs = [_]TabSnap{.{
+        .tree = placeholder,
+        .ai_session_id = "sess-abc-123",
+    }};
+    const original: Session = .{ .active_tab = 0, .tabs = @constCast(&tabs) };
+
+    const json = try dumpSessionToString(allocator, original);
+    defer allocator.free(json);
+
+    var parsed = try loadSessionFromString(allocator, json);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.tabs.len);
+    try std.testing.expect(parsed.value.tabs[0].ai_session_id != null);
+    try std.testing.expectEqualStrings("sess-abc-123", parsed.value.tabs[0].ai_session_id.?);
+}
+
+test "session_persist: tab without ai_session_id defaults to null (back-compat)" {
+    const allocator = std.testing.allocator;
+
+    // An older snapshot has no ai_session_id field; it must parse as a terminal
+    // tab (ai_session_id == null), not error.
+    const json =
+        \\{ "version": 1, "active_tab": 0, "tabs": [
+        \\  { "focused_leaf": 0, "tree": { "leaf": { "surface": { "local_shell": {} } } } }
+        \\] }
+    ;
+    var parsed = try loadSessionFromString(allocator, json);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.tabs.len);
+    try std.testing.expect(parsed.value.tabs[0].ai_session_id == null);
+}
+
 test "session_persist: round-trip nested split with SSH leaf" {
     const allocator = std.testing.allocator;
 
@@ -253,6 +300,57 @@ test "session_persist: round-trip nested split with SSH leaf" {
     try std.testing.expectEqualStrings("/var/log", ssh.cwd.?);
     try std.testing.expectEqualStrings("work", parsed.value.tabs[0].title_override.?);
     try std.testing.expectEqual(@as(u32, 1), parsed.value.tabs[0].focused_leaf);
+}
+
+test "session_persist: SSH leaf round-trips its proxy jump host" {
+    const allocator = std.testing.allocator;
+
+    const leaf = NodeSnap{ .leaf = .{ .surface = .{ .ssh = .{
+        .user = "root",
+        .host = "internal.box",
+        .port = 22,
+        .proxy_jump = "admin@bastion.example.com:2200",
+    } } } };
+    const tabs = [_]TabSnap{.{ .focused_leaf = 0, .tree = leaf }};
+    const original: Session = .{ .active_tab = 0, .tabs = @constCast(&tabs) };
+
+    const json = try dumpSessionToString(allocator, original);
+    defer allocator.free(json);
+
+    var parsed = try loadSessionFromString(allocator, json);
+    defer parsed.deinit();
+
+    const ssh = switch (parsed.value.tabs[0].tree) {
+        .leaf => |l| switch (l.surface) {
+            .ssh => |s| s,
+            .local_shell => return error.UnexpectedShell,
+        },
+        .split => return error.UnexpectedSplit,
+    };
+    try std.testing.expectEqualStrings("admin@bastion.example.com:2200", ssh.proxy_jump);
+}
+
+test "session_persist: SSH leaf without a proxy jump field defaults to empty" {
+    const allocator = std.testing.allocator;
+
+    // Older session files predate the proxy_jump field; they must still load.
+    const json =
+        \\{ "active_tab": 0, "tabs": [ { "title_override": null, "focused_leaf": 0,
+        \\  "zoomed_leaf": null, "ai_session_id": null,
+        \\  "tree": { "leaf": { "surface": { "ssh": {
+        \\    "cwd": null, "user": "root", "host": "legacy.box", "port": 22 } } } } } ] }
+    ;
+    var parsed = try loadSessionFromString(allocator, json);
+    defer parsed.deinit();
+
+    const ssh = switch (parsed.value.tabs[0].tree) {
+        .leaf => |l| switch (l.surface) {
+            .ssh => |s| s,
+            .local_shell => return error.UnexpectedShell,
+        },
+        .split => return error.UnexpectedSplit,
+    };
+    try std.testing.expectEqualStrings("", ssh.proxy_jump);
 }
 
 test "session_persist: corrupt JSON returns error" {

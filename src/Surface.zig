@@ -1,10 +1,10 @@
-/// A terminal surface — the core unit of Phantty.
+/// A terminal surface — the core unit of WispTerm.
 /// Each Surface is a fully independent terminal session, owning a PTY,
 /// terminal state machine, selection, and OSC title state.
 ///
 /// Modeled after Ghostty's `src/Surface.zig`:
 /// - Ghostty: Surface owns terminal, PTY, IO thread, renderer thread
-/// - Phantty (Phase 1): Surface owns terminal, PTY, selection, OSC state
+/// - WispTerm (Phase 1): Surface owns terminal, PTY, selection, OSC state
 ///   (IO thread added in Phase 2, renderer stays in main.zig for now)
 ///
 /// TabState in main.zig becomes a thin wrapper: `{ surface: *Surface }`.
@@ -21,7 +21,9 @@ const remote = @import("remote_client.zig");
 const threading = @import("threading.zig");
 const agent_detector = @import("agent_detector.zig");
 const sync_output = @import("sync_output.zig");
+const notification = @import("notification.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
+const platform_process = @import("platform/process.zig");
 
 const Surface = @This();
 
@@ -58,8 +60,8 @@ const ImageOscParseState = enum {
     passthrough_osc_esc,
 };
 
-const PHANTTY_IMAGE_OSC_PREFIX = "7747;PhanttyImage=";
-const PHANTTY_IMAGE_OSC_MAX = 16 * 1024;
+const WISPTERM_IMAGE_OSC_PREFIX = "7747;WispTermImage=";
+const WISPTERM_IMAGE_OSC_MAX = 16 * 1024;
 
 /// Coarse launch environment for terminal-side integrations such as path paste.
 pub const LaunchKind = platform_pty_command.LaunchKind;
@@ -73,11 +75,17 @@ pub const SshConnection = struct {
     port_len: usize = 0,
     password_buf: [128]u8 = undefined,
     password_len: usize = 0,
+    proxy_jump_buf: [256]u8 = undefined,
+    proxy_jump_len: usize = 0,
     password_auth: bool = false,
     legacy_algorithms: bool = false,
 
     pub fn user(self: *const SshConnection) []const u8 {
         return self.user_buf[0..self.user_len];
+    }
+
+    pub fn proxyJump(self: *const SshConnection) []const u8 {
+        return self.proxy_jump_buf[0..self.proxy_jump_len];
     }
 
     pub fn host(self: *const SshConnection) []const u8 {
@@ -126,6 +134,15 @@ pub const VtHandler = struct {
     ) void {
         if (action == .bell) {
             self.surface.bell_pending.store(true, .release);
+            return;
+        }
+
+        if (action == .show_desktop_notification) {
+            notification.ingest(
+                &self.surface.notif_queue,
+                value.title,
+                value.body,
+            );
             return;
         }
 
@@ -220,6 +237,16 @@ bell_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 /// Timestamp of the last bell notification, for rate limiting (100ms like Ghostty).
 last_bell_time: i64 = 0,
 
+// ============================================================================
+// Desktop notification state (OSC 9 / OSC 777)
+// ============================================================================
+
+/// Notifications pushed by the IO reader thread, drained on the main thread.
+notif_queue: notification.Queue = .{},
+/// Last delivered notification's content hash + time, for dedup / rate limit.
+last_notif_hash: u64 = 0,
+last_notif_time: i64 = 0,
+
 /// Bell indicator opacity (0.0 = hidden, 1.0 = fully visible).
 /// Fades in when bell fires, fades out on active tab after hold period.
 bell_opacity: f32 = 0,
@@ -271,8 +298,8 @@ osc7_title: [256]u8 = undefined,
 osc7_title_len: usize = 0,
 got_osc7_this_batch: bool = false,
 
-phantty_image_osc_state: ImageOscParseState = .ground,
-phantty_image_osc_buf: std.ArrayListUnmanaged(u8) = .empty,
+wispterm_image_osc_state: ImageOscParseState = .ground,
+wispterm_image_osc_buf: std.ArrayListUnmanaged(u8) = .empty,
 
 // Raw CWD path from OSC 7 (Unix-style, e.g., "/home/user/dir")
 cwd_path: [512]u8 = undefined,
@@ -345,18 +372,16 @@ pub fn init(
     surface.terminal.modes.set(.cursor_blinking, cursor_blink);
 
     // Open PTY, then ask the PTY backend to attach the child process.
-    surface.pty = Pty.open(.{ .ws_col = cols, .ws_row = rows }) catch |err| {
-        surface.terminal.deinit(allocator);
-        return err;
-    };
+    // Cleanup on any later failure is handled exclusively by errdefer; catch
+    // blocks must NOT also deinit manually or resources get torn down twice
+    // (double ClosePseudoConsole/CloseHandle = heap corruption on Windows; see
+    // issue #65, where a missing PowerShell made command.start fail).
+    surface.pty = try Pty.open(.{ .ws_col = cols, .ws_row = rows });
     errdefer surface.pty.deinit();
 
     surface.command = .{};
-    surface.command.start(&surface.pty, shell_cmd, cwd) catch |err| {
-        surface.pty.deinit();
-        surface.terminal.deinit(allocator);
-        return err;
-    };
+    try surface.command.start(&surface.pty, shell_cmd, cwd);
+    errdefer surface.command.deinit();
 
     // Init remaining fields
     surface.allocator = allocator;
@@ -373,13 +398,18 @@ pub fn init(
     surface.exited = std.atomic.Value(bool).init(false);
     surface.resize_in_progress = std.atomic.Value(bool).init(false);
 
+    // Desktop-notification state. `allocator.create` returns undefined memory
+    // and this constructor initializes every field explicitly (struct-default
+    // values are NOT applied here), so these must be set or notif_queue's mutex
+    // is garbage — the first handleNotification()/Queue.pop() lock then aborts
+    // with os_unfair_lock corruption (SIGKILL on the first frame).
+    surface.notif_queue = .{};
+    surface.last_notif_hash = 0;
+    surface.last_notif_time = 0;
+
     // Initialize mailbox for main thread → IO writer communication
-    surface.mailbox = termio.Mailbox.init() catch |err| {
-        surface.command.deinit();
-        surface.pty.deinit();
-        surface.terminal.deinit(allocator);
-        return err;
-    };
+    surface.mailbox = try termio.Mailbox.init();
+    errdefer surface.mailbox.deinit();
     surface.io_thread_state = null;
     surface.io_writer_thread = null;
     surface.io_reader_thread = null;
@@ -405,8 +435,8 @@ pub fn init(
     surface.osc_buf_len = 0;
     surface.osc7_title_len = 0;
     surface.got_osc7_this_batch = false;
-    surface.phantty_image_osc_state = .ground;
-    surface.phantty_image_osc_buf = .empty;
+    surface.wispterm_image_osc_state = .ground;
+    surface.wispterm_image_osc_buf = .empty;
     surface.cwd_path_len = 0;
     surface.initial_cwd_path_len = 0;
     surface.agent_detection = .{};
@@ -428,47 +458,26 @@ pub fn init(
     surface.ref_count = 1;
 
     // Initialize IO writer thread state (xev loop, async handles)
-    const thread_state = allocator.create(termio.Thread) catch |err| {
-        surface.mailbox.deinit();
-        surface.command.deinit();
-        surface.pty.deinit();
-        surface.terminal.deinit(allocator);
-        return err;
-    };
-    thread_state.* = termio.Thread.init() catch |err| {
-        allocator.destroy(thread_state);
-        surface.mailbox.deinit();
-        surface.command.deinit();
-        surface.pty.deinit();
-        surface.terminal.deinit(allocator);
-        return err;
-    };
+    const thread_state = try allocator.create(termio.Thread);
+    errdefer allocator.destroy(thread_state);
+    thread_state.* = try termio.Thread.init();
+    errdefer thread_state.deinit();
     surface.io_thread_state = thread_state;
 
     // Spawn IO writer thread (xev event loop — handles resize, future messages)
     surface.io_writer_thread = std.Thread.spawn(threading.surface_thread_spawn_config, termio.Thread.threadMain, .{ thread_state, surface }) catch |err| {
         std.debug.print("Failed to spawn IO writer thread: {}\n", .{err});
-        thread_state.deinit();
-        allocator.destroy(thread_state);
-        surface.mailbox.deinit();
-        surface.command.deinit();
-        surface.pty.deinit();
-        surface.terminal.deinit(allocator);
         return err;
     };
+    errdefer {
+        // Stop the writer thread before any deeper cleanup runs.
+        if (surface.io_thread_state) |st| st.stop.notify() catch {};
+        if (surface.io_writer_thread) |t| t.join();
+    }
 
     // Spawn IO reader thread (blocking PTY output loop)
     surface.io_reader_thread = std.Thread.spawn(threading.surface_thread_spawn_config, termio.ReadThread.threadMain, .{surface}) catch |err| {
         std.debug.print("Failed to spawn IO reader thread: {}\n", .{err});
-        // Stop writer thread since we can't proceed without reader
-        thread_state.stop.notify() catch {};
-        if (surface.io_writer_thread) |t| t.join();
-        thread_state.deinit();
-        allocator.destroy(thread_state);
-        surface.mailbox.deinit();
-        surface.command.deinit();
-        surface.pty.deinit();
-        surface.terminal.deinit(allocator);
         return err;
     };
 
@@ -522,7 +531,7 @@ pub fn deinit(self: *Surface, allocator: std.mem.Allocator) void {
     self.mailbox.deinit();
 
     // 3. Now safe to tear down everything — no other thread is accessing.
-    self.phantty_image_osc_buf.deinit(allocator);
+    self.wispterm_image_osc_buf.deinit(allocator);
     self.vt_stream.deinit();
     self.command.deinit();
     self.pty.deinit();
@@ -553,6 +562,7 @@ pub fn setSshConnection(
     host: []const u8,
     port: []const u8,
     password: []const u8,
+    proxy_jump: []const u8,
     password_auth: bool,
     legacy_algorithms: bool,
 ) void {
@@ -561,10 +571,12 @@ pub fn setSshConnection(
     conn.host_len = @min(host.len, conn.host_buf.len);
     conn.port_len = @min(port.len, conn.port_buf.len);
     conn.password_len = @min(password.len, conn.password_buf.len);
+    conn.proxy_jump_len = @min(proxy_jump.len, conn.proxy_jump_buf.len);
     @memcpy(conn.user_buf[0..conn.user_len], user[0..conn.user_len]);
     @memcpy(conn.host_buf[0..conn.host_len], host[0..conn.host_len]);
     @memcpy(conn.port_buf[0..conn.port_len], port[0..conn.port_len]);
     @memcpy(conn.password_buf[0..conn.password_len], password[0..conn.password_len]);
+    @memcpy(conn.proxy_jump_buf[0..conn.proxy_jump_len], proxy_jump[0..conn.proxy_jump_len]);
     conn.password_auth = password_auth;
     conn.legacy_algorithms = legacy_algorithms;
 
@@ -696,7 +708,7 @@ pub fn getTitle(self: *const Surface) []const u8 {
         return self.osc7_title[0..self.osc7_title_len];
     if (self.window_title_len > 0)
         return self.window_title[0..self.window_title_len];
-    return "phantty";
+    return "wispterm";
 }
 
 /// Set a manual title override. Pass empty slice to clear.
@@ -746,6 +758,19 @@ pub fn getCwd(self: *const Surface) ?[]const u8 {
 pub fn getInitialCwd(self: *const Surface) ?[]const u8 {
     if (self.initial_cwd_path_len > 0)
         return self.initial_cwd_path[0..self.initial_cwd_path_len];
+    return null;
+}
+
+/// Best-effort current working directory for resolving relative paths.
+/// Tries, in order: the OSC 7-reported cwd; a live query of the shell
+/// process's cwd (POSIX proc lookup — covers zsh and other shells that don't
+/// emit OSC 7); the launch cwd. Caller owns the returned slice.
+pub fn dupeCurrentCwd(self: *const Surface, allocator: std.mem.Allocator) ?[]u8 {
+    if (self.getCwd()) |c| return allocator.dupe(u8, c) catch null;
+    if (self.command.cwdQueryId()) |pid| {
+        if (platform_process.processCwd(allocator, pid)) |live| return live;
+    }
+    if (self.getInitialCwd()) |c| return allocator.dupe(u8, c) catch null;
     return null;
 }
 
@@ -819,51 +844,51 @@ pub fn synchronizedOutputPendingLocked(self: *Surface) bool {
     };
 }
 
-/// Feed terminal output to the VT parser, translating Phantty's private OSC
+/// Feed terminal output to the VT parser, translating WispTerm's private OSC
 /// image fallback back into the Ghostty/Kitty APC protocol in stream order.
-pub fn feedVtWithPhanttyImageFallback(self: *Surface, data: []const u8) void {
+pub fn feedVtWithWispTermImageFallback(self: *Surface, data: []const u8) void {
     var passthrough_start: usize = 0;
 
     for (data, 0..) |byte, i| {
-        switch (self.phantty_image_osc_state) {
+        switch (self.wispterm_image_osc_state) {
             .ground => {
                 if (byte == 0x1b) {
                     if (i > passthrough_start) {
                         self.vt_stream.nextSlice(data[passthrough_start..i]);
                     }
-                    self.phantty_image_osc_state = .esc;
+                    self.wispterm_image_osc_state = .esc;
                     passthrough_start = i + 1;
                 }
             },
             .esc => {
                 if (byte == ']') {
-                    self.phantty_image_osc_buf.clearRetainingCapacity();
-                    self.phantty_image_osc_state = .osc_prefix;
+                    self.wispterm_image_osc_buf.clearRetainingCapacity();
+                    self.wispterm_image_osc_state = .osc_prefix;
                     passthrough_start = i + 1;
                 } else {
                     self.vt_stream.nextSlice("\x1b");
                     self.vt_stream.nextSlice(data[i .. i + 1]);
-                    self.phantty_image_osc_state = .ground;
+                    self.wispterm_image_osc_state = .ground;
                     passthrough_start = i + 1;
                 }
             },
             .osc_prefix => {
-                const matched = self.phantty_image_osc_buf.items.len;
-                if (matched < PHANTTY_IMAGE_OSC_PREFIX.len and
-                    byte == PHANTTY_IMAGE_OSC_PREFIX[matched])
+                const matched = self.wispterm_image_osc_buf.items.len;
+                if (matched < WISPTERM_IMAGE_OSC_PREFIX.len and
+                    byte == WISPTERM_IMAGE_OSC_PREFIX[matched])
                 {
-                    if (!self.appendPhanttyImageOscByte(byte)) {
-                        self.phantty_image_osc_buf.clearRetainingCapacity();
-                        self.phantty_image_osc_state = .image_overflow;
-                    } else if (self.phantty_image_osc_buf.items.len == PHANTTY_IMAGE_OSC_PREFIX.len) {
-                        self.phantty_image_osc_buf.clearRetainingCapacity();
-                        self.phantty_image_osc_state = .image_osc;
+                    if (!self.appendWispTermImageOscByte(byte)) {
+                        self.wispterm_image_osc_buf.clearRetainingCapacity();
+                        self.wispterm_image_osc_state = .image_overflow;
+                    } else if (self.wispterm_image_osc_buf.items.len == WISPTERM_IMAGE_OSC_PREFIX.len) {
+                        self.wispterm_image_osc_buf.clearRetainingCapacity();
+                        self.wispterm_image_osc_state = .image_osc;
                     }
                     passthrough_start = i + 1;
                 } else {
                     self.replayNonImageOscPrefix();
                     self.vt_stream.nextSlice(data[i .. i + 1]);
-                    self.phantty_image_osc_state = switch (byte) {
+                    self.wispterm_image_osc_state = switch (byte) {
                         0x07 => .ground,
                         0x1b => .passthrough_osc_esc,
                         else => .passthrough_osc,
@@ -873,51 +898,51 @@ pub fn feedVtWithPhanttyImageFallback(self: *Surface, data: []const u8) void {
             },
             .image_osc => switch (byte) {
                 0x07 => {
-                    self.handlePhanttyImageOsc();
-                    self.phantty_image_osc_state = .ground;
+                    self.handleWispTermImageOsc();
+                    self.wispterm_image_osc_state = .ground;
                     passthrough_start = i + 1;
                 },
                 0x1b => {
-                    self.phantty_image_osc_state = .image_osc_esc;
+                    self.wispterm_image_osc_state = .image_osc_esc;
                     passthrough_start = i + 1;
                 },
                 else => {
-                    if (!self.appendPhanttyImageOscByte(byte)) {
-                        self.phantty_image_osc_buf.clearRetainingCapacity();
-                        self.phantty_image_osc_state = .image_overflow;
+                    if (!self.appendWispTermImageOscByte(byte)) {
+                        self.wispterm_image_osc_buf.clearRetainingCapacity();
+                        self.wispterm_image_osc_state = .image_overflow;
                     }
                     passthrough_start = i + 1;
                 },
             },
             .image_osc_esc => {
                 if (byte == '\\') {
-                    self.handlePhanttyImageOsc();
-                    self.phantty_image_osc_state = .ground;
+                    self.handleWispTermImageOsc();
+                    self.wispterm_image_osc_state = .ground;
                 } else {
-                    if (!self.appendPhanttyImageOscByte(0x1b) or
-                        !self.appendPhanttyImageOscByte(byte))
+                    if (!self.appendWispTermImageOscByte(0x1b) or
+                        !self.appendWispTermImageOscByte(byte))
                     {
-                        self.phantty_image_osc_buf.clearRetainingCapacity();
-                        self.phantty_image_osc_state = .image_overflow;
+                        self.wispterm_image_osc_buf.clearRetainingCapacity();
+                        self.wispterm_image_osc_state = .image_overflow;
                     } else {
-                        self.phantty_image_osc_state = .image_osc;
+                        self.wispterm_image_osc_state = .image_osc;
                     }
                 }
                 passthrough_start = i + 1;
             },
             .image_overflow => switch (byte) {
                 0x07 => {
-                    self.phantty_image_osc_state = .ground;
+                    self.wispterm_image_osc_state = .ground;
                     passthrough_start = i + 1;
                 },
                 0x1b => {
-                    self.phantty_image_osc_state = .image_overflow_esc;
+                    self.wispterm_image_osc_state = .image_overflow_esc;
                     passthrough_start = i + 1;
                 },
                 else => passthrough_start = i + 1,
             },
             .image_overflow_esc => {
-                self.phantty_image_osc_state = if (byte == '\\') .ground else .image_overflow;
+                self.wispterm_image_osc_state = if (byte == '\\') .ground else .image_overflow;
                 passthrough_start = i + 1;
             },
             .passthrough_osc => switch (byte) {
@@ -925,10 +950,10 @@ pub fn feedVtWithPhanttyImageFallback(self: *Surface, data: []const u8) void {
                     if (i + 1 > passthrough_start) {
                         self.vt_stream.nextSlice(data[passthrough_start .. i + 1]);
                     }
-                    self.phantty_image_osc_state = .ground;
+                    self.wispterm_image_osc_state = .ground;
                     passthrough_start = i + 1;
                 },
-                0x1b => self.phantty_image_osc_state = .passthrough_osc_esc,
+                0x1b => self.wispterm_image_osc_state = .passthrough_osc_esc,
                 else => {},
             },
             .passthrough_osc_esc => {
@@ -936,16 +961,16 @@ pub fn feedVtWithPhanttyImageFallback(self: *Surface, data: []const u8) void {
                     if (i + 1 > passthrough_start) {
                         self.vt_stream.nextSlice(data[passthrough_start .. i + 1]);
                     }
-                    self.phantty_image_osc_state = .ground;
+                    self.wispterm_image_osc_state = .ground;
                     passthrough_start = i + 1;
                 } else {
-                    self.phantty_image_osc_state = .passthrough_osc;
+                    self.wispterm_image_osc_state = .passthrough_osc;
                 }
             },
         }
     }
 
-    switch (self.phantty_image_osc_state) {
+    switch (self.wispterm_image_osc_state) {
         .ground, .passthrough_osc, .passthrough_osc_esc => {
             if (data.len > passthrough_start) {
                 self.vt_stream.nextSlice(data[passthrough_start..]);
@@ -955,24 +980,24 @@ pub fn feedVtWithPhanttyImageFallback(self: *Surface, data: []const u8) void {
     }
 }
 
-fn appendPhanttyImageOscByte(self: *Surface, byte: u8) bool {
-    if (self.phantty_image_osc_buf.items.len >= PHANTTY_IMAGE_OSC_MAX) return false;
-    self.phantty_image_osc_buf.append(self.allocator, byte) catch return false;
+fn appendWispTermImageOscByte(self: *Surface, byte: u8) bool {
+    if (self.wispterm_image_osc_buf.items.len >= WISPTERM_IMAGE_OSC_MAX) return false;
+    self.wispterm_image_osc_buf.append(self.allocator, byte) catch return false;
     return true;
 }
 
 fn replayNonImageOscPrefix(self: *Surface) void {
     self.vt_stream.nextSlice("\x1b]");
-    if (self.phantty_image_osc_buf.items.len > 0) {
-        self.vt_stream.nextSlice(self.phantty_image_osc_buf.items);
-        self.phantty_image_osc_buf.clearRetainingCapacity();
+    if (self.wispterm_image_osc_buf.items.len > 0) {
+        self.vt_stream.nextSlice(self.wispterm_image_osc_buf.items);
+        self.wispterm_image_osc_buf.clearRetainingCapacity();
     }
 }
 
-fn handlePhanttyImageOsc(self: *Surface) void {
-    defer self.phantty_image_osc_buf.clearRetainingCapacity();
+fn handleWispTermImageOsc(self: *Surface) void {
+    defer self.wispterm_image_osc_buf.clearRetainingCapacity();
 
-    const kitty = self.phantty_image_osc_buf.items;
+    const kitty = self.wispterm_image_osc_buf.items;
     if (std.mem.indexOfScalar(u8, kitty, ';') == null) return;
 
     const seq = self.allocator.alloc(u8, 3 + kitty.len + 2) catch return;

@@ -16,6 +16,7 @@ pub const TOOL_CALL_REASONING_FALLBACK = "Tool call is required before answering
 pub const ApiProtocol = enum {
     chat_completions,
     responses,
+    anthropic,
 
     pub fn parse(value: []const u8) ApiProtocol {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -25,6 +26,12 @@ pub const ApiProtocol = enum {
         {
             return .responses;
         }
+        if (std.ascii.eqlIgnoreCase(trimmed, "anthropic") or
+            std.ascii.eqlIgnoreCase(trimmed, "claude") or
+            std.ascii.eqlIgnoreCase(trimmed, "messages"))
+        {
+            return .anthropic;
+        }
         return .chat_completions;
     }
 
@@ -32,9 +39,40 @@ pub const ApiProtocol = enum {
         return switch (self) {
             .chat_completions => DEFAULT_PROTOCOL,
             .responses => "responses",
+            .anthropic => "anthropic",
+        };
+    }
+
+    /// Cycle to the next/previous valid protocol (wraps). Used by the AI profile
+    /// form so the Protocol field is a toggle over valid values, not free text.
+    pub fn cycle(self: ApiProtocol, forward: bool) ApiProtocol {
+        if (forward) {
+            return switch (self) {
+                .chat_completions => .responses,
+                .responses => .anthropic,
+                .anthropic => .chat_completions,
+            };
+        }
+        return switch (self) {
+            .chat_completions => .anthropic,
+            .responses => .chat_completions,
+            .anthropic => .responses,
         };
     }
 };
+
+test "ApiProtocol.cycle toggles forward and backward through the valid set, wrapping" {
+    // forward
+    try std.testing.expectEqual(ApiProtocol.responses, ApiProtocol.chat_completions.cycle(true));
+    try std.testing.expectEqual(ApiProtocol.anthropic, ApiProtocol.responses.cycle(true));
+    try std.testing.expectEqual(ApiProtocol.chat_completions, ApiProtocol.anthropic.cycle(true));
+    // backward
+    try std.testing.expectEqual(ApiProtocol.anthropic, ApiProtocol.chat_completions.cycle(false));
+    try std.testing.expectEqual(ApiProtocol.chat_completions, ApiProtocol.responses.cycle(false));
+    try std.testing.expectEqual(ApiProtocol.responses, ApiProtocol.anthropic.cycle(false));
+    // a full forward loop returns to start
+    try std.testing.expectEqual(ApiProtocol.chat_completions, ApiProtocol.chat_completions.cycle(true).cycle(true).cycle(true));
+}
 
 pub const Role = enum {
     user,
@@ -131,12 +169,14 @@ pub const RequestParams = struct {
     thinking_enabled: bool,
     reasoning_effort: []const u8,
     stream: bool,
+    max_tokens: u32 = 8192,
 };
 
 pub fn buildRequestJson(allocator: std.mem.Allocator, params: RequestParams, messages: []const RequestMessage, include_tools: bool) ![]u8 {
     return switch (params.protocol) {
         .chat_completions => buildChatCompletionsRequestJsonForMessages(allocator, params, messages, include_tools),
         .responses => buildResponsesRequestJsonForMessages(allocator, params, messages, include_tools),
+        .anthropic => buildAnthropicRequestJsonForMessages(allocator, params, messages, include_tools),
     };
 }
 
@@ -188,10 +228,15 @@ pub fn isDeepSeekBaseUrl(base_url: []const u8) bool {
     return std.ascii.indexOfIgnoreCase(base_url, "deepseek.com") != null;
 }
 
+pub fn isAnthropicBaseUrl(base_url: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(base_url, "api.anthropic.com") != null;
+}
+
 pub fn apiEndpoint(allocator: std.mem.Allocator, base_url_raw: []const u8, protocol: ApiProtocol) ![]u8 {
     return switch (protocol) {
         .chat_completions => chatEndpoint(allocator, base_url_raw),
         .responses => responsesEndpoint(allocator, base_url_raw),
+        .anthropic => messagesEndpoint(allocator, base_url_raw),
     };
 }
 
@@ -201,6 +246,10 @@ pub fn chatEndpoint(allocator: std.mem.Allocator, base_url_raw: []const u8) ![]u
 
 pub fn responsesEndpoint(allocator: std.mem.Allocator, base_url_raw: []const u8) ![]u8 {
     return endpointWithSuffix(allocator, base_url_raw, "/responses");
+}
+
+pub fn messagesEndpoint(allocator: std.mem.Allocator, base_url_raw: []const u8) ![]u8 {
+    return endpointWithSuffix(allocator, base_url_raw, "/v1/messages");
 }
 
 pub fn endpointWithSuffix(allocator: std.mem.Allocator, base_url_raw: []const u8, suffix: []const u8) ![]u8 {
@@ -274,8 +323,11 @@ fn buildChatCompletionsRequestJsonForMessages(
     }
     try out.appendSlice(allocator, "],\"thinking\":{\"type\":");
     try appendJsonString(allocator, &out, if (params.thinking_enabled) "enabled" else "disabled");
-    try out.appendSlice(allocator, "},\"reasoning_effort\":");
-    try appendJsonString(allocator, &out, if (params.reasoning_effort.len > 0) params.reasoning_effort else "high");
+    try out.append(allocator, '}');
+    if (params.thinking_enabled) {
+        try out.appendSlice(allocator, ",\"reasoning_effort\":");
+        try appendJsonString(allocator, &out, if (params.reasoning_effort.len > 0) params.reasoning_effort else "high");
+    }
     try out.appendSlice(allocator, ",\"stream\":");
     try out.appendSlice(allocator, if (params.stream) "true" else "false");
     if (params.stream) {
@@ -348,6 +400,102 @@ fn buildResponsesRequestJsonForMessages(
     return out.toOwnedSlice(allocator);
 }
 
+fn buildAnthropicRequestJsonForMessages(
+    allocator: std.mem.Allocator,
+    params: RequestParams,
+    messages: []const RequestMessage,
+    include_tools: bool,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "{\"model\":");
+    try appendJsonString(allocator, &out, params.model);
+    try out.print(allocator, ",\"max_tokens\":{d}", .{params.max_tokens});
+    if (params.system_prompt.len > 0) {
+        try out.appendSlice(allocator, ",\"system\":");
+        try appendJsonString(allocator, &out, params.system_prompt);
+    }
+    try out.appendSlice(allocator, ",\"messages\":[");
+    try appendAnthropicMessages(allocator, &out, messages);
+    try out.append(allocator, ']');
+    if (include_tools) try appendAnthropicTools(allocator, &out);
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendAnthropicMessages(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), messages: []const RequestMessage) !void {
+    var first = true;
+    var i: usize = 0;
+    while (i < messages.len) {
+        const msg = messages[i];
+        if (msg.role == .tool) {
+            // Anthropic requires tool results grouped into one user turn: collapse
+            // consecutive .tool messages into a single user message of tool_result blocks.
+            if (!first) try out.append(allocator, ',');
+            first = false;
+            try out.appendSlice(allocator, "{\"role\":\"user\",\"content\":[");
+            var jt: usize = i;
+            var block_first = true;
+            while (jt < messages.len and messages[jt].role == .tool) : (jt += 1) {
+                if (!block_first) try out.append(allocator, ',');
+                block_first = false;
+                try out.appendSlice(allocator, "{\"type\":\"tool_result\",\"tool_use_id\":");
+                try appendJsonString(allocator, out, messages[jt].tool_call_id orelse "");
+                try out.appendSlice(allocator, ",\"content\":");
+                try appendJsonString(allocator, out, messages[jt].content);
+                try out.append(allocator, '}');
+            }
+            try out.appendSlice(allocator, "]}");
+            i = jt;
+            continue;
+        }
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try out.appendSlice(allocator, "{\"role\":");
+        try appendJsonString(allocator, out, msg.role.apiName());
+        if (msg.role == .assistant and msg.tool_calls != null and msg.tool_calls.?.len > 0) {
+            try out.appendSlice(allocator, ",\"content\":[");
+            var wrote = false;
+            if (msg.content.len > 0) {
+                try out.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
+                try appendJsonString(allocator, out, msg.content);
+                try out.append(allocator, '}');
+                wrote = true;
+            }
+            for (msg.tool_calls.?) |call| {
+                if (wrote) try out.append(allocator, ',');
+                wrote = true;
+                try out.appendSlice(allocator, "{\"type\":\"tool_use\",\"id\":");
+                try appendJsonString(allocator, out, call.id);
+                try out.appendSlice(allocator, ",\"name\":");
+                try appendJsonString(allocator, out, call.name);
+                try out.appendSlice(allocator, ",\"input\":");
+                // arguments is already a JSON object string; embed verbatim.
+                if (call.arguments.len > 0) {
+                    try out.appendSlice(allocator, call.arguments);
+                } else {
+                    try out.appendSlice(allocator, "{}");
+                }
+                try out.append(allocator, '}');
+            }
+            try out.appendSlice(allocator, "]}");
+        } else {
+            try out.appendSlice(allocator, ",\"content\":");
+            try appendJsonString(allocator, out, msg.content);
+            try out.append(allocator, '}');
+        }
+        i += 1;
+    }
+}
+
+fn appendAnthropicTools(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    try out.appendSlice(allocator, ",\"tools\":[");
+    var ctx = AnthropicToolEmitter{ .allocator = allocator, .out = out };
+    try forEachToolSpec(*AnthropicToolEmitter, &ctx, AnthropicToolEmitter.emit);
+    try out.append(allocator, ']');
+}
+
 fn appendResponseMessage(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), role: Role, content: []const u8) !void {
     try out.appendSlice(allocator, "{\"role\":");
     try appendJsonString(allocator, out, role.apiName());
@@ -379,153 +527,112 @@ fn appendResponseFunctionCallOutput(
     try out.append(allocator, '}');
 }
 
+// Single source of truth for the agent tool set. Each tool's name, description,
+// and JSON Schema `properties` object is defined exactly once here and yielded to
+// a per-format emitter (OpenAI chat-completions, OpenAI responses, Anthropic), so
+// the schema text is never duplicated across protocols.
+//
+// `Ctx` is the emitter's context type; `emit` receives `(ctx, name, description,
+// properties)` for every active tool, in order.
+fn forEachToolSpec(
+    comptime Ctx: type,
+    ctx: Ctx,
+    comptime emit: fn (Ctx, []const u8, []const u8, []const u8) anyerror!void,
+) !void {
+    try emit(ctx, "terminal_list", "List WispTerm terminal surfaces visible to the agent, including the current agent-selected write context. Before any terminal write, use terminal_select to choose the intended surface_id; use focused=true only as a default hint.", "{}");
+    try emit(ctx, "terminal_snapshot", "Read a bounded text snapshot from one terminal surface or all surfaces.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Optional surface id from terminal_list.\"}}");
+    try emit(ctx, "terminal_select", platform_pty_command.terminalSelectToolDescription(), "{\"surface_id\":{\"type\":\"string\",\"description\":\"Surface id from terminal_list to make the current agent write context.\"}}");
+    try emit(ctx, platform_process.localCommandToolName(), platform_process.localCommandToolDescription(), "{\"command\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}");
+    try emit(ctx, "ssh_session_exec", "Run a POSIX shell command in the selected already-open SSH terminal surface. The surface_id must match the current terminal_select context. Use only when the surface is at a shell prompt; for R, Python, Codex, Claude Code, or other REPLs use terminal_repl_exec.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Selected surface id from terminal_select.\"},\"command\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}");
+    if (platform_pty_command.wslSessionToolsEnabled()) {
+        try emit(ctx, platform_pty_command.wslSessionToolName(), platform_pty_command.wslSessionToolDescription(), platform_pty_command.wslSessionToolPropertiesJson());
+    }
+    try emit(ctx, "terminal_repl_exec", "Send code or text to the selected already-open interactive REPL/app terminal without shell syntax. The surface_id must match the current terminal_select context. Use repl=r for R, repl=python for Python, repl=codex for Codex, repl=claude_code for Claude Code, or repl=plain for raw text input.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Selected surface id from terminal_select.\"},\"repl\":{\"type\":\"string\",\"description\":\"r, python, codex, claude_code, or plain\"},\"code\":{\"type\":\"string\",\"description\":\"Code or plain text to submit.\"},\"timeout_ms\":{\"type\":\"integer\"}}");
+    try emit(ctx, "ssh_profile_save", "Create or update a saved WispTerm SSH server profile. Use before ssh_profile_connect when the user provides SSH host, user, port, or password details.", "{\"name\":{\"type\":\"string\",\"description\":\"Optional profile name; defaults to host for new profiles.\"},\"host\":{\"type\":\"string\",\"description\":\"SSH host name or IP address.\"},\"user\":{\"type\":\"string\",\"description\":\"SSH username.\"},\"password\":{\"type\":\"string\",\"description\":\"Optional SSH password; omit when using keys.\"},\"port\":{\"type\":\"string\",\"description\":\"Optional SSH port; defaults to 22 for new profiles.\"},\"proxy_jump\":{\"type\":\"string\",\"description\":\"Optional OpenSSH ProxyJump/jump host: [user@]host[:port], comma-separated for multi-hop. Omit for a direct connection.\"}}");
+    try emit(ctx, "ssh_profile_connect", "Create a new tab connected to a saved WispTerm SSH server profile by its profile name or host.", "{\"profile_name\":{\"type\":\"string\",\"description\":\"Saved SSH profile name or host to open in a new tab.\"}}");
+    try emit(ctx, "tab_new", platform_pty_command.tabNewToolDescription(), platform_pty_command.tabNewToolPropertiesJson());
+    try emit(ctx, "tab_close", "Close a terminal tab by tab_number (the one-based `tab` shown by terminal_list, matching the tab number the user sees), surface_id, title, or the active terminal tab when no selector is provided. Cannot close the AI chat tab running the agent.", "{\"tab_number\":{\"type\":\"integer\",\"description\":\"One-based UI tab number — the `tab` value shown by terminal_list and what the user sees.\"},\"tab_index\":{\"type\":\"integer\",\"description\":\"Zero-based tab index (tab_number minus one). Prefer tab_number.\"},\"surface_id\":{\"type\":\"string\",\"description\":\"Surface id from terminal_list.\"},\"title\":{\"type\":\"string\",\"description\":\"Terminal tab title to close, such as CPU2.\"}}");
+    try emit(ctx, "skill_info", "Load a WispTerm skill by stable name. Use when the user explicitly names a skill or asks for specialized skill instructions.", "{\"skill_name\":{\"type\":\"string\",\"description\":\"Skill name or skill directory name.\"}}");
+    try emit(ctx, "wispterm_docs", "Read WispTerm's own documentation (features, configuration, shortcuts, AI agent, file explorer, media). Call with no topic to list available topics, then call again with a topic to read its full text.", "{\"topic\":{\"type\":\"string\",\"description\":\"Topic name from the list. Omit to list available topics.\"}}");
+    try emit(ctx, "weixin_send_attachment", "Send a local file back to the active Weixin conversation that triggered this agent request. Use only when the current request came from Weixin; normal local chat requests have no Weixin reply context. Audio and voice files are sent as ordinary file attachments.", "{\"kind\":{\"type\":\"string\",\"description\":\"Attachment kind: file, image, or voice. Voice is accepted as an alias for file.\"},\"path\":{\"type\":\"string\",\"description\":\"Readable local file path to send.\"},\"display_name\":{\"type\":\"string\",\"description\":\"Optional filename shown in Weixin for file attachments; defaults to the path basename.\"}}");
+}
+
+const ToolSchemaEmitter = struct {
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: bool = true,
+
+    fn emit(self: *ToolSchemaEmitter, name: []const u8, description: []const u8, properties: []const u8) !void {
+        if (!self.first) try self.out.append(self.allocator, ',');
+        self.first = false;
+        try self.out.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":");
+        try appendJsonString(self.allocator, self.out, name);
+        try self.out.appendSlice(self.allocator, ",\"description\":");
+        try appendJsonString(self.allocator, self.out, description);
+        try self.out.appendSlice(self.allocator, ",\"parameters\":{\"type\":\"object\",\"properties\":");
+        try self.out.appendSlice(self.allocator, properties);
+        try self.out.appendSlice(self.allocator, ",\"additionalProperties\":false}}}");
+    }
+};
+
+const ResponseToolSchemaEmitter = struct {
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: bool = true,
+
+    fn emit(self: *ResponseToolSchemaEmitter, name: []const u8, description: []const u8, properties: []const u8) !void {
+        if (!self.first) try self.out.append(self.allocator, ',');
+        self.first = false;
+        try self.out.appendSlice(self.allocator, "{\"type\":\"function\",\"name\":");
+        try appendJsonString(self.allocator, self.out, name);
+        try self.out.appendSlice(self.allocator, ",\"description\":");
+        try appendJsonString(self.allocator, self.out, description);
+        try self.out.appendSlice(self.allocator, ",\"parameters\":{\"type\":\"object\",\"properties\":");
+        try self.out.appendSlice(self.allocator, properties);
+        try self.out.appendSlice(self.allocator, ",\"additionalProperties\":false}}");
+    }
+};
+
+const AnthropicToolEmitter = struct {
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: bool = true,
+
+    fn emit(self: *AnthropicToolEmitter, name: []const u8, description: []const u8, properties: []const u8) !void {
+        if (!self.first) try self.out.append(self.allocator, ',');
+        self.first = false;
+        try self.out.appendSlice(self.allocator, "{\"name\":");
+        try appendJsonString(self.allocator, self.out, name);
+        try self.out.appendSlice(self.allocator, ",\"description\":");
+        try appendJsonString(self.allocator, self.out, description);
+        // input_schema reuses the SAME JSON Schema object the OpenAI `parameters` uses.
+        try self.out.appendSlice(self.allocator, ",\"input_schema\":{\"type\":\"object\",\"properties\":");
+        try self.out.appendSlice(self.allocator, properties);
+        try self.out.appendSlice(self.allocator, ",\"additionalProperties\":false}}");
+    }
+};
+
 fn appendToolSchemas(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
     try out.appendSlice(allocator, ",\"tools\":[");
-    try out.appendSlice(allocator, toolSchema("terminal_list", "List Phantty terminal surfaces visible to the agent, including the current agent-selected write context. Before any terminal write, use terminal_select to choose the intended surface_id; use focused=true only as a default hint.", "{}"));
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, toolSchema("terminal_snapshot", "Read a bounded text snapshot from one terminal surface or all surfaces.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Optional surface id from terminal_list.\"}}"));
-    try out.append(allocator, ',');
-    try appendToolSchema(
-        allocator,
-        out,
-        "terminal_select",
-        platform_pty_command.terminalSelectToolDescription(),
-        "{\"surface_id\":{\"type\":\"string\",\"description\":\"Surface id from terminal_list to make the current agent write context.\"}}",
-    );
-    try out.append(allocator, ',');
-    try appendToolSchema(
-        allocator,
-        out,
-        platform_process.localCommandToolName(),
-        platform_process.localCommandToolDescription(),
-        "{\"command\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}",
-    );
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, toolSchema("ssh_session_exec", "Run a POSIX shell command in the selected already-open SSH terminal surface. The surface_id must match the current terminal_select context. Use only when the surface is at a shell prompt; for R, Python, Codex, Claude Code, or other REPLs use terminal_repl_exec.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Selected surface id from terminal_select.\"},\"command\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}"));
-    if (platform_pty_command.wslSessionToolsEnabled()) {
-        try out.append(allocator, ',');
-        try appendToolSchema(
-            allocator,
-            out,
-            platform_pty_command.wslSessionToolName(),
-            platform_pty_command.wslSessionToolDescription(),
-            platform_pty_command.wslSessionToolPropertiesJson(),
-        );
-    }
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, toolSchema("terminal_repl_exec", "Send code or text to the selected already-open interactive REPL/app terminal without shell syntax. The surface_id must match the current terminal_select context. Use repl=r for R, repl=python for Python, repl=codex for Codex, repl=claude_code for Claude Code, or repl=plain for raw text input.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Selected surface id from terminal_select.\"},\"repl\":{\"type\":\"string\",\"description\":\"r, python, codex, claude_code, or plain\"},\"code\":{\"type\":\"string\",\"description\":\"Code or plain text to submit.\"},\"timeout_ms\":{\"type\":\"integer\"}}"));
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, toolSchema("ssh_profile_save", "Create or update a saved Phantty SSH server profile. Use before ssh_profile_connect when the user provides SSH host, user, port, or password details.", "{\"name\":{\"type\":\"string\",\"description\":\"Optional profile name; defaults to host for new profiles.\"},\"host\":{\"type\":\"string\",\"description\":\"SSH host name or IP address.\"},\"user\":{\"type\":\"string\",\"description\":\"SSH username.\"},\"password\":{\"type\":\"string\",\"description\":\"Optional SSH password; omit when using keys.\"},\"port\":{\"type\":\"string\",\"description\":\"Optional SSH port; defaults to 22 for new profiles.\"}}"));
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, toolSchema("ssh_profile_connect", "Create a new tab connected to a saved Phantty SSH server profile by its profile name or host.", "{\"profile_name\":{\"type\":\"string\",\"description\":\"Saved SSH profile name or host to open in a new tab.\"}}"));
-    try out.append(allocator, ',');
-    try appendToolSchema(
-        allocator,
-        out,
-        "tab_new",
-        platform_pty_command.tabNewToolDescription(),
-        platform_pty_command.tabNewToolPropertiesJson(),
-    );
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, toolSchema("tab_close", "Close a terminal tab by zero-based tab_index, surface_id, title, or the active terminal tab when no selector is provided. Cannot close the AI chat tab running the agent.", "{\"tab_index\":{\"type\":\"integer\",\"description\":\"Zero-based tab index from terminal_list.\"},\"tab_number\":{\"type\":\"integer\",\"description\":\"One-based UI tab number, accepted as a convenience.\"},\"surface_id\":{\"type\":\"string\",\"description\":\"Surface id from terminal_list.\"},\"title\":{\"type\":\"string\",\"description\":\"Terminal tab title to close, such as CPU2.\"}}"));
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, toolSchema("skill_info", "Load a Phantty skill by stable name. Use when the user explicitly names a skill or asks for specialized skill instructions.", "{\"skill_name\":{\"type\":\"string\",\"description\":\"Skill name or skill directory name.\"}}"));
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, toolSchema("phantty_docs", "Read Phantty's own documentation (features, configuration, shortcuts, AI agent, file explorer, media). Call with no topic to list available topics, then call again with a topic to read its full text.", "{\"topic\":{\"type\":\"string\",\"description\":\"Topic name from the list. Omit to list available topics.\"}}"));
+    var ctx = ToolSchemaEmitter{ .allocator = allocator, .out = out };
+    try forEachToolSpec(*ToolSchemaEmitter, &ctx, ToolSchemaEmitter.emit);
     try out.append(allocator, ']');
     try out.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
 }
 
 fn appendResponseToolSchemas(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
     try out.appendSlice(allocator, ",\"tools\":[");
-    try out.appendSlice(allocator, responseToolSchema("terminal_list", "List Phantty terminal surfaces visible to the agent, including the current agent-selected write context. Before any terminal write, use terminal_select to choose the intended surface_id; use focused=true only as a default hint.", "{}"));
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, responseToolSchema("terminal_snapshot", "Read a bounded text snapshot from one terminal surface or all surfaces.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Optional surface id from terminal_list.\"}}"));
-    try out.append(allocator, ',');
-    try appendResponseToolSchema(
-        allocator,
-        out,
-        "terminal_select",
-        platform_pty_command.terminalSelectToolDescription(),
-        "{\"surface_id\":{\"type\":\"string\",\"description\":\"Surface id from terminal_list to make the current agent write context.\"}}",
-    );
-    try out.append(allocator, ',');
-    try appendResponseToolSchema(
-        allocator,
-        out,
-        platform_process.localCommandToolName(),
-        platform_process.localCommandToolDescription(),
-        "{\"command\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}",
-    );
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, responseToolSchema("ssh_session_exec", "Run a POSIX shell command in the selected already-open SSH terminal surface. The surface_id must match the current terminal_select context. Use only when the surface is at a shell prompt; for R, Python, Codex, Claude Code, or other REPLs use terminal_repl_exec.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Selected surface id from terminal_select.\"},\"command\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}"));
-    if (platform_pty_command.wslSessionToolsEnabled()) {
-        try out.append(allocator, ',');
-        try appendResponseToolSchema(
-            allocator,
-            out,
-            platform_pty_command.wslSessionToolName(),
-            platform_pty_command.wslSessionToolDescription(),
-            platform_pty_command.wslSessionToolPropertiesJson(),
-        );
-    }
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, responseToolSchema("terminal_repl_exec", "Send code or text to the selected already-open interactive REPL/app terminal without shell syntax. The surface_id must match the current terminal_select context. Use repl=r for R, repl=python for Python, repl=codex for Codex, repl=claude_code for Claude Code, or repl=plain for raw text input.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Selected surface id from terminal_select.\"},\"repl\":{\"type\":\"string\",\"description\":\"r, python, codex, claude_code, or plain\"},\"code\":{\"type\":\"string\",\"description\":\"Code or plain text to submit.\"},\"timeout_ms\":{\"type\":\"integer\"}}"));
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, responseToolSchema("ssh_profile_save", "Create or update a saved Phantty SSH server profile. Use before ssh_profile_connect when the user provides SSH host, user, port, or password details.", "{\"name\":{\"type\":\"string\",\"description\":\"Optional profile name; defaults to host for new profiles.\"},\"host\":{\"type\":\"string\",\"description\":\"SSH host name or IP address.\"},\"user\":{\"type\":\"string\",\"description\":\"SSH username.\"},\"password\":{\"type\":\"string\",\"description\":\"Optional SSH password; omit when using keys.\"},\"port\":{\"type\":\"string\",\"description\":\"Optional SSH port; defaults to 22 for new profiles.\"}}"));
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, responseToolSchema("ssh_profile_connect", "Create a new tab connected to a saved Phantty SSH server profile by its profile name or host.", "{\"profile_name\":{\"type\":\"string\",\"description\":\"Saved SSH profile name or host to open in a new tab.\"}}"));
-    try out.append(allocator, ',');
-    try appendResponseToolSchema(
-        allocator,
-        out,
-        "tab_new",
-        platform_pty_command.tabNewToolDescription(),
-        platform_pty_command.tabNewToolPropertiesJson(),
-    );
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, responseToolSchema("tab_close", "Close a terminal tab by zero-based tab_index, surface_id, title, or the active terminal tab when no selector is provided. Cannot close the AI chat tab running the agent.", "{\"tab_index\":{\"type\":\"integer\",\"description\":\"Zero-based tab index from terminal_list.\"},\"tab_number\":{\"type\":\"integer\",\"description\":\"One-based UI tab number, accepted as a convenience.\"},\"surface_id\":{\"type\":\"string\",\"description\":\"Surface id from terminal_list.\"},\"title\":{\"type\":\"string\",\"description\":\"Terminal tab title to close, such as CPU2.\"}}"));
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, responseToolSchema("skill_info", "Load a Phantty skill by stable name. Use when the user explicitly names a skill or asks for specialized skill instructions.", "{\"skill_name\":{\"type\":\"string\",\"description\":\"Skill name or skill directory name.\"}}"));
-    try out.append(allocator, ',');
-    try out.appendSlice(allocator, responseToolSchema("phantty_docs", "Read Phantty's own documentation (features, configuration, shortcuts, AI agent, file explorer, media). Call with no topic to list available topics, then call again with a topic to read its full text.", "{\"topic\":{\"type\":\"string\",\"description\":\"Topic name from the list. Omit to list available topics.\"}}"));
+    var ctx = ResponseToolSchemaEmitter{ .allocator = allocator, .out = out };
+    try forEachToolSpec(*ResponseToolSchemaEmitter, &ctx, ResponseToolSchemaEmitter.emit);
     try out.append(allocator, ']');
     try out.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
-}
-
-fn toolSchema(comptime name: []const u8, comptime description: []const u8, comptime properties: []const u8) []const u8 {
-    return "{\"type\":\"function\",\"function\":{\"name\":\"" ++ name ++ "\",\"description\":\"" ++ description ++ "\",\"parameters\":{\"type\":\"object\",\"properties\":" ++ properties ++ ",\"additionalProperties\":false}}}";
-}
-
-fn responseToolSchema(comptime name: []const u8, comptime description: []const u8, comptime properties: []const u8) []const u8 {
-    return "{\"type\":\"function\",\"name\":\"" ++ name ++ "\",\"description\":\"" ++ description ++ "\",\"parameters\":{\"type\":\"object\",\"properties\":" ++ properties ++ ",\"additionalProperties\":false}}";
-}
-
-fn appendToolSchema(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, description: []const u8, properties: []const u8) !void {
-    try out.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
-    try appendJsonString(allocator, out, name);
-    try out.appendSlice(allocator, ",\"description\":");
-    try appendJsonString(allocator, out, description);
-    try out.appendSlice(allocator, ",\"parameters\":{\"type\":\"object\",\"properties\":");
-    try out.appendSlice(allocator, properties);
-    try out.appendSlice(allocator, ",\"additionalProperties\":false}}}");
-}
-
-fn appendResponseToolSchema(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, description: []const u8, properties: []const u8) !void {
-    try out.appendSlice(allocator, "{\"type\":\"function\",\"name\":");
-    try appendJsonString(allocator, out, name);
-    try out.appendSlice(allocator, ",\"description\":");
-    try appendJsonString(allocator, out, description);
-    try out.appendSlice(allocator, ",\"parameters\":{\"type\":\"object\",\"properties\":");
-    try out.appendSlice(allocator, properties);
-    try out.appendSlice(allocator, ",\"additionalProperties\":false}}");
 }
 
 // ---------------------------------------------------------------------------
 // Response parsing
 // ---------------------------------------------------------------------------
 
-pub fn parseApiResponse(allocator: std.mem.Allocator, body: []const u8) !ApiResult {
+pub fn parseApiResponse(allocator: std.mem.Allocator, body: []const u8, protocol: ApiProtocol) !ApiResult {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         const trimmed = std.mem.trim(u8, body, " \t\r\n");
         if (trimmed.len == 0) return error.EmptyResponse;
@@ -538,6 +645,7 @@ pub fn parseApiResponse(allocator: std.mem.Allocator, body: []const u8) !ApiResu
     const obj = root.object;
 
     if (try parseApiErrorResult(allocator, root)) |result| return result;
+    if (protocol == .anthropic) return parseAnthropicResponse(allocator, root);
     if (obj.get("choices") != null) return parseChatCompletionsResponse(allocator, root);
     if (obj.get("output") != null or obj.get("output_text") != null) return parseResponsesResponse(allocator, root);
     return error.MissingChoices;
@@ -625,6 +733,77 @@ fn parseResponsesResponse(allocator: std.mem.Allocator, root: std.json.Value) !A
         .tool_calls = tool_calls,
         .usage = parseApiUsage(root),
     };
+}
+
+fn parseAnthropicResponse(allocator: std.mem.Allocator, root: std.json.Value) !ApiResult {
+    if (root != .object) return error.InvalidResponse;
+
+    var content: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer content.deinit(allocator);
+
+    const tool_calls = try parseAnthropicToolCalls(allocator, root);
+    errdefer if (tool_calls) |calls| {
+        for (calls) |call| call.deinit(allocator);
+        allocator.free(calls);
+    };
+
+    if (root.object.get("content")) |content_value| {
+        if (content_value == .array) {
+            for (content_value.array.items) |item| {
+                if (item != .object) continue;
+                const typ = jsonStringValue(item.object.get("type")) orelse "";
+                if (!std.mem.eql(u8, typ, "text")) continue;
+                if (jsonStringValue(item.object.get("text"))) |text| {
+                    if (text.len > 0) try content.appendSlice(allocator, text);
+                }
+            }
+        }
+    }
+
+    return .{
+        .content = try content.toOwnedSlice(allocator),
+        .reasoning = null,
+        .tool_calls = tool_calls,
+        .usage = parseApiUsage(root),
+    };
+}
+
+fn parseAnthropicToolCalls(allocator: std.mem.Allocator, root: std.json.Value) !?[]ToolCall {
+    if (root != .object) return null;
+    const content_value = root.object.get("content") orelse return null;
+    if (content_value != .array or content_value.array.items.len == 0) return null;
+
+    const calls = try allocator.alloc(ToolCall, content_value.array.items.len);
+    errdefer allocator.free(calls);
+    var written: usize = 0;
+    errdefer {
+        for (calls[0..written]) |call| call.deinit(allocator);
+    }
+
+    for (content_value.array.items) |item| {
+        if (item != .object) continue;
+        const typ = jsonStringValue(item.object.get("type")) orelse continue;
+        if (!std.mem.eql(u8, typ, "tool_use")) continue;
+        const id = jsonStringValue(item.object.get("id")) orelse continue;
+        const name = jsonStringValue(item.object.get("name")) orelse continue;
+        const arguments = if (item.object.get("input")) |input_value|
+            try std.json.Stringify.valueAlloc(allocator, input_value, .{})
+        else
+            try allocator.dupe(u8, "{}");
+        errdefer allocator.free(arguments);
+        calls[written] = .{
+            .id = try allocator.dupe(u8, id),
+            .name = try allocator.dupe(u8, name),
+            .arguments = arguments,
+        };
+        written += 1;
+    }
+
+    if (written == 0) {
+        allocator.free(calls);
+        return null;
+    }
+    return try allocator.realloc(calls, written);
 }
 
 pub fn appendResponsesOutputText(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), root: std.json.Value) !void {
@@ -832,6 +1011,20 @@ test "ApiProtocol.parse and Role.apiName" {
     try std.testing.expectEqualStrings("assistant", Role.assistant.apiName());
 }
 
+test "ApiProtocol parses and names anthropic + aliases" {
+    try std.testing.expectEqual(ApiProtocol.anthropic, ApiProtocol.parse("anthropic"));
+    try std.testing.expectEqual(ApiProtocol.anthropic, ApiProtocol.parse("claude"));
+    try std.testing.expectEqual(ApiProtocol.anthropic, ApiProtocol.parse("messages"));
+    try std.testing.expectEqualStrings("anthropic", ApiProtocol.anthropic.name());
+}
+
+test "apiEndpoint builds the anthropic messages endpoint" {
+    const a = std.testing.allocator;
+    const ep = try apiEndpoint(a, "https://api.anthropic.com", .anthropic);
+    defer a.free(ep);
+    try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", ep);
+}
+
 test "buildRequestJson chat_completions emits model, roles, flags" {
     const a = std.testing.allocator;
     var msgs = [_]RequestMessage{.{ .role = .user, .content = @constCast("hi") }};
@@ -842,6 +1035,16 @@ test "buildRequestJson chat_completions emits model, roles, flags" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"role\":\"user\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stream\":false") != null);
+}
+
+test "buildRequestJson chat_completions omits reasoning_effort when thinking disabled" {
+    const a = std.testing.allocator;
+    var msgs = [_]RequestMessage{.{ .role = .user, .content = @constCast("hi") }};
+    const params = RequestParams{ .model = "m1", .system_prompt = "", .protocol = .chat_completions, .thinking_enabled = false, .reasoning_effort = "low", .stream = false };
+    const json = try buildRequestJson(a, params, &msgs, false);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"thinking\":{\"type\":\"disabled\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"reasoning_effort\"") == null);
 }
 
 test "buildRequestJson responses uses input + instructions" {
@@ -859,7 +1062,7 @@ test "parseApiResponse reads chat_completions content + usage" {
     const body =
         \\{"choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}
     ;
-    var result = try parseApiResponse(a, body);
+    var result = try parseApiResponse(a, body, .chat_completions);
     defer result.deinit(a);
     try std.testing.expectEqualStrings("hello", result.content);
     try std.testing.expectEqual(@as(u64, 8), result.usage.?.total_tokens);
@@ -870,7 +1073,7 @@ test "parseApiResponse surfaces an error object as content" {
     const body =
         \\{"error":{"message":"boom"}}
     ;
-    var result = try parseApiResponse(a, body);
+    var result = try parseApiResponse(a, body, .chat_completions);
     defer result.deinit(a);
     try std.testing.expectEqualStrings("boom", result.content);
 }
@@ -878,6 +1081,11 @@ test "parseApiResponse surfaces an error object as content" {
 test "isDeepSeekBaseUrl" {
     try std.testing.expect(isDeepSeekBaseUrl("https://api.deepseek.com/v1"));
     try std.testing.expect(!isDeepSeekBaseUrl("https://api.openai.com/v1"));
+}
+
+test "isAnthropicBaseUrl detects the anthropic api host" {
+    try std.testing.expect(isAnthropicBaseUrl("https://api.anthropic.com"));
+    try std.testing.expect(!isAnthropicBaseUrl("https://api.openai.com"));
 }
 
 test "buildRequestJson chat_completions emits tool_calls when present" {
@@ -891,19 +1099,37 @@ test "buildRequestJson chat_completions emits tool_calls when present" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"terminal_list\"") != null);
 }
 
-test "buildRequestJson includes phantty_docs tool for both protocols" {
+test "buildRequestJson includes wispterm_docs tool for both protocols" {
     const a = std.testing.allocator;
     var msgs = [_]RequestMessage{.{ .role = .user, .content = @constCast("hi") }};
 
     const chat = RequestParams{ .model = "m", .system_prompt = "", .protocol = .chat_completions, .thinking_enabled = false, .reasoning_effort = "", .stream = false };
     const chat_json = try buildRequestJson(a, chat, &msgs, true);
     defer a.free(chat_json);
-    try std.testing.expect(std.mem.indexOf(u8, chat_json, "\"phantty_docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chat_json, "\"wispterm_docs\"") != null);
 
     const resp = RequestParams{ .model = "m", .system_prompt = "", .protocol = .responses, .thinking_enabled = false, .reasoning_effort = "", .stream = false };
     const resp_json = try buildRequestJson(a, resp, &msgs, true);
     defer a.free(resp_json);
-    try std.testing.expect(std.mem.indexOf(u8, resp_json, "\"phantty_docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp_json, "\"wispterm_docs\"") != null);
+}
+
+test "tool schemas include weixin_send_attachment" {
+    var msgs = [_]RequestMessage{.{ .role = .user, .content = @constCast("send the report") }};
+    const params = RequestParams{
+        .model = "m",
+        .system_prompt = "",
+        .protocol = .chat_completions,
+        .thinking_enabled = false,
+        .reasoning_effort = "",
+        .stream = false,
+    };
+    const json = try buildRequestJson(std.testing.allocator, params, &msgs, true);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"weixin_send_attachment\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"path\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"display_name\"") != null);
 }
 
 test "parseApiResponse reads responses-protocol output text" {
@@ -911,7 +1137,55 @@ test "parseApiResponse reads responses-protocol output text" {
     const body =
         \\{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi there"}]}]}
     ;
-    var result = try parseApiResponse(a, body);
+    var result = try parseApiResponse(a, body, .responses);
     defer result.deinit(a);
     try std.testing.expectEqualStrings("hi there", result.content);
+}
+
+test "parseApiResponse anthropic reads text, tool_use, and usage" {
+    const a = std.testing.allocator;
+    const body =
+        \\{"content":[{"type":"text","text":"hello"},{"type":"tool_use","id":"call_1","name":"shell_exec","input":{"cmd":"ls"}}],"stop_reason":"tool_use","usage":{"input_tokens":12,"output_tokens":7}}
+    ;
+    var result = try parseApiResponse(a, body, .anthropic);
+    defer result.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "hello") != null);
+    try std.testing.expect(result.tool_calls != null);
+    try std.testing.expectEqualStrings("shell_exec", result.tool_calls.?[0].name);
+    try std.testing.expectEqualStrings("call_1", result.tool_calls.?[0].id);
+    try std.testing.expect(result.usage != null);
+}
+
+test "buildRequestJson anthropic puts system top-level and includes max_tokens" {
+    const a = std.testing.allocator;
+    var msgs = [_]RequestMessage{
+        .{ .role = .user, .content = @constCast("hi") },
+    };
+    const params = RequestParams{ .model = "claude-x", .system_prompt = "be brief", .protocol = .anthropic, .thinking_enabled = false, .reasoning_effort = "", .stream = false, .max_tokens = 8192 };
+    const json = try buildRequestJson(a, params, &msgs, false);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"max_tokens\":8192") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"system\":\"be brief\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"role\":\"user\"") != null);
+    // system must NOT be inside the messages array as a role
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"role\":\"system\"") == null);
+}
+
+test "anthropic maps tool_calls to tool_use and tool results to grouped tool_result" {
+    const a = std.testing.allocator;
+    var calls = [_]ToolCall{.{ .id = @constCast("call_1"), .name = @constCast("shell_exec"), .arguments = @constCast("{\"cmd\":\"ls\"}") }};
+    var msgs = [_]RequestMessage{
+        .{ .role = .user, .content = @constCast("run ls") },
+        .{ .role = .assistant, .content = @constCast(""), .tool_calls = &calls },
+        .{ .role = .tool, .content = @constCast("file.txt"), .tool_call_id = @constCast("call_1") },
+    };
+    const params = RequestParams{ .model = "claude-x", .system_prompt = "", .protocol = .anthropic, .thinking_enabled = false, .reasoning_effort = "", .stream = false, .max_tokens = 8192 };
+    const json = try buildRequestJson(a, params, &msgs, true);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"tool_use\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"input\":{\"cmd\":\"ls\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"tool_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_use_id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"input_schema\"") != null);
 }

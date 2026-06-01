@@ -227,6 +227,35 @@ pub fn setOuterFrame(window: *Window, rect: Rect, topmost: bool) bool {
     return platform_window.setOuterFrame(nativeHandle(window), rectToPlatform(rect), topmost);
 }
 
+/// macOS-only: returns true if the user clicked the Dock icon while no window
+/// was visible (NSApplicationDelegate.applicationShouldHandleReopen). Other
+/// platforms return false.
+pub fn consumeReopenRequest() bool {
+    return platform_window.consumeReopenRequest();
+}
+
+/// macOS-only: returns true if the user invoked Quit (cmd+Q or menu) and the
+/// app should tear down. Other platforms return false.
+pub fn consumeQuitRequest() bool {
+    return platform_window.consumeQuitRequest();
+}
+
+/// macOS-only: signal the idle loop that the app should quit (used when zig
+/// initiates a quit, e.g. from a menu handler). No-op elsewhere.
+pub fn requestQuit() void {
+    platform_window.requestQuit();
+}
+
+/// macOS-only: pump pending NSApp events without owning a window — needed by
+/// the idle loop in App.run() so AppDelegate callbacks (Dock reopen, cmd+Q)
+/// keep firing between window sessions. `timeout_seconds` is the max time the
+/// main thread will block waiting for an event (also drains the GCD main
+/// queue, which worker threads use to marshal NSWindow modifications back to
+/// the main thread). No-op elsewhere.
+pub fn pumpAppEvents(timeout_seconds: f64) void {
+    platform_window.pumpAppEvents(timeout_seconds);
+}
+
 pub fn refreshClientSizeFromNative(window: *Window) bool {
     const rect = clientRect(window) orelse return false;
     setClientSize(window, rect.right - rect.left, rect.bottom - rect.top);
@@ -372,6 +401,20 @@ pub fn closeRequested(window: *const Window) bool {
 
 pub fn clearCloseRequested(window: *Window) void {
     window.close_requested = false;
+}
+
+fn closeRequestPromptsConfirmationForBackend(backend: Backend) bool {
+    // macOS follows traffic-light semantics: the red close button tears down
+    // this window immediately with no in-app prompt, and closing the last
+    // window does not end the process — App.run() keeps the NSApp alive so the
+    // Dock icon can re-open a window. Other backends confirm before closing.
+    return backend != .macos;
+}
+
+/// Whether an OS window-close request should open an in-app confirmation prompt
+/// before the window is torn down, instead of closing immediately.
+pub fn closeRequestPromptsConfirmation() bool {
+    return closeRequestPromptsConfirmationForBackend(comptime backendForOs(builtin.os.tag));
 }
 
 pub fn consumeDpiChanged(window: *Window) bool {
@@ -660,14 +703,14 @@ test "platform window backend exposes backend-neutral create options" {
     const options = CreateOptions{
         .width = 800,
         .height = 600,
-        .title = "Phantty",
+        .title = "WispTerm",
         .x = 10,
         .y = 20,
         .maximize = true,
     };
     try std.testing.expectEqual(@as(i32, 800), options.width);
     try std.testing.expectEqual(@as(i32, 600), options.height);
-    try std.testing.expectEqualStrings("Phantty", options.title);
+    try std.testing.expectEqualStrings("WispTerm", options.title);
     try std.testing.expectEqual(@as(?i32, 10), options.x);
     try std.testing.expectEqual(@as(?i32, 20), options.y);
     try std.testing.expect(options.maximize);
@@ -717,7 +760,7 @@ test "macOS AppKit backend creates a Metal-backed native window" {
     var window = try create(std.testing.allocator, .{
         .width = 320,
         .height = 180,
-        .title = "Phantty Window Smoke",
+        .title = "WispTerm Window Smoke",
     });
     defer destroy(&window);
 
@@ -757,4 +800,10 @@ test "platform window backend selects backend by target OS" {
     try std.testing.expectEqual(Backend.windows, backendForOs(.windows));
     try std.testing.expectEqual(Backend.unsupported, backendForOs(.linux));
     try std.testing.expectEqual(Backend.macos, backendForOs(.macos));
+}
+
+test "platform window backend resolves close-request confirmation policy per backend" {
+    try std.testing.expect(closeRequestPromptsConfirmationForBackend(.windows));
+    try std.testing.expect(closeRequestPromptsConfirmationForBackend(.unsupported));
+    try std.testing.expect(!closeRequestPromptsConfirmationForBackend(.macos));
 }

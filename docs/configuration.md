@@ -1,14 +1,17 @@
 # Configuration
 
-Phantty uses a Ghostty-compatible config file format (`key = value` pairs). The
+WispTerm uses a Ghostty-compatible config file format (`key = value` pairs). The
 main config path is resolved in this order:
 
 1. `--config <path>` or `--config-path <path>`
-2. `phantty.conf` next to `phantty.exe` (portable profile)
-3. `%APPDATA%\phantty\config`
+2. `wispterm.conf` next to the executable (portable profile, Windows only)
+3. Platform config directory:
+   - **Windows:** `%APPDATA%\wispterm\config`
+   - **macOS:** `~/Library/Application Support/wispterm/config`
+   - **Linux:** `$XDG_CONFIG_HOME/wispterm/config` (fallback: `~/.config/wispterm/config`)
 
-Press the configured `open_config` shortcut (default `Ctrl+,`) to open the
-config file in your default editor, or run `phantty.exe --show-config-path` to
+Press the configured `open_config` shortcut (default `Ctrl+,`, `Cmd+,` on macOS) to open the
+config file in your default editor, or run `wispterm --show-config-path` to
 print the resolved path.
 
 CLI flags override config file values (last wins). `config-file = extra.conf`
@@ -32,7 +35,7 @@ keybind = ctrl+shift+p=toggle_command_palette
 scrollback-limit = 10000000
 url-open-mode = embedded
 custom-shader = path/to/shader.glsl
-background-image = C:\Users\me\Pictures\wallpaper.png
+background-image = C:\Users\me\Pictures\wallpaper.png   # Windows example; use /Users/me/Pictures/wallpaper.png on macOS
 background-opacity = 0.85
 background-image-mode = fill
 config-file = extra.conf
@@ -63,17 +66,17 @@ remote-session-key = Workstation
 | `quake-mode`                | `true`     | Start as a Quake-style drop-down terminal. The `toggle_quake` keybind hides or shows the same window while preserving terminal state.                                                                                    |
 | `keybind`                   | defaults   | Configure an app-level shortcut. Can be repeated. Syntax: `keybind = [global:]modifier+key=action`; use `keybind = clear` before custom bindings to remove all defaults.                                                 |
 | `scrollback-limit`          | `10000000` | Scrollback buffer limit in bytes                                                                                                                                                                                        |
-| `url-open-mode`             | `embedded` | Where web URLs open: `embedded` uses the right-side browser panel when available, while `system-browser` always opens the Windows default browser. SSH loopback URLs keep local port forwards alive for either mode.       |
-| `restore-tabs-on-startup`   | `false`    | Persist tab/split layout to `%APPDATA%\phantty\session.json` on close and rebuild it on next launch. SSH passwords are never persisted; reconnects re-prompt. CLI overrides (`--cwd`) take precedence and skip restore. |
+| `url-open-mode`             | `embedded` | Where web URLs open: `embedded` uses the right-side browser panel when available (Windows only), while `system-browser` always opens the system default browser. SSH loopback URLs keep local port forwards alive for either mode. |
+| `restore-tabs-on-startup`   | `false`    | Persist tab/split layout to the platform config directory (`session.json`) on close and rebuild it on next launch. SSH passwords are never persisted; reconnects re-prompt. CLI overrides (`--cwd`) take precedence and skip restore. |
 | `auto-update-check`         | `true`     | Check GitHub Releases after startup and show a clickable prompt when a newer version is available. Set to `false` to disable startup checks.                                                                             |
 | `config-file`               | *(none)*   | Include another config file (prefix with `?` to make optional)                                                                                                                                                          |
-| `remote-enabled`            | `false`    | Start the shared outbound RemoteClient for this Phantty instance                                                                                                                                                        |
+| `remote-enabled`            | `false`    | Start the shared outbound RemoteClient for this WispTerm instance                                                                                                                                                        |
 | `remote-server-url`         | *(none)*   | Cloudflare relay URL, for example `https://remote.example.com`                                                                                                                                                          |
 | `remote-server-fingerprint` | *(none)*   | Expected relay fingerprint for server identity pinning                                                                                                                                                                  |
-| `remote-device-name`        | *(none)*   | Friendly device name sent with the Phantty WebSocket pairing                                                                                                                                                            |
-| `remote-session-key`        | *(none)*   | Fixed remote session key base. The first local Phantty instance uses it directly; later concurrently running instances use `_1`, `_2`, `_3`, and so on.                                                                  |
+| `remote-device-name`        | *(none)*   | Friendly device name sent with the WispTerm WebSocket pairing                                                                                                                                                            |
+| `remote-session-key`        | *(none)*   | Fixed remote session key base. The first local WispTerm instance uses it directly; later concurrently running instances use `_1`, `_2`, `_3`, and so on.                                                                  |
 
-When `remote-enabled = true`, Phantty creates one RemoteClient for the running
+When `remote-enabled = true`, WispTerm creates one RemoteClient for the running
 instance. All tabs and splits publish PTY output through that shared client, and
 the generated session key is printed in the debug console and shown in the
 in-window remote status pill. Click the remote status pill to copy the active
@@ -81,16 +84,17 @@ session key, or use `Copy Remote Key` from the command center.
 
 By default the session key is random for every process. Set
 `remote-session-key = mypass` to use predictable keys for multiple concurrent
-local Phantty instances: the first process gets `mypass`, the next gets
+local WispTerm instances: the first process gets `mypass`, the next gets
 `mypass_1`, then `mypass_2`, `mypass_3`, and so on. This only chooses the relay
 session key that the remote browser enters; it is separate from the web admin
 login password configured on the relay server.
 
 ## Keyboard Shortcuts
 
-Phantty follows Ghostty's `keybind = trigger=action` style for app-level
+WispTerm follows Ghostty's `keybind = trigger=action` style for app-level
 shortcuts. Prefix a binding with `global:` when the shortcut should be
-registered with Windows; the first global use case is Quake mode.
+registered system-wide (Win32 hotkey on Windows, CGEventTap on macOS); the
+first global use case is Quake mode.
 
 ```text
 keybind = alt+f10=toggle_command_palette
@@ -98,7 +102,7 @@ keybind = ctrl+shift+t=new_session
 keybind = global:ctrl+backquote=toggle_quake
 ```
 
-Supported modifiers are `ctrl`, `shift`, `alt`, and `win`. Common key names
+Supported modifiers are `ctrl`, `shift`, `alt`, and `win` (Windows) / `cmd` (macOS). Common key names
 include letters, digits, `f1`-`f24`, `backquote`, `comma`, `plus`, `minus`,
 `bracket_left`, `bracket_right`, `enter`, `tab`, `escape`, and arrow keys.
 
