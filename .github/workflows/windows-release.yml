@@ -78,14 +78,14 @@ jobs:
       - name: Validate packaged outputs
         shell: pwsh
         run: |
-          $portableExe = "zig-out\dist\portable\phantty.exe"
+          $portableExe = "zig-out\dist\portable\wispterm.exe"
           $portableVersion = "zig-out\dist\portable\version.txt"
           $portablePluginSkills = "zig-out\dist\portable\plugins\skills"
-          $portableWebView2Exe = "zig-out\dist\portable-webview2\phantty.exe"
+          $portableWebView2Exe = "zig-out\dist\portable-webview2\wispterm.exe"
           $portableWebView2Version = "zig-out\dist\portable-webview2\version.txt"
           $portableWebView2Loader = "zig-out\dist\portable-webview2\WebView2Loader.dll"
           $portableWebView2PluginSkills = "zig-out\dist\portable-webview2\plugins\skills"
-          $portableNoWebViewExe = "zig-out\dist\portable-no-webview\phantty.exe"
+          $portableNoWebViewExe = "zig-out\dist\portable-no-webview\wispterm.exe"
           $portableNoWebViewVersion = "zig-out\dist\portable-no-webview\version.txt"
           $portableNoWebViewPluginSkills = "zig-out\dist\portable-no-webview\plugins\skills"
           $skillFiles = @(
@@ -146,9 +146,9 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          $portableAsset = "phantty-windows-portable-$tag.zip"
-          $portableWebView2Asset = "phantty-windows-portable-webview2-$tag.zip"
-          $portableNoWebViewAsset = "phantty-windows-portable-no-webview-$tag.zip"
+          $portableAsset = "wispterm-windows-portable-$tag.zip"
+          $portableWebView2Asset = "wispterm-windows-portable-webview2-$tag.zip"
+          $portableNoWebViewAsset = "wispterm-windows-portable-no-webview-$tag.zip"
 
           if (Test-Path $portableAsset) {
             Remove-Item $portableAsset -Force
@@ -167,20 +167,20 @@ jobs:
       - name: Upload portable artifact
         uses: actions/upload-artifact@v4
         with:
-          name: phantty-windows-portable-${{ github.ref_name }}
-          path: phantty-windows-portable-${{ github.ref_name }}.zip
+          name: wispterm-windows-portable-${{ github.ref_name }}
+          path: wispterm-windows-portable-${{ github.ref_name }}.zip
           if-no-files-found: error
 
       - name: Upload portable WebView2 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: phantty-windows-portable-webview2-${{ github.ref_name }}
-          path: phantty-windows-portable-webview2-${{ github.ref_name }}.zip
+          name: wispterm-windows-portable-webview2-${{ github.ref_name }}
+          path: wispterm-windows-portable-webview2-${{ github.ref_name }}.zip
           if-no-files-found: error
 
       - name: Upload portable no-WebView artifact
         uses: actions/upload-artifact@v4
         with:
-          name: phantty-windows-portable-no-webview-${{ github.ref_name }}
-          path: phantty-windows-portable-no-webview-${{ github.ref_name }}.zip
+          name: wispterm-windows-portable-no-webview-${{ github.ref_name }}
+          path: wispterm-windows-portable-no-webview-${{ github.ref_name }}.zip
           if-no-files-found: error
