@@ -12,6 +12,9 @@ const input_key = @import("../input/key.zig");
 const remote_client = @import("../remote_client.zig");
 const session_persist = @import("../session_persist.zig");
 const ai_chat = @import("../ai_chat.zig");
+const ai_history_session = @import("../ai_history_session.zig");
+const ai_history_source = @import("../ai_history_source.zig");
+const ai_history_time = @import("../ai_history_time.zig");
 const agent_history = @import("../agent_history.zig");
 const platform_pty_command = @import("../platform/pty_command.zig");
 const active_tab_state = @import("active_tab.zig");
@@ -43,6 +46,7 @@ pub const TabState = struct {
     tree: SplitTree,
     focused: SplitTree.Node.Handle = .root,
     ai_chat_session: ?*ai_chat.Session = null,
+    ai_history_session: ?*ai_history_session.Session = null,
     /// Copilot conversation for a terminal tab (Issue #98). Distinct from
     /// `ai_chat_session`, which backs a dedicated AI-chat tab. Lazily created
     /// the first time the copilot sidebar is opened on this tab.
@@ -51,6 +55,7 @@ pub const TabState = struct {
     pub const Kind = enum {
         terminal,
         ai_chat,
+        ai_history,
     };
 
     /// Get the focused surface in this tab, or null if tree is empty
@@ -74,12 +79,15 @@ pub const TabState = struct {
             const chat_title = chat.title();
             return if (chat_title.len > 0) chat_title else "AI Chat";
         }
+        if (self.kind == .ai_history) {
+            const session = self.ai_history_session orelse return "AI History";
+            return if (session.source.name.len > 0) session.source.name else "AI History";
+        }
         const surface = self.focusedSurface() orelse return "wispterm";
         return surface.getTitle();
     }
 
     pub fn deinit(self: *TabState, allocator: std.mem.Allocator) void {
-        _ = allocator;
         switch (self.kind) {
             .terminal => {
                 self.tree.deinit();
@@ -92,6 +100,13 @@ pub const TabState = struct {
                 if (self.ai_chat_session) |session| {
                     session.deinit();
                     self.ai_chat_session = null;
+                }
+            },
+            .ai_history => {
+                if (self.ai_history_session) |session| {
+                    session.deinit();
+                    allocator.destroy(session);
+                    self.ai_history_session = null;
                 }
             },
         }
@@ -116,6 +131,12 @@ pub threadlocal var g_ai_history_change_hook: ?ai_chat.HistoryChangeHook = null;
 // id. Registered by AppWindow (which owns the history store), so tab.zig stays
 // free of that dependency. Returns true if the tab was reopened.
 pub threadlocal var g_ai_restore_hook: ?*const fn (session_id: []const u8) bool = null;
+
+// Restore hook: rebuild an AI History tab from its persisted source snapshot.
+// The snap slices are borrowed from the parsed session JSON and are only valid
+// for the duration of the hook call; callees must duplicate any fields they
+// keep after returning. Returns true if the tab was reopened.
+pub threadlocal var g_ai_history_restore_hook: ?*const fn (session_persist.AiHistorySnap) bool = null;
 
 // Forced title from config (overrides all tab titles)
 pub threadlocal var g_forced_title: ?[]const u8 = null;
@@ -323,6 +344,7 @@ pub fn spawnTabWithCommandAndCwd(allocator: std.mem.Allocator, cols: u16, rows: 
     t.tree = tree;
     t.focused = .root;
     t.ai_chat_session = null;
+    t.ai_history_session = null;
     t.copilot_session = null;
 
     g_tabs[g_tab_count] = t;
@@ -376,6 +398,7 @@ pub fn spawnAiChatTab(
     t.tree = .empty;
     t.focused = .root;
     t.ai_chat_session = session;
+    t.ai_history_session = null;
     t.copilot_session = null;
 
     g_tabs[g_tab_count] = t;
@@ -404,6 +427,7 @@ pub fn spawnAiChatTabFromHistoryRecord(allocator: std.mem.Allocator, record: age
     t.tree = .empty;
     t.focused = .root;
     t.ai_chat_session = session;
+    t.ai_history_session = null;
     t.copilot_session = null;
 
     g_tabs[g_tab_count] = t;
@@ -411,6 +435,33 @@ pub fn spawnAiChatTabFromHistoryRecord(allocator: std.mem.Allocator, record: age
     g_tab_count += 1;
 
     std.debug.print("Restored AI Chat tab from history (count={}), active: {}\n", .{ g_tab_count, active_tab_state.g_active_tab });
+    return true;
+}
+
+pub fn spawnAiHistoryTab(allocator: std.mem.Allocator, source: ai_history_source.Source) bool {
+    if (g_tab_count >= MAX_TABS) return false;
+    const session_ptr = allocator.create(ai_history_session.Session) catch return false;
+    session_ptr.* = ai_history_session.Session.initOwned(allocator, source) catch {
+        allocator.destroy(session_ptr);
+        return false;
+    };
+    session_ptr.tz_offset_seconds = ai_history_time.localOffsetSeconds();
+
+    const t = allocator.create(TabState) catch {
+        session_ptr.deinit();
+        allocator.destroy(session_ptr);
+        return false;
+    };
+    t.kind = .ai_history;
+    t.tree = .empty;
+    t.focused = .root;
+    t.ai_chat_session = null;
+    t.copilot_session = null;
+    t.ai_history_session = session_ptr;
+
+    g_tabs[g_tab_count] = t;
+    active_tab_state.g_active_tab = g_tab_count;
+    g_tab_count += 1;
     return true;
 }
 
@@ -698,7 +749,7 @@ pub const CloseResult = enum {
 /// Close the focused split. Returns what happened so the caller can handle side effects.
 pub fn closeFocusedSplit(allocator: std.mem.Allocator) CloseResult {
     const t = activeTab() orelse return .no_op;
-    if (t.kind == .ai_chat) {
+    if (t.kind != .terminal) {
         if (g_tab_count <= 1) return .close_window;
         closeTab(active_tab_state.g_active_tab, allocator);
         return .closed_tab;
@@ -817,6 +868,7 @@ pub fn commitTabRename() void {
                     .ai_chat => if (t.ai_chat_session) |session| {
                         session.setTitle(g_tab_rename_buf[0..g_tab_rename_len]);
                     },
+                    .ai_history => {},
                 }
             }
         }
@@ -982,6 +1034,17 @@ pub fn snapshotTab(arena: std.mem.Allocator, t: *const TabState) !session_persis
             .ai_session_id = sid,
         };
     }
+    if (t.kind == .ai_history) {
+        const session = t.ai_history_session orelse return error.NoAiHistorySession;
+        const snap = try session.persistSnap(arena);
+        return session_persist.TabSnap{
+            .title_override = null,
+            .focused_leaf = 0,
+            .zoomed_leaf = null,
+            .tree = .{ .leaf = .{ .surface = .{ .local_shell = .{} } } },
+            .ai_history = snap,
+        };
+    }
     if (t.kind != .terminal) return error.NotTerminalTab;
     if (t.tree.isEmpty()) return error.EmptyTree;
 
@@ -997,11 +1060,17 @@ pub fn snapshotTab(arena: std.mem.Allocator, t: *const TabState) !session_persis
     const zoomed_leaf: ?u32 = if (t.tree.zoomed) |z| computeFocusedLeafIndex(&t.tree, z) else null;
 
     return session_persist.TabSnap{
-        .title_override = null,
+        .title_override = try snapshotFocusedTitleOverride(arena, t),
         .focused_leaf = focused_leaf,
         .zoomed_leaf = zoomed_leaf,
         .tree = tree,
     };
+}
+
+fn snapshotFocusedTitleOverride(arena: std.mem.Allocator, t: *const TabState) !?[]const u8 {
+    const surface = t.focusedSurface() orelse return null;
+    if (surface.title_override_len == 0) return null;
+    return try arena.dupe(u8, surface.title_override[0..surface.title_override_len]);
 }
 
 fn snapshotNode(
@@ -1031,12 +1100,9 @@ fn snapshotNode(
 }
 
 fn snapshotSurface(arena: std.mem.Allocator, surface: *const Surface) !session_persist.SurfaceSnap {
-    const cwd_opt: ?[]const u8 = surface.getCwd() orelse surface.getInitialCwd();
-    const cwd_dup: ?[]const u8 = if (cwd_opt) |c| try arena.dupe(u8, c) else null;
-
     return switch (surface.surfaceKind()) {
         .local_shell => .{ .local_shell = .{
-            .cwd = cwd_dup,
+            .cwd = try snapshotOptionalCwd(arena, surface.getCwd() orelse surface.getInitialCwd()),
             .command = null,
         } },
         .ssh => blk: {
@@ -1048,7 +1114,7 @@ fn snapshotSurface(arena: std.mem.Allocator, surface: *const Surface) !session_p
             else
                 std.fmt.parseInt(u16, port_str, 10) catch 22;
             break :blk .{ .ssh = .{
-                .cwd = cwd_dup,
+                .cwd = try snapshotOptionalCwd(arena, surface.getCwd()),
                 .user = try arena.dupe(u8, conn.user()),
                 .host = try arena.dupe(u8, conn.host()),
                 .port = port_num,
@@ -1056,6 +1122,10 @@ fn snapshotSurface(arena: std.mem.Allocator, surface: *const Surface) !session_p
             } };
         },
     };
+}
+
+fn snapshotOptionalCwd(arena: std.mem.Allocator, cwd: ?[]const u8) !?[]const u8 {
+    return if (cwd) |c| try arena.dupe(u8, c) else null;
 }
 
 fn computeFocusedLeafIndex(tree: *const SplitTree, target: SplitTree.Node.Handle) u32 {
@@ -1101,6 +1171,7 @@ threadlocal var g_restore_cols: u16 = 80;
 threadlocal var g_restore_rows: u16 = 24;
 threadlocal var g_restore_cursor_style: CursorStyle = .block;
 threadlocal var g_restore_cursor_blink: bool = true;
+const SSH_RESTORE_COMMAND_BUF_SIZE: usize = 4096;
 
 /// Free-function factory passed to SplitTree.fromSnapshot. Reads dimensions
 /// and cursor settings from the thread-local restore context populated by
@@ -1139,38 +1210,12 @@ fn surfaceFromSnapImpl(
             return surface;
         },
         .ssh => |s| {
-            // Build the platform SSH command with an optional trailing
-            // `cd <cwd>` argument when cwd is present. Mirrors the
-            // password_auth=false branch since persisted SSH snaps do not
-            // carry the password_auth flag. SSH password is never persisted.
-            var stack_buf: [1024]u8 = undefined;
+            var stack_buf: [SSH_RESTORE_COMMAND_BUF_SIZE]u8 = undefined;
+            const command_text = try buildSshRestoreCommand(gpa, &stack_buf, s);
 
-            // Render the port to a stable scratch buffer first; we need the
-            // port string both inside the spawned command and to pass to
-            // setSshConnection below.
             var port_buf: [8]u8 = undefined;
             const port_slice = std.fmt.bufPrint(&port_buf, "{}", .{s.port}) catch return error.CommandTooLong;
-
-            const base = platform_pty_command.sshInteractiveCommand(stack_buf[0..], .{
-                .user = s.user,
-                .host = s.host,
-                .port = port_slice,
-                .legacy_algorithms = g_ssh_legacy_algorithms,
-                .proxy_jump = s.proxy_jump,
-            }) orelse return error.CommandTooLong;
-            var final_len: usize = base.len;
-
-            if (s.cwd) |cwd_str| {
-                const escaped = try session_persist.shellSingleQuoteEscape(gpa, cwd_str);
-                defer gpa.free(escaped);
-                var trailing_buf: [768]u8 = undefined;
-                const trail = std.fmt.bufPrint(&trailing_buf, " \"cd '{s}' 2>/dev/null; exec $SHELL -l\"", .{escaped}) catch return error.CommandTooLong;
-                if (final_len + trail.len > stack_buf.len) return error.CommandTooLong;
-                @memcpy(stack_buf[final_len..][0..trail.len], trail);
-                final_len += trail.len;
-            }
-
-            const command = try platform_pty_command.allocCommandLineFromUtf8(gpa, stack_buf[0..final_len]);
+            const command = try platform_pty_command.allocCommandLineFromUtf8(gpa, command_text);
             defer platform_pty_command.freeCommandLine(gpa, command);
             const surface = try Surface.init(gpa, cols, rows, platform_pty_command.commandLineFromOwned(command), g_scrollback_limit, cursor_style, cursor_blink, null);
             surface.attachRemoteClient(g_remote_client);
@@ -1182,6 +1227,35 @@ fn surfaceFromSnapImpl(
             return surface;
         },
     }
+}
+
+fn buildSshRestoreCommand(
+    allocator: std.mem.Allocator,
+    buf: []u8,
+    s: session_persist.SurfaceSnap.SshSnap,
+) ![]const u8 {
+    // Mirrors the password_auth=false branch: persisted SSH snaps never carry
+    // passwords, so restored sessions rely on keys or the native ssh prompt.
+    var port_buf: [8]u8 = undefined;
+    const port_slice = std.fmt.bufPrint(&port_buf, "{}", .{s.port}) catch return error.CommandTooLong;
+
+    const base = platform_pty_command.sshInteractiveCommand(buf, .{
+        .user = s.user,
+        .host = s.host,
+        .port = port_slice,
+        .legacy_algorithms = g_ssh_legacy_algorithms,
+        .proxy_jump = s.proxy_jump,
+    }) orelse return error.CommandTooLong;
+    var final_len: usize = base.len;
+
+    if (s.cwd) |cwd_str| {
+        const escaped = try session_persist.shellSingleQuoteEscape(allocator, cwd_str);
+        defer allocator.free(escaped);
+        const trail = std.fmt.bufPrint(buf[final_len..], " \"cd '{s}' 2>/dev/null; exec $SHELL -l\"", .{escaped}) catch return error.CommandTooLong;
+        final_len += trail.len;
+    }
+
+    return buf[0..final_len];
 }
 
 /// Materialize one TabSnap into a new live tab. Returns true on success.
@@ -1199,6 +1273,11 @@ pub fn restoreTab(
     cursor_blink: bool,
 ) bool {
     if (g_tab_count >= MAX_TABS) return false;
+
+    if (snap.ai_history) |history_snap| {
+        const hook = g_ai_history_restore_hook orelse return false;
+        return hook(history_snap);
+    }
 
     // AI Chat tab: rebuild from its persisted history session via the hook
     // AppWindow installed (it owns the history store). The placeholder `tree` in
@@ -1231,12 +1310,27 @@ pub fn restoreTab(
     // Resolve focused_leaf from pre-order index back to a Handle.
     t.focused = handleOfNthLeaf(&t.tree, snap.focused_leaf) orelse .root;
     t.ai_chat_session = null;
+    t.ai_history_session = null;
     t.copilot_session = null;
+    applyRestoredTabMetadata(t, snap);
 
     g_tabs[g_tab_count] = t;
     active_tab_state.g_active_tab = g_tab_count;
     g_tab_count += 1;
     return true;
+}
+
+fn applyRestoredTabMetadata(t: *TabState, snap: *const session_persist.TabSnap) void {
+    const title = snap.title_override orelse return;
+    switch (t.kind) {
+        .terminal => if (t.focusedSurface()) |surface| {
+            surface.setTitleOverride(title);
+        },
+        .ai_chat => if (t.ai_chat_session) |session| {
+            session.setTitle(title);
+        },
+        .ai_history => {},
+    }
 }
 
 fn handleOfNthLeaf(tree: *const SplitTree, target_idx: u32) ?SplitTree.Node.Handle {
@@ -1371,6 +1465,7 @@ fn makeTestTabState() TabState {
         .tree = .empty,
         .focused = .root,
         .ai_chat_session = null,
+        .ai_history_session = null,
     };
 }
 
@@ -1414,6 +1509,392 @@ test "tab: restoreTab skips an ai tab when no restore hook is installed" {
         .ai_session_id = "sess-xyz",
     };
     try std.testing.expect(!restoreTab(std.testing.allocator, &snap, 80, 24, .block, false));
+}
+
+test "tab: restoreTab routes ai_history through the restore hook" {
+    resetTestTabGlobals();
+    const previous_hook = g_ai_history_restore_hook;
+    defer g_ai_history_restore_hook = previous_hook;
+
+    const Captured = struct {
+        var source_id: []const u8 = "";
+        var called: bool = false;
+        fn hook(snap: session_persist.AiHistorySnap) bool {
+            source_id = snap.source_id;
+            called = true;
+            return true;
+        }
+    };
+    Captured.called = false;
+    Captured.source_id = "";
+    g_ai_history_restore_hook = Captured.hook;
+
+    const snap = session_persist.TabSnap{
+        .tree = .{ .leaf = .{ .surface = .{ .local_shell = .{} } } },
+        .ai_history = .{
+            .source_id = "local-history",
+            .target_kind = "local",
+            .target_name = "Local",
+        },
+    };
+    try std.testing.expect(restoreTab(std.testing.allocator, &snap, 80, 24, .block, false));
+    try std.testing.expect(Captured.called);
+    try std.testing.expectEqualStrings("local-history", Captured.source_id);
+    try std.testing.expectEqual(@as(usize, 0), g_tab_count);
+}
+
+test "tab: restoreTab skips an ai_history tab when no restore hook is installed" {
+    resetTestTabGlobals();
+    const previous_hook = g_ai_history_restore_hook;
+    defer g_ai_history_restore_hook = previous_hook;
+    g_ai_history_restore_hook = null;
+
+    const snap = session_persist.TabSnap{
+        .tree = .{ .leaf = .{ .surface = .{ .local_shell = .{} } } },
+        .ai_history = .{
+            .source_id = "local-history",
+            .target_kind = "local",
+            .target_name = "Local",
+        },
+    };
+    try std.testing.expect(!restoreTab(std.testing.allocator, &snap, 80, 24, .block, false));
+    try std.testing.expectEqual(@as(usize, 0), g_tab_count);
+}
+
+test "tab: snapshotTab persists focused surface title override" {
+    const allocator = std.testing.allocator;
+
+    var surface: Surface = undefined;
+    surface.ref_count = 1;
+    surface.ssh_connection = null;
+    surface.cwd_path_len = 0;
+    surface.initial_cwd_path_len = 0;
+    @memcpy(surface.title_override[0..3], "GLM");
+    surface.title_override_len = 3;
+
+    var tree = try SplitTree.init(allocator, &surface);
+    defer tree.deinit();
+
+    const tab_state = TabState{
+        .kind = .terminal,
+        .tree = tree,
+        .focused = .root,
+        .ai_chat_session = null,
+        .ai_history_session = null,
+        .copilot_session = null,
+    };
+
+    const snap = try snapshotTab(allocator, &tab_state);
+    defer if (snap.title_override) |title| allocator.free(title);
+
+    try std.testing.expectEqualStrings("GLM", snap.title_override.?);
+}
+
+test "tab: restored title override applies to focused surface" {
+    const allocator = std.testing.allocator;
+
+    var surface: Surface = undefined;
+    surface.ref_count = 1;
+    surface.ssh_connection = null;
+    surface.cwd_path_len = 0;
+    surface.initial_cwd_path_len = 0;
+    surface.title_override_len = 0;
+    surface.agent_recent_output_len = 0;
+
+    var tree = try SplitTree.init(allocator, &surface);
+    defer tree.deinit();
+
+    var tab_state = TabState{
+        .kind = .terminal,
+        .tree = tree,
+        .focused = .root,
+        .ai_chat_session = null,
+        .ai_history_session = null,
+        .copilot_session = null,
+    };
+    const snap = session_persist.TabSnap{
+        .title_override = "GLM",
+        .focused_leaf = 0,
+        .tree = .{ .leaf = .{ .surface = .{ .local_shell = .{} } } },
+    };
+
+    applyRestoredTabMetadata(&tab_state, &snap);
+
+    try std.testing.expectEqualStrings("GLM", tab_state.focusedSurface().?.getTitle());
+}
+
+test "tab: snapshotTab does not use local launch cwd as ssh remote cwd" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var surface: Surface = undefined;
+    surface.ref_count = 1;
+    surface.cwd_path_len = 0;
+    @memcpy(surface.initial_cwd_path[0..6], "/local");
+    surface.initial_cwd_path_len = 6;
+    surface.title_override_len = 0;
+    surface.setSshConnection("root", "server.test", "22", "", "", false, false);
+
+    var tree = try SplitTree.init(allocator, &surface);
+    defer tree.deinit();
+
+    const tab_state = TabState{
+        .kind = .terminal,
+        .tree = tree,
+        .focused = .root,
+        .ai_chat_session = null,
+        .ai_history_session = null,
+        .copilot_session = null,
+    };
+
+    const snap = try snapshotTab(arena.allocator(), &tab_state);
+    const ssh = switch (snap.tree) {
+        .leaf => |leaf| switch (leaf.surface) {
+            .ssh => |s| s,
+            .local_shell => return error.UnexpectedShell,
+        },
+        .split => return error.UnexpectedSplit,
+    };
+
+    try std.testing.expect(ssh.cwd == null);
+}
+
+test "tab: snapshotTab persists ssh cwd only when remote cwd is known" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var surface: Surface = undefined;
+    surface.ref_count = 1;
+    @memcpy(surface.cwd_path[0..4], "/srv");
+    surface.cwd_path_len = 4;
+    @memcpy(surface.initial_cwd_path[0..6], "/local");
+    surface.initial_cwd_path_len = 6;
+    surface.title_override_len = 0;
+    surface.setSshConnection("root", "server.test", "22", "", "", false, false);
+
+    var tree = try SplitTree.init(allocator, &surface);
+    defer tree.deinit();
+
+    const tab_state = TabState{
+        .kind = .terminal,
+        .tree = tree,
+        .focused = .root,
+        .ai_chat_session = null,
+        .ai_history_session = null,
+        .copilot_session = null,
+    };
+
+    const snap = try snapshotTab(arena.allocator(), &tab_state);
+    const ssh = switch (snap.tree) {
+        .leaf => |leaf| switch (leaf.surface) {
+            .ssh => |s| s,
+            .local_shell => return error.UnexpectedShell,
+        },
+        .split => return error.UnexpectedSplit,
+    };
+
+    try std.testing.expectEqualStrings("/srv", ssh.cwd.?);
+}
+
+test "tab: SSH restore command accepts the longest persisted connection fields and cwd" {
+    const allocator = std.testing.allocator;
+
+    var user_buf: [128]u8 = undefined;
+    @memset(&user_buf, 'u');
+    var host_buf: [128]u8 = undefined;
+    @memset(&host_buf, 'h');
+    var proxy_buf: [256]u8 = undefined;
+    @memset(&proxy_buf, 'p');
+    var cwd_buf: [512]u8 = undefined;
+    @memset(&cwd_buf, 'd');
+
+    var command_buf: [SSH_RESTORE_COMMAND_BUF_SIZE]u8 = undefined;
+    const command = try buildSshRestoreCommand(
+        allocator,
+        &command_buf,
+        .{
+            .cwd = cwd_buf[0..],
+            .user = user_buf[0..],
+            .host = host_buf[0..],
+            .port = 65535,
+            .proxy_jump = proxy_buf[0..],
+        },
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, command, "ssh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "-p 65535") != null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "cd '") != null);
+}
+
+test "tab: spawnAiHistoryTab creates active ai_history tab" {
+    resetTestTabGlobals();
+    const allocator = std.testing.allocator;
+    defer {
+        for (0..g_tab_count) |idx| {
+            if (g_tabs[idx]) |tab_state| {
+                tab_state.deinit(allocator);
+                allocator.destroy(tab_state);
+                g_tabs[idx] = null;
+            }
+        }
+        resetTestTabGlobals();
+    }
+
+    try std.testing.expect(spawnAiHistoryTab(allocator, .{
+        .id = "local-history",
+        .name = "Local History",
+        .target = .local,
+    }));
+
+    try std.testing.expectEqual(@as(usize, 1), g_tab_count);
+    try std.testing.expectEqual(@as(usize, 0), active_tab_state.g_active_tab);
+    const active = activeTab() orelse return error.ExpectedActiveTab;
+    try std.testing.expectEqual(TabState.Kind.ai_history, active.kind);
+    const session = active.ai_history_session orelse return error.ExpectedAiHistorySession;
+    try std.testing.expectEqualStrings("local-history", session.source.id);
+}
+
+test "tab: spawnAiHistoryTab owns mutable ssh source buffers" {
+    resetTestTabGlobals();
+    const allocator = std.testing.allocator;
+    defer {
+        for (0..g_tab_count) |idx| {
+            if (g_tabs[idx]) |tab_state| {
+                tab_state.deinit(allocator);
+                allocator.destroy(tab_state);
+                g_tabs[idx] = null;
+            }
+        }
+        resetTestTabGlobals();
+    }
+
+    var id_buf = [_]u8{ 's', 's', 'h', '-', 'h', 'i', 's', 't', 'o', 'r', 'y' };
+    var name_buf = [_]u8{ 'B', 'u', 'i', 'l', 'd', ' ', 'B', 'o', 'x' };
+    var profile_buf = [_]u8{ 'b', 'u', 'i', 'l', 'd', 'b', 'o', 'x' };
+
+    try std.testing.expect(spawnAiHistoryTab(allocator, .{
+        .id = id_buf[0..],
+        .name = name_buf[0..],
+        .target = .{ .ssh = .{ .profile_name = profile_buf[0..] } },
+    }));
+
+    @memset(&id_buf, 'x');
+    @memset(&name_buf, 'x');
+    @memset(&profile_buf, 'x');
+
+    const active = activeTab() orelse return error.ExpectedActiveTab;
+    const session = active.ai_history_session orelse return error.ExpectedAiHistorySession;
+    try std.testing.expectEqualStrings("ssh-history", session.source.id);
+    try std.testing.expectEqualStrings("Build Box", session.source.name);
+    try std.testing.expectEqualStrings("buildbox", session.source.target.ssh.profile_name);
+    try std.testing.expectEqualStrings("Build Box", active.getTitle());
+}
+
+test "tab: spawnAiHistoryTab rolls back when tab allocation fails" {
+    resetTestTabGlobals();
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 3,
+    });
+
+    try std.testing.expect(!spawnAiHistoryTab(failing_allocator.allocator(), .{
+        .id = "local-history",
+        .name = "Local History",
+        .target = .local,
+    }));
+
+    try std.testing.expect(failing_allocator.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), g_tab_count);
+    try std.testing.expect(g_tabs[0] == null);
+}
+
+test "tab: snapshotTab persists a live ai_history tab" {
+    const allocator = std.testing.allocator;
+    const source: ai_history_source.Source = .{
+        .id = "local-history",
+        .name = "Local History",
+        .target = .local,
+    };
+    const session = try allocator.create(ai_history_session.Session);
+    session.* = ai_history_session.Session.init(allocator, source);
+    defer {
+        session.deinit();
+        allocator.destroy(session);
+    }
+
+    const tab = TabState{
+        .kind = .ai_history,
+        .tree = .empty,
+        .focused = .root,
+        .ai_chat_session = null,
+        .ai_history_session = session,
+        .copilot_session = null,
+    };
+
+    const snap = try snapshotTab(allocator, &tab);
+    defer if (snap.ai_history) |history| {
+        allocator.free(history.source_id);
+        allocator.free(history.target_kind);
+        allocator.free(history.target_name);
+    };
+
+    try std.testing.expect(snap.ai_session_id == null);
+    const history = snap.ai_history orelse return error.ExpectedAiHistorySnap;
+    try std.testing.expectEqualStrings("local-history", history.source_id);
+    try std.testing.expectEqualStrings("local", history.target_kind);
+    try std.testing.expectEqualStrings("Local History", history.target_name);
+
+    const leaf = switch (snap.tree) {
+        .leaf => |leaf| leaf,
+        .split => return error.UnexpectedSplit,
+    };
+    switch (leaf.surface) {
+        .local_shell => {},
+        .ssh => return error.UnexpectedSsh,
+    }
+}
+
+test "tab: restoreTab prioritizes ai_history over ai_session_id" {
+    resetTestTabGlobals();
+    const previous_history_hook = g_ai_history_restore_hook;
+    const previous_chat_hook = g_ai_restore_hook;
+    defer {
+        g_ai_history_restore_hook = previous_history_hook;
+        g_ai_restore_hook = previous_chat_hook;
+    }
+
+    const Captured = struct {
+        var history_called: bool = false;
+        var chat_called: bool = false;
+        fn historyHook(_: session_persist.AiHistorySnap) bool {
+            history_called = true;
+            return true;
+        }
+        fn chatHook(_: []const u8) bool {
+            chat_called = true;
+            return true;
+        }
+    };
+    Captured.history_called = false;
+    Captured.chat_called = false;
+    g_ai_history_restore_hook = Captured.historyHook;
+    g_ai_restore_hook = Captured.chatHook;
+
+    const snap = session_persist.TabSnap{
+        .tree = .{ .leaf = .{ .surface = .{ .local_shell = .{} } } },
+        .ai_session_id = "chat-session",
+        .ai_history = .{
+            .source_id = "local-history",
+            .target_kind = "local",
+            .target_name = "Local",
+        },
+    };
+
+    try std.testing.expect(restoreTab(std.testing.allocator, &snap, 80, 24, .block, false));
+    try std.testing.expect(Captured.history_called);
+    try std.testing.expect(!Captured.chat_called);
+    try std.testing.expectEqual(@as(usize, 0), g_tab_count);
 }
 
 test "tab: reorder moves active tab forward" {

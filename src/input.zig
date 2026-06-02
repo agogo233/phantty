@@ -224,6 +224,7 @@ threadlocal var g_ai_transcript_scroll_drag_offset: f32 = 0;
 threadlocal var g_ai_transcript_selecting: bool = false;
 threadlocal var g_ai_transcript_select_chat: ?*AppWindow.ai_chat.Session = null;
 threadlocal var g_ai_transcript_select_auto_copy: bool = false;
+threadlocal var g_ai_history_suppress_refresh_char: bool = false;
 pub threadlocal var g_sidebar_resize_hover: bool = false; // Mouse is over the sidebar resize edge
 pub threadlocal var g_sidebar_resize_dragging: bool = false; // Currently dragging the sidebar edge
 pub threadlocal var g_explorer_resize_hover: bool = false; // Mouse is over the file explorer resize edge
@@ -691,13 +692,17 @@ pub fn processEvents(win: anytype) void {
 fn processKeyAndCharEvents(win: anytype) void {
     while (true) {
         var did_anything = false;
+        var handled_key = false;
         if (window_backend.popKeyEvent(win)) |ev| {
             handleKey(ev);
             did_anything = true;
+            handled_key = true;
         }
         if (window_backend.popCharEvent(win)) |ev| {
             handleChar(ev);
             did_anything = true;
+        } else if (handled_key) {
+            g_ai_history_suppress_refresh_char = false;
         }
         if (!did_anything) break;
     }
@@ -782,6 +787,17 @@ fn handleChar(ev: platform_input.CharEvent) void {
         }
         return;
     }
+    if (AppWindow.activeAiHistory() != null) {
+        if (g_ai_history_suppress_refresh_char) {
+            const suppress = !ev.ctrl and !ev.alt and !ev.super and ev.codepoint == 'r';
+            g_ai_history_suppress_refresh_char = false;
+            if (suppress) return;
+        }
+        if (!ev.ctrl and !ev.alt and !ev.super) {
+            _ = AppWindow.aiHistoryInsertCodepoint(ev.codepoint);
+        }
+        return;
+    }
     // AI copilot sidebar (terminal tabs): when the copilot owns focus, route
     // text input to its composer. `activeCopilotSessionForInput` is non-null
     // only when the panel is visible on the active terminal tab.
@@ -859,6 +875,7 @@ fn logicalKeyFromCode(key_code: platform_input.KeyCode) input_key.Key {
         0x41 => .key_a,
         0x43 => .key_c,
         0x45 => .key_e,
+        0x48 => .key_h,
         0x4B => .key_k,
         0x4C => .key_l,
         0x4E => .key_n,
@@ -870,6 +887,10 @@ fn logicalKeyFromCode(key_code: platform_input.KeyCode) input_key.Key {
         0x59 => .key_y,
         else => .unidentified,
     };
+}
+
+test "input: logical key mapping includes session launcher H mnemonic" {
+    try std.testing.expectEqual(input_key.Key.key_h, logicalKeyFromCode(0x48));
 }
 
 fn actionIs(action: ?keybind.Action, expected: keybind.Action) bool {
@@ -1042,6 +1063,12 @@ fn handleKey(ev: platform_input.KeyEvent) void {
         }
         return;
     }
+    if (overlays.restoreDefaultsConfirmVisible()) {
+        overlays.restoreDefaultsConfirmHandleKey(key_event);
+        AppWindow.g_force_rebuild = true;
+        AppWindow.g_cells_valid = false;
+        return;
+    }
     if (overlays.settingsPageVisible()) {
         overlays.settingsPageHandleKey(key_event);
         return;
@@ -1120,6 +1147,62 @@ fn handleKey(ev: platform_input.KeyEvent) void {
             AppWindow.g_cells_valid = false;
             return;
         }
+    }
+
+    if (AppWindow.activeAiHistory() != null) {
+        const plain = !ev.ctrl and !ev.alt and !ev.super;
+        switch (ev.key_code) {
+            platform_input.key_backspace => {
+                _ = AppWindow.aiHistoryBackspaceFilter();
+                return;
+            },
+            platform_input.key_up => {
+                _ = AppWindow.aiHistoryMoveSelection(-1);
+                return;
+            },
+            platform_input.key_down => {
+                _ = AppWindow.aiHistoryMoveSelection(1);
+                return;
+            },
+            platform_input.key_left => {
+                _ = AppWindow.aiHistoryCycleCategory(-1);
+                return;
+            },
+            platform_input.key_right => {
+                _ = AppWindow.aiHistoryCycleCategory(1);
+                return;
+            },
+            platform_input.key_enter => {
+                _ = AppWindow.aiHistoryLoadSelectedTranscript();
+                return;
+            },
+            platform_input.key_page_up => {
+                _ = AppWindow.aiHistoryScrollTranscript(-8);
+                return;
+            },
+            platform_input.key_page_down => {
+                _ = AppWindow.aiHistoryScrollTranscript(8);
+                return;
+            },
+            platform_input.key_home => {
+                _ = AppWindow.aiHistoryScrollTranscript(-(1 << 30));
+                return;
+            },
+            platform_input.key_end => {
+                _ = AppWindow.aiHistoryScrollTranscript(1 << 30);
+                return;
+            },
+            0x20 => if (plain) {
+                _ = AppWindow.aiHistoryPreviewSelectedTranscript();
+                return;
+            },
+            0x52 => if (plain and !ev.shift) {
+                g_ai_history_suppress_refresh_char = AppWindow.aiHistoryScanLocalNow();
+                return;
+            },
+            else => {},
+        }
+        return;
     }
 
     // AI copilot sidebar (terminal tabs): route editing/navigation keys to the
@@ -2405,6 +2488,18 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
         }
         return;
     }
+    if (overlays.restoreDefaultsConfirmVisible()) {
+        if (ev.button == .left and ev.action == .press) {
+            const win = AppWindow.g_window orelse return;
+            const fb = window_backend.framebufferSize(win);
+            const xpos: f64 = @floatFromInt(ev.x);
+            const ypos: f64 = @floatFromInt(ev.y);
+            _ = overlays.restoreDefaultsConfirmExecuteAt(xpos, ypos, @floatFromInt(fb.width), @floatFromInt(fb.height));
+            AppWindow.g_force_rebuild = true;
+            AppWindow.g_cells_valid = false;
+        }
+        return;
+    }
     if (overlays.settingsPageVisible()) {
         if (ev.button == .left and ev.action == .press) {
             const win = AppWindow.g_window orelse return;
@@ -2641,6 +2736,10 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             // Clicking outside file explorer unfocuses it
             file_explorer.g_focused = false;
             if (file_explorer.g_op_mode != .none) file_explorer.cancelOp();
+
+            if (AppWindow.activeAiHistory() != null) {
+                if (AppWindow.aiHistoryHandleMousePress(xpos, ypos)) return;
+            }
 
             // AI copilot sidebar (terminal tabs). When the panel is visible,
             // a click inside its rect focuses the copilot and routes one-shot
@@ -3764,6 +3863,29 @@ fn handleMouseWheel(ev: platform_input.MouseWheelEvent) void {
             file_explorer.scrollBy(delta);
             return;
         }
+    }
+    // AI History transcript preview: scroll the wrapped transcript when the
+    // wheel is over the detail (rightmost) pane.
+    if (AppWindow.activeAiHistory() != null) {
+        const win = AppWindow.g_window orelse return;
+        const size = clientSize(win);
+        const left_f = AppWindow.leftPanelsWidth();
+        const right_f = @as(f32, @floatFromInt(size.width)) - AppWindow.rightPanelsWidthForWindow(size.width);
+        const content_w = @max(0, right_f - left_f);
+        const layout = AppWindow.ai_history_renderer.computeLayout(left_f, content_w);
+        const x: f32 = @floatFromInt(ev.xpos);
+        if (x >= layout.detail_x and x < layout.detail_x + layout.detail_w) {
+            const units: i32 = @intCast(mouseWheelUnits(ev.delta));
+            const step = units * 3;
+            _ = AppWindow.aiHistoryScrollTranscript(if (ev.delta > 0) -step else step);
+            return;
+        }
+        if (x >= layout.left_x and x < layout.left_x + layout.left_w) {
+            const units: i32 = @intCast(mouseWheelUnits(ev.delta));
+            _ = AppWindow.aiHistoryScrollDateList(if (ev.delta > 0) -units else units);
+            return;
+        }
+        return;
     }
     if (AppWindow.activeAiChat()) |chat| {
         const win = AppWindow.g_window orelse return;

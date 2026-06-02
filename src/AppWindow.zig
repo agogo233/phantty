@@ -34,12 +34,19 @@ const platform_pty_command = @import("platform/pty_command.zig");
 const platform_window_state = @import("platform/window_state.zig");
 const platform_wsl = @import("platform/wsl.zig");
 const startup_tabs = @import("startup_tabs.zig");
+const session_persist = @import("session_persist.zig");
 const quick_terminal = @import("quick_terminal.zig");
 const keybind = @import("keybind.zig");
 const thread_message = @import("appwindow/thread_message.zig");
 const render_diagnostics = @import("render_diagnostics.zig");
 const ime_caret = @import("ime_caret.zig");
 pub const ai_chat = @import("ai_chat.zig");
+const ai_history_cache = @import("ai_history_cache.zig");
+const ai_history_resume = @import("ai_history_resume.zig");
+const ai_history_types = @import("ai_history_types.zig");
+pub const ai_history_session = @import("ai_history_session.zig");
+pub const ai_history_source = @import("ai_history_source.zig");
+const ssh_connection = @import("ssh_connection.zig");
 pub const tab = @import("appwindow/tab.zig");
 const active_tab_state = @import("appwindow/active_tab.zig");
 pub const font = @import("font/manager.zig");
@@ -66,6 +73,7 @@ pub const browser_panel = if (build_options.webview)
 else
     @import("browser_panel_stub.zig");
 pub const ai_chat_renderer = @import("renderer/ai_chat_renderer.zig");
+pub const ai_history_renderer = @import("renderer/ai_history_renderer.zig");
 const ai_sidebar = @import("ai_sidebar.zig");
 pub const ui_perf = @import("ui_perf.zig");
 const log = std.log.scoped(.app_window);
@@ -112,10 +120,7 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
 
     try ensureGlobalAgentHistoryStore(allocator);
     tab.g_ai_history_change_hook = saveAiHistoryChangeEvent;
-    // Let session restore reopen AI Chat tabs from their persisted history
-    // session id. AppWindow owns the agent history store, so it supplies the
-    // hook tab.zig calls from restoreTab (which only knows the session id).
-    tab.g_ai_restore_hook = reopenAiChatTabFromHistorySessionId;
+    installSessionRestoreHooks();
 
     // Apply config from App to globals
     g_theme = app.theme;
@@ -231,6 +236,7 @@ pub fn deinit(self: *AppWindow) void {
             is_last_window = self.app.windows.items.len == 0;
         }
         if (restore_enabled and is_last_window) {
+            persistOpenAiChatTabsToHistoryStore(self.allocator);
             tab.dumpSessionToFile(self.allocator);
         }
     }
@@ -303,6 +309,101 @@ test "AppWindow: platform window callbacks use backend-neutral names" {
     try std.testing.expect(message_info.return_type.? == ?window_backend.MessageResult);
 }
 
+test "AppWindow: session restore hooks include AI chat and AI history tabs" {
+    const previous_chat_hook = tab.g_ai_restore_hook;
+    const previous_history_hook = tab.g_ai_history_restore_hook;
+    defer {
+        tab.g_ai_restore_hook = previous_chat_hook;
+        tab.g_ai_history_restore_hook = previous_history_hook;
+    }
+
+    tab.g_ai_restore_hook = null;
+    tab.g_ai_history_restore_hook = null;
+
+    installSessionRestoreHooks();
+
+    try std.testing.expect(tab.g_ai_restore_hook != null);
+    try std.testing.expect(tab.g_ai_history_restore_hook != null);
+}
+
+test "AppWindow: AI history restore snapshot rebuilds an SSH source" {
+    const source = aiHistorySourceFromSnap(.{
+        .source_id = "buildbox",
+        .target_kind = "ssh",
+        .target_name = "buildbox",
+    }) orelse return error.ExpectedSource;
+
+    try std.testing.expectEqualStrings("buildbox", source.id);
+    try std.testing.expectEqualStrings("buildbox", source.name);
+    switch (source.target) {
+        .ssh => |ssh| try std.testing.expectEqualStrings("buildbox", ssh.profile_name),
+        else => return error.ExpectedSshTarget,
+    }
+}
+
+test "AppWindow: open AI chat tabs are persisted to agent history before session dump" {
+    const allocator = std.testing.allocator;
+
+    const previous_store = g_agent_history;
+    const previous_tabs = tab.g_tabs;
+    const previous_count = tab.g_tab_count;
+    const previous_active = active_tab_state.g_active_tab;
+    defer {
+        g_agent_history = previous_store;
+        tab.g_tabs = previous_tabs;
+        tab.g_tab_count = previous_count;
+        active_tab_state.g_active_tab = previous_active;
+    }
+
+    tab.g_tabs = .{null} ** tab.MAX_TABS;
+    tab.g_tab_count = 0;
+    active_tab_state.g_active_tab = 0;
+
+    var store = agent_history.Store.init(allocator);
+    defer store.deinit();
+    g_agent_history = &store;
+
+    const session = try ai_chat.Session.init(
+        allocator,
+        "Agent",
+        "https://api.example.test",
+        "key",
+        "model",
+        "system",
+        "enabled",
+        "",
+        "false",
+        "true",
+    );
+
+    const tab_state = try allocator.create(tab.TabState);
+    tab_state.* = .{
+        .kind = .ai_chat,
+        .tree = .empty,
+        .focused = .root,
+        .ai_chat_session = session,
+        .ai_history_session = null,
+        .copilot_session = null,
+    };
+    defer {
+        tab_state.deinit(allocator);
+        allocator.destroy(tab_state);
+        tab.g_tabs[0] = null;
+        tab.g_tab_count = 0;
+    }
+
+    tab.g_tabs[0] = tab_state;
+    tab.g_tab_count = 1;
+
+    persistOpenAiChatTabsToHistoryStore(allocator);
+
+    var restored = try store.cloneRecordBySessionId(allocator, session.sessionId()) orelse return error.ExpectedHistoryRecord;
+    defer agent_history.freeOwnedRecord(allocator, &restored);
+
+    try std.testing.expectEqualStrings("Agent", restored.title);
+    try std.testing.expect(restored.agent_enabled);
+}
+
 // ============================================================================
 // Module-level state (will be moved into AppWindow struct in future)
 // ============================================================================
@@ -329,7 +430,7 @@ threadlocal var g_requested_weight: font_backend.FontWeight = .NORMAL;
 threadlocal var g_shader_path: ?[]const u8 = null;
 threadlocal var g_start_maximize: bool = false;
 threadlocal var g_start_fullscreen: bool = false;
-threadlocal var g_quake_mode: bool = true;
+threadlocal var g_quake_mode: bool = false;
 threadlocal var g_quake_hidden: bool = false;
 threadlocal var g_quake_frame: ?quick_terminal.Frame = null;
 threadlocal var g_quake_hotkey_registered: bool = false;
@@ -490,7 +591,11 @@ fn logFrameGeometryIfChanged(win: *window_backend.Window, fb_width: c_int, fb_he
 }
 
 fn glDiagString(name: gpu.c.GLenum) []const u8 {
-    const ptr = gpu.glTable().GetString.?(name);
+    // The Metal backend hands back a stub GlTable whose fn pointers are null
+    // (see renderer/gpu/metal/GlTable.zig). Guard the fn pointer itself, not
+    // just its return value, so render diagnostics don't panic on macOS.
+    const get_string = gpu.glTable().GetString orelse return "(unavailable)";
+    const ptr = get_string(name);
     if (ptr == null) return "(null)";
     return std.mem.span(@as([*:0]const u8, @ptrCast(ptr)));
 }
@@ -528,16 +633,22 @@ threadlocal var g_diag_last_swap_client_h: i32 = -1;
 fn logSwapDiagnosticsIfChanged(win: *window_backend.Window, fb_width: c_int, fb_height: c_int) void {
     if (!render_diagnostics.enabled()) return;
     const gl = gpu.glTable();
+    // Metal backend's GlTable is a stub with null fn pointers (see GlTable.zig);
+    // skip the GL-specific swap diagnostics there instead of panicking on `.?`.
+    // Geometry/DPI diagnostics are emitted by logFrameGeometryIfChanged, which
+    // doesn't touch GL, so the DPI log we care about for #90 still works.
+    const get_integerv = gl.GetIntegerv orelse return;
+    const is_enabled = gl.IsEnabled orelse return;
 
     var vp: [4]gpu.c.GLint = undefined;
-    gl.GetIntegerv.?(gpu.c.GL_VIEWPORT, &vp);
+    get_integerv(gpu.c.GL_VIEWPORT, &vp);
 
     var blend: [5]gpu.c.GLint = undefined;
-    blend[0] = @intFromBool(gl.IsEnabled.?(gpu.c.GL_BLEND) != 0);
-    gl.GetIntegerv.?(gpu.c.GL_BLEND_SRC_RGB, &blend[1]);
-    gl.GetIntegerv.?(gpu.c.GL_BLEND_DST_RGB, &blend[2]);
-    gl.GetIntegerv.?(gpu.c.GL_BLEND_SRC_ALPHA, &blend[3]);
-    gl.GetIntegerv.?(gpu.c.GL_BLEND_DST_ALPHA, &blend[4]);
+    blend[0] = @intFromBool(is_enabled(gpu.c.GL_BLEND) != 0);
+    get_integerv(gpu.c.GL_BLEND_SRC_RGB, &blend[1]);
+    get_integerv(gpu.c.GL_BLEND_DST_RGB, &blend[2]);
+    get_integerv(gpu.c.GL_BLEND_SRC_ALPHA, &blend[3]);
+    get_integerv(gpu.c.GL_BLEND_DST_ALPHA, &blend[4]);
 
     const client = window_backend.clientSize(win);
     const vp_matches_client = (vp[2] == client.width and vp[3] == client.height);
@@ -586,6 +697,43 @@ fn renderAiChatFrame(fb_width: c_int, fb_height: c_int, titlebar_offset: f32, le
     }
 }
 
+fn aiHistoryContentWidth(fb_width: c_int, left_panels_w: f32, right_panels_w: f32) f32 {
+    return @max(0, @as(f32, @floatFromInt(fb_width)) - left_panels_w - right_panels_w);
+}
+
+fn renderAiHistoryFrame(active_tab: *TabState, fb_width: c_int, fb_height: c_int, titlebar_offset: f32, left_panels_w: f32, right_panels_w: f32) void {
+    gpu.state.setViewport(0, 0, @intCast(fb_width), @intCast(fb_height));
+    gpu.gl_init.setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+    clearWithBackground(fb_width, fb_height);
+    titlebar.renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
+    titlebar.renderSidebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
+    markdown_preview_renderer.render(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset, 0);
+    file_explorer_renderer.render(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
+    if (active_tab.ai_history_session) |session| {
+        const draw: ai_history_renderer.DrawContext = .{
+            .bg = g_theme.background,
+            .fg = g_theme.foreground,
+            .accent = g_theme.cursor_color,
+            .cell_h = font.g_titlebar_cell_height,
+            .fillQuad = ui_pipeline.fillQuad,
+            .fillQuadAlpha = ui_pipeline.fillQuadAlpha,
+            .renderTextLimited = titlebar.renderTextLimited,
+            .glyphAdvance = titlebar.titlebarGlyphAdvance,
+        };
+        session.mutex.lock();
+        defer session.mutex.unlock();
+        ai_history_renderer.render(
+            draw,
+            session,
+            @floatFromInt(fb_width),
+            @floatFromInt(fb_height),
+            titlebar_offset,
+            left_panels_w,
+            aiHistoryContentWidth(fb_width, left_panels_w, right_panels_w),
+        );
+    }
+}
+
 fn renderAiCopilotPanel(fb_width: c_int, fb_height: c_int, titlebar_offset: f32) void {
     if (!aiCopilotVisible()) return;
     const session = ensureActiveCopilotSession() orelse return;
@@ -606,6 +754,411 @@ pub fn activeSurface() ?*Surface {
 
 pub fn activeAiChat() ?*ai_chat.Session {
     return tab.activeAiChat();
+}
+
+pub fn activeAiHistory() ?*ai_history_session.Session {
+    const active = activeTab() orelse return null;
+    if (active.kind != .ai_history) return null;
+    return active.ai_history_session;
+}
+
+pub fn aiHistoryInsertCodepoint(codepoint: u21) bool {
+    const session = activeAiHistory() orelse return false;
+    if (codepoint == ' ') return aiHistoryPreviewSelectedTranscript();
+    if (codepoint < 0x20 or codepoint == 0x7f) return false;
+    var buf: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(codepoint, &buf) catch return false;
+    session.mutex.lock();
+    session.appendFilterBytes(buf[0..len]);
+    session.mutex.unlock();
+    markUiDirty();
+    return true;
+}
+
+pub fn aiHistoryBackspaceFilter() bool {
+    const session = activeAiHistory() orelse return false;
+    session.mutex.lock();
+    session.backspaceFilter();
+    session.mutex.unlock();
+    markUiDirty();
+    return true;
+}
+
+pub fn aiHistoryMoveSelection(delta: isize) bool {
+    const session = activeAiHistory() orelse return false;
+    session.mutex.lock();
+    session.moveSelection(delta);
+    session.ensureSelectionVisible(aiHistoryListVisibleRowsForWindow());
+    session.mutex.unlock();
+    markUiDirty();
+    return true;
+}
+
+pub fn aiHistoryCycleCategory(delta: isize) bool {
+    const session = activeAiHistory() orelse return false;
+    session.cycleCategory(delta);
+    session.ensureSelectionVisible(aiHistoryListVisibleRowsForWindow());
+    markUiDirty();
+    return true;
+}
+
+pub fn aiHistoryPreviewSelectedTranscript() bool {
+    const session = activeAiHistory() orelse return false;
+    const allocator = g_allocator orelse return false;
+    startAiHistoryTranscript(allocator, session);
+    return true;
+}
+
+/// Scroll the transcript preview by `delta` wrapped visual lines (negative
+/// scrolls up). The renderer clamps the offset against the content height.
+pub fn aiHistoryScrollTranscript(delta: isize) bool {
+    const session = activeAiHistory() orelse return false;
+    session.mutex.lock();
+    session.scrollTranscriptBy(delta);
+    session.mutex.unlock();
+    markUiDirty();
+    return true;
+}
+
+/// Scroll the DATE navigator's day list by `delta` rows (negative scrolls up).
+/// The renderer clamps the offset against the visible capacity each frame.
+pub fn aiHistoryScrollDateList(delta: isize) bool {
+    const session = activeAiHistory() orelse return false;
+    session.mutex.lock();
+    session.scrollDateBy(delta);
+    session.mutex.unlock();
+    markUiDirty();
+    return true;
+}
+
+pub fn aiHistoryLoadSelectedTranscript() bool {
+    return resumeAiHistorySelection();
+}
+
+pub fn resumeAiHistorySelection() bool {
+    const active = tab.activeTab() orelse return false;
+    if (active.kind != .ai_history) return false;
+    const session = active.ai_history_session orelse return false;
+    const allocator = g_allocator orelse return false;
+
+    session.mutex.lock();
+    const selected = session.selectedVisible();
+    const meta_clone: ?ai_history_types.SessionMeta = if (selected) |m|
+        (ai_history_session.cloneMetadata(allocator, m) catch null)
+    else
+        null;
+    session.mutex.unlock();
+
+    const meta = meta_clone orelse return false;
+    defer ai_history_session.freeMetadata(allocator, meta);
+    return spawnResumeTerminal(session.source.target, meta);
+}
+
+pub fn spawnResumeTerminal(target: ai_history_source.Target, meta: ai_history_types.SessionMeta) bool {
+    var resume_buf: [512]u8 = undefined;
+    const resume_cmd = ai_history_resume.resumeCommand(meta, &resume_buf) catch |err| {
+        log.warn("failed to build AI History provider resume command for {s}: {}", .{ meta.session_id, err });
+        return failAiHistoryResumePathUnavailable();
+    };
+
+    var checked_buf: [2048]u8 = undefined;
+    const checked_cmd = ai_history_resume.checkedPosixResume(resume_cmd, meta.project_dir, &checked_buf) catch |err| {
+        log.warn("failed to build AI History checked resume command for {s}: {}", .{ meta.session_id, err });
+        return failAiHistoryResumePathUnavailable();
+    };
+
+    var command_buf: [4096]u8 = undefined;
+    switch (target) {
+        .local => {
+            var native_checked_buf: [2048]u8 = undefined;
+            const local_checked_cmd = switch (platform_pty_command.backend()) {
+                .windows => ai_history_resume.checkedPowerShellResume(meta, &native_checked_buf) catch |err| {
+                    log.warn("failed to build AI History PowerShell resume command for {s}: {}", .{ meta.session_id, err });
+                    return failAiHistoryResumePathUnavailable();
+                },
+                .unsupported => checked_cmd,
+            };
+            const command = platform_pty_command.localShellInitialCommand(command_buf[0..], tab.getShellCmd(), local_checked_cmd) orelse return failAiHistoryResumePathUnavailable();
+            if (spawnTabWithCommandUtf8(command)) return true;
+            overlays.showStatusToast("AI History resume failed");
+            return false;
+        },
+        .wsl => {
+            const command = platform_pty_command.wslShellCommand(command_buf[0..], checked_cmd) orelse return failAiHistoryResumePathUnavailable();
+            if (spawnTabWithCommandUtf8(command)) return true;
+            overlays.showStatusToast("AI History resume failed");
+            return false;
+        },
+        .ssh => |ssh| {
+            return switch (overlays.aiHistoryConnectSshProfile(ssh.profile_name, checked_cmd)) {
+                .connected => true,
+                .not_found => {
+                    overlays.showStatusToast("AI History resume failed: SSH profile unavailable");
+                    return false;
+                },
+                .failed => {
+                    overlays.showStatusToast("AI History resume failed");
+                    return false;
+                },
+            };
+        },
+    }
+}
+
+fn failAiHistoryResumePathUnavailable() bool {
+    overlays.showStatusToast("AI History resume failed: project path unavailable");
+    markUiDirty();
+    return false;
+}
+
+pub fn aiHistoryScanLocalNow() bool {
+    const session = activeAiHistory() orelse return false;
+    const allocator = g_allocator orelse return false;
+    startAiHistoryScan(allocator, session);
+    return true;
+}
+
+/// Everything a background AI History worker needs, snapshotted on the UI thread.
+/// `ssh` carries a copied `SshConnection` value (inline buffers, no threadlocal
+/// pointers). `local`/`wsl` resolve their inputs inside the worker.
+const AiHistoryTarget = union(enum) {
+    local,
+    wsl,
+    ssh: ssh_connection.SshConnection,
+};
+
+const AiHistoryScanJob = struct {
+    target: AiHistoryTarget,
+
+    fn run(ctx: *anyopaque, allocator: std.mem.Allocator, source: ai_history_source.Source, sink: ?ai_history_session.ScanSink) anyerror!ai_history_session.ScanResult {
+        const job: *AiHistoryScanJob = @ptrCast(@alignCast(ctx));
+        switch (job.target) {
+            .local => {
+                const home = try localHomeForAiHistory(allocator);
+                defer allocator.free(home);
+                var parsed_cache = ai_history_cache.loadDefault(allocator) catch null;
+                defer if (parsed_cache) |*cache| cache.deinit();
+                var host_state = ai_history_session.LocalScannerHost{
+                    .home = home,
+                    .cache = if (parsed_cache) |cache| cache.value else null,
+                };
+                const host = host_state.scannerHost();
+                return host.scan(host.ctx, allocator, source, sink);
+            },
+            .wsl => {
+                var parsed_cache = ai_history_cache.loadDefault(allocator) catch null;
+                defer if (parsed_cache) |*cache| cache.deinit();
+                var host_state = ai_history_session.WslScannerHost{
+                    .cache = if (parsed_cache) |cache| cache.value else null,
+                };
+                const host = host_state.scannerHost();
+                return host.scan(host.ctx, allocator, source, sink);
+            },
+            .ssh => |conn| {
+                var parsed_cache = ai_history_cache.loadDefault(allocator) catch null;
+                defer if (parsed_cache) |*cache| cache.deinit();
+                var host_state = ai_history_session.SshScannerHost{
+                    .conn = conn,
+                    .cache = if (parsed_cache) |cache| cache.value else null,
+                };
+                const host = host_state.scannerHost();
+                return host.scan(host.ctx, allocator, source, sink);
+            },
+        }
+    }
+
+    fn destroy(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const job: *AiHistoryScanJob = @ptrCast(@alignCast(ctx));
+        allocator.destroy(job);
+    }
+};
+
+const AiHistoryTranscriptJob = struct {
+    target: AiHistoryTarget,
+    meta: ai_history_types.SessionMeta, // owned clone
+
+    fn run(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]ai_history_types.TranscriptMessage {
+        const job: *AiHistoryTranscriptJob = @ptrCast(@alignCast(ctx));
+        switch (job.target) {
+            .local => {
+                var host_state = ai_history_session.LocalScannerHost{ .home = "" };
+                const host = host_state.scannerHost();
+                return host.loadTranscript(host.ctx, allocator, job.meta);
+            },
+            .wsl => {
+                var host_state = ai_history_session.WslScannerHost{};
+                const host = host_state.scannerHost();
+                return host.loadTranscript(host.ctx, allocator, job.meta);
+            },
+            .ssh => |conn| {
+                var host_state = ai_history_session.SshScannerHost{ .conn = conn };
+                const host = host_state.scannerHost();
+                return host.loadTranscript(host.ctx, allocator, job.meta);
+            },
+        }
+    }
+
+    fn destroy(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const job: *AiHistoryTranscriptJob = @ptrCast(@alignCast(ctx));
+        ai_history_session.freeMetadata(allocator, job.meta);
+        allocator.destroy(job);
+    }
+};
+
+/// Snapshot the source's target into a worker-safe value (UI thread). Returns
+/// null only when an SSH profile cannot be resolved.
+fn aiHistoryTargetSnapshot(target: ai_history_source.Target) ?AiHistoryTarget {
+    return switch (target) {
+        .local => .local,
+        .wsl => .wsl,
+        .ssh => |ssh| .{ .ssh = overlays.aiHistorySshConnection(ssh.profile_name) orelse return null },
+    };
+}
+
+/// Kick off an async scan for `session`. UI thread. On setup failure marks the
+/// session failed instead of spawning a doomed worker.
+fn startAiHistoryScan(allocator: std.mem.Allocator, session: *ai_history_session.Session) void {
+    const target = aiHistoryTargetSnapshot(session.source.target) orelse {
+        session.mutex.lock();
+        session.state = .failed;
+        session.status = "SSH profile unavailable";
+        session.mutex.unlock();
+        return;
+    };
+    const job = allocator.create(AiHistoryScanJob) catch {
+        session.mutex.lock();
+        session.state = .failed;
+        session.status = "Scan failed";
+        session.mutex.unlock();
+        return;
+    };
+    job.* = .{ .target = target };
+    session.scanAsync(.{ .ctx = job, .run = AiHistoryScanJob.run, .destroy = AiHistoryScanJob.destroy });
+}
+
+/// Kick off an async transcript load for the selected row. UI thread.
+fn startAiHistoryTranscript(allocator: std.mem.Allocator, session: *ai_history_session.Session) void {
+    session.mutex.lock();
+    const selected = session.selectedVisible();
+    const meta_clone: ?ai_history_types.SessionMeta = if (selected) |m|
+        (ai_history_session.cloneMetadata(allocator, m) catch |err| blk: {
+            log.warn("failed to clone ai history metadata for transcript: {}", .{err});
+            break :blk null;
+        })
+    else
+        null;
+    session.mutex.unlock();
+
+    const meta = meta_clone orelse return;
+
+    const target = aiHistoryTargetSnapshot(session.source.target) orelse {
+        ai_history_session.freeMetadata(allocator, meta);
+        session.mutex.lock();
+        session.transcript_state = .failed;
+        session.transcript_status = "SSH profile unavailable";
+        session.mutex.unlock();
+        return;
+    };
+    const job = allocator.create(AiHistoryTranscriptJob) catch {
+        ai_history_session.freeMetadata(allocator, meta);
+        session.mutex.lock();
+        session.transcript_state = .failed;
+        session.transcript_status = "Transcript failed";
+        session.mutex.unlock();
+        return;
+    };
+    job.* = .{ .target = target, .meta = meta };
+    session.loadTranscriptAsync(.{
+        .ctx = job,
+        .provider = job.meta.provider,
+        .run = AiHistoryTranscriptJob.run,
+        .destroy = AiHistoryTranscriptJob.destroy,
+    });
+}
+
+pub fn aiHistoryHandleMousePress(xpos: f64, ypos: f64) bool {
+    const session = activeAiHistory() orelse return false;
+    const win = g_window orelse return true;
+    const fb = window_backend.framebufferSize(win);
+    const left = leftPanelsWidth();
+    const right = rightPanelsWidthForWindow(fb.width);
+    const width = @as(f32, @floatFromInt(fb.width)) - left - right;
+    const visible_rows = ai_history_renderer.listVisibleCapacity(@floatFromInt(fb.height), currentTitlebarHeight(), font.g_titlebar_cell_height);
+
+    session.mutex.lock();
+    const hit = ai_history_renderer.interactionHitTest(
+        session,
+        @floatFromInt(fb.width),
+        @floatFromInt(fb.height),
+        currentTitlebarHeight(),
+        left,
+        width,
+        font.g_titlebar_cell_height,
+        xpos,
+        ypos,
+    );
+    session.mutex.unlock();
+
+    switch (hit) {
+        .none => {},
+        .refresh => {
+            _ = aiHistoryScanLocalNow();
+            return true;
+        },
+        .@"resume" => {
+            _ = resumeAiHistorySelection();
+            markUiDirty();
+            return true;
+        },
+        .category => |cat| {
+            session.setCategory(cat);
+            session.ensureSelectionVisible(visible_rows);
+            markUiDirty();
+            return true;
+        },
+        .date => |k| {
+            session.setDateFilter(k);
+            session.ensureSelectionVisible(visible_rows);
+            markUiDirty();
+            return true;
+        },
+        .row => |visible_index| {
+            // Re-lock independently of the hit-test above: a worker may have
+            // replaced rows in between, but selectVisibleIndex clamps to the
+            // current visible count, so a now-stale index is safe.
+            session.mutex.lock();
+            session.selectVisibleIndex(visible_index);
+            session.ensureSelectionVisible(visible_rows);
+            session.mutex.unlock();
+            markUiDirty();
+            return true;
+        },
+    }
+    markUiDirty();
+    return true;
+}
+
+fn markUiDirty() void {
+    g_force_rebuild = true;
+    g_cells_valid = false;
+}
+
+fn aiHistoryListVisibleRowsForWindow() usize {
+    const win = g_window orelse return 1;
+    const fb = window_backend.framebufferSize(win);
+    return ai_history_renderer.listVisibleCapacity(@floatFromInt(fb.height), currentTitlebarHeight(), font.g_titlebar_cell_height);
+}
+
+fn localHomeForAiHistory(allocator: std.mem.Allocator) ![]u8 {
+    if (std.process.getEnvVarOwned(allocator, "USERPROFILE")) |value| {
+        if (value.len > 0) return value;
+        allocator.free(value);
+    } else |_| {}
+    if (std.process.getEnvVarOwned(allocator, "HOME")) |value| {
+        if (value.len > 0) return value;
+        allocator.free(value);
+    } else |_| {}
+    return error.NoHomeDirectory;
 }
 
 pub fn exportActiveAiChatMarkdown(mode: ai_chat.MarkdownExportMode) void {
@@ -889,6 +1442,13 @@ fn ensureGlobalAgentHistoryStore(allocator: std.mem.Allocator) !void {
     g_agent_history_revision = 0;
 }
 
+fn installSessionRestoreHooks() void {
+    // AppWindow owns the stores needed to rebuild non-terminal tab kinds, so
+    // tab.zig routes persisted AI snapshots back through these hooks.
+    tab.g_ai_restore_hook = reopenAiChatTabFromHistorySessionId;
+    tab.g_ai_history_restore_hook = reopenAiHistoryTabFromSnapshot;
+}
+
 fn deinitGlobalAgentHistoryStore(allocator: std.mem.Allocator) void {
     flushAgentHistoryStoreIfDirty(true);
 
@@ -917,6 +1477,31 @@ fn saveAiHistoryChangeEvent(event: ai_chat.HistoryChangeEvent) void {
         return;
     };
     markAgentHistoryDirtyLocked();
+}
+
+fn persistOpenAiChatTabsToHistoryStore(allocator: std.mem.Allocator) void {
+    for (0..tab.g_tab_count) |idx| {
+        const tab_state = tab.g_tabs[idx] orelse continue;
+        if (tab_state.kind != .ai_chat) continue;
+        const session = tab_state.ai_chat_session orelse continue;
+
+        var record = session.toHistoryRecord(allocator) catch |err| {
+            log.warn("failed to snapshot open AI tab for session restore: {}", .{err});
+            continue;
+        };
+
+        g_agent_history_mutex.lock();
+        if (g_agent_history) |store| {
+            if (store.upsertRecord(record)) {
+                markAgentHistoryDirtyLocked();
+            } else |err| {
+                log.warn("failed to persist open AI tab {s}: {}", .{ record.session_id, err });
+            }
+        }
+        g_agent_history_mutex.unlock();
+
+        agent_history.freeOwnedRecord(allocator, &record);
+    }
 }
 
 fn markAgentHistoryDirtyLocked() void {
@@ -1088,6 +1673,14 @@ pub fn spawnAiChatTab(
     return true;
 }
 
+pub fn spawnAiHistoryTab(source: ai_history_source.Source) bool {
+    const allocator = g_allocator orelse return false;
+    if (!tab.spawnAiHistoryTab(allocator, source)) return false;
+    clearUiStateOnTabChange();
+    if (activeAiHistory()) |session| startAiHistoryScan(allocator, session);
+    return true;
+}
+
 pub fn reopenAiChatTabFromHistorySessionId(session_id: []const u8) bool {
     if (tab.switchToAiTabBySessionId(session_id)) {
         clearUiStateOnTabChange();
@@ -1108,6 +1701,39 @@ pub fn reopenAiChatTabFromHistorySessionId(session_id: []const u8) bool {
     if (!tab.spawnAiChatTabFromHistoryRecord(allocator, owned_record)) return false;
     clearUiStateOnTabChange();
     return true;
+}
+
+fn aiHistorySourceFromSnap(snap: session_persist.AiHistorySnap) ?ai_history_source.Source {
+    if (snap.source_id.len == 0) return null;
+    const name = if (snap.target_name.len > 0) snap.target_name else snap.source_id;
+
+    if (std.ascii.eqlIgnoreCase(snap.target_kind, "local")) {
+        return .{
+            .id = snap.source_id,
+            .name = name,
+            .target = .local,
+        };
+    }
+    if (std.ascii.eqlIgnoreCase(snap.target_kind, "wsl")) {
+        return .{
+            .id = snap.source_id,
+            .name = name,
+            .target = .{ .wsl = .{} },
+        };
+    }
+    if (std.ascii.eqlIgnoreCase(snap.target_kind, "ssh")) {
+        return .{
+            .id = snap.source_id,
+            .name = name,
+            .target = .{ .ssh = .{ .profile_name = name } },
+        };
+    }
+    return null;
+}
+
+fn reopenAiHistoryTabFromSnapshot(snap: session_persist.AiHistorySnap) bool {
+    const source = aiHistorySourceFromSnap(snap) orelse return false;
+    return spawnAiHistoryTab(source);
 }
 
 pub fn deleteAiChatHistorySessionId(session_id: []const u8) bool {
@@ -1333,6 +1959,8 @@ pub threadlocal var window_focused: bool = true; // Track window focus state
 // Window state persistence.
 const loadWindowState = platform_window_state.loadWindowState;
 const saveWindowGeometry = platform_window_state.saveWindowGeometry;
+const loadQuakeFrame = platform_window_state.loadQuakeFrame;
+const saveQuakeFrame = platform_window_state.saveQuakeFrame;
 
 // Pending resize state (resize is deferred to main loop to avoid PageList integrity issues)
 // Ghostty coalesces resize events with a 25ms timer to batch rapid resizes
@@ -1517,6 +2145,8 @@ fn onPlatformResize(width: i32, height: i32) void {
         if (split_count <= 1) {
             if (active_tab.kind == .ai_chat) {
                 renderAiChatFrame(fb_width, fb_height, titlebar_offset, left_panels_w, right_panels_w);
+            } else if (active_tab.kind == .ai_history) {
+                renderAiHistoryFrame(active_tab, fb_width, fb_height, titlebar_offset, left_panels_w, right_panels_w);
             } else if (activeSurface()) |surface| {
                 // Single surface: simple render path
                 const rend = &surface.surface_renderer;
@@ -1619,6 +2249,7 @@ fn onPlatformResize(width: i32, height: i32) void {
     overlays.renderTransferCancelConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
     overlays.renderUpdatePrompt(@floatFromInt(fb_width), @floatFromInt(fb_height));
     overlays.renderWindowCloseConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
+    overlays.renderRestoreDefaultsConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
 
     render_diagnostics.log(
         "platform-resize swap fb={}x{} term={}x{} draw_calls={}",
@@ -2041,6 +2672,10 @@ fn buildRemoteLayoutJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmana
             try appendRemoteAiChatTabJson(allocator, out, tab_state, tab_index);
             continue;
         }
+        if (tab_state.kind == .ai_history) {
+            try appendRemoteAiHistoryTabJson(allocator, out, tab_state, tab_index);
+            continue;
+        }
 
         try out.appendSlice(allocator, "{\"index\":");
         try out.print(allocator, "{d}", .{tab_index});
@@ -2120,6 +2755,12 @@ fn buildRemoteLayoutJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmana
 fn remoteAiSurfaceId(tab_index: usize) [16]u8 {
     var id: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&id, "aichat{d:0>10}", .{tab_index}) catch unreachable;
+    return id;
+}
+
+fn remoteAiHistorySurfaceId(tab_index: usize) [16]u8 {
+    var id: [16]u8 = undefined;
+    _ = std.fmt.bufPrint(&id, "aihist{d:0>10}", .{tab_index}) catch unreachable;
     return id;
 }
 
@@ -2229,6 +2870,36 @@ fn appendRemoteAiChatTabJson(
     try out.appendSlice(allocator, ",\"requestStopping\":");
     try out.appendSlice(allocator, if (request_state.stopping) "true" else "false");
     try out.appendSlice(allocator, ",\"x\":0,\"y\":0,\"w\":1,\"h\":1}]}");
+}
+
+fn appendRemoteAiHistoryTabJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    tab_state: *tab.TabState,
+    tab_index: usize,
+) !void {
+    const surface_id = remoteAiHistorySurfaceId(tab_index);
+    const title_text = tab_state.getTitle();
+
+    try out.appendSlice(allocator, "{\"index\":");
+    try out.print(allocator, "{d}", .{tab_index});
+    try out.appendSlice(allocator, ",\"title\":\"");
+    try remote.appendJsonString(out, allocator, title_text);
+    try out.appendSlice(allocator, "\",\"focusedSurfaceId\":\"");
+    try remote.appendJsonString(out, allocator, surface_id[0..]);
+    try out.append(allocator, '"');
+    try appendAgentDetectionJson(allocator, out, null);
+    try out.appendSlice(allocator, ",\"surfaces\":[{\"id\":\"");
+    try remote.appendJsonString(out, allocator, surface_id[0..]);
+    try out.appendSlice(allocator, "\",\"title\":\"");
+    try remote.appendJsonString(out, allocator, title_text);
+    try out.appendSlice(allocator, "\",\"focused\":true");
+    try appendAgentDetectionJson(allocator, out, null);
+    // AI History is read-only in remote layouts. Keep it terminal-style so the
+    // remote client does not show AI Chat composer/input affordances.
+    try out.appendSlice(allocator, ",\"kind\":\"terminal\",\"readOnly\":true,\"cols\":120,\"rows\":30,\"cursorX\":0,\"cursorY\":0,\"snapshot\":\"AI History\\n");
+    try remote.appendJsonString(out, allocator, title_text);
+    try out.appendSlice(allocator, "\",\"x\":0,\"y\":0,\"w\":1,\"h\":1}]}");
 }
 
 fn handleRemoteAiInputRequest(request: *RemoteAiInputRequest) void {
@@ -3901,7 +4572,14 @@ fn runMainLoop(self: *AppWindow) !void {
     const target_fb_height: i32 = @intFromFloat(desired_grid_height + total_height_padding);
 
     if (g_quake_mode) {
-        applyQuakeFrame(&backend_window, false);
+        // Seed the remembered frame from disk so the drop-down reopens at the
+        // user's last size/position. applyQuakeFrame(.., true) validates it
+        // against the current monitor work area and falls back to the default
+        // frame if it no longer fits (resolution / monitor change).
+        if (loadQuakeFrame(allocator)) |qf| {
+            g_quake_frame = .{ .x = qf.x, .y = qf.y, .width = qf.width, .height = qf.height };
+        }
+        applyQuakeFrame(&backend_window, true);
     } else if (size_from_config and term_cols > 0 and term_rows > 0) {
         window_backend.resizeClientArea(&backend_window, target_fb_width, target_fb_height);
     } else if (saved_fb_w) |sw| {
@@ -4156,7 +4834,7 @@ fn runMainLoop(self: *AppWindow) !void {
             const split_count = computeSplitLayout(active_tab, content_x, content_y, content_w, content_h, font.cell_width, font.cell_height);
             syncRemoteLayout(allocator);
             syncImeCaretPosition(win, split_count);
-            if (active_tab.kind != .ai_chat and synchronizedOutputPendingForVisibleSplits(split_count)) {
+            if (active_tab.kind != .ai_chat and active_tab.kind != .ai_history and synchronizedOutputPendingForVisibleSplits(split_count)) {
                 std.Thread.sleep(std.time.ns_per_ms);
                 continue;
             }
@@ -4165,6 +4843,8 @@ fn runMainLoop(self: *AppWindow) !void {
             // GL rendering
             if (active_tab.kind == .ai_chat) {
                 renderAiChatFrame(fb_width, fb_height, titlebar_offset, left_panels_w, right_panels_w);
+            } else if (active_tab.kind == .ai_history) {
+                renderAiHistoryFrame(active_tab, fb_width, fb_height, titlebar_offset, left_panels_w, right_panels_w);
             } else if (post_process.g_post_enabled) {
                 // Post-processing path: only render focused surface for now
                 if (activeSurface()) |surface| {
@@ -4313,6 +4993,7 @@ fn runMainLoop(self: *AppWindow) !void {
         overlays.renderTransferCancelConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
         overlays.renderUpdatePrompt(@floatFromInt(fb_width), @floatFromInt(fb_height));
         overlays.renderWindowCloseConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
+        overlays.renderRestoreDefaultsConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
         renderImePreedit(win, fb_width, fb_height);
 
         logSwapDiagnosticsIfChanged(win, fb_width, fb_height);
@@ -4321,9 +5002,17 @@ fn runMainLoop(self: *AppWindow) !void {
     }
 
     // Save window position + size for next session
-    if (!g_quake_mode and g_window != null) {
-        const w = g_window.?;
-        if (window_backend.windowRect(w)) |rect| {
+    if (g_window) |w| {
+        if (g_quake_mode) {
+            // Persist the drop-down outer frame so it reopens where the user left
+            // it. rememberQuakeFrame refreshes g_quake_frame from the live window
+            // (skipping degenerate / off-work-area frames); persist whatever it
+            // leaves, falling back to a frame captured on the last hide.
+            rememberQuakeFrame(w);
+            if (g_quake_frame) |f| {
+                saveQuakeFrame(allocator, f.x, f.y, f.width, f.height);
+            }
+        } else if (window_backend.windowRect(w)) |rect| {
             const is_maximized = window_backend.isMaximized(w);
             if (!is_maximized and !window_backend.isFullscreen(w)) {
                 const fb = window_backend.framebufferSize(w);
@@ -4370,4 +5059,47 @@ test "appwindow: syncDefaultShellCommandFromConfig refreshes tab default shell" 
     const expected_len = platform_pty_command.resolveShellCommandLine(&expected_buf, test_shell);
     const CommandUnit = @TypeOf(expected_buf[0]);
     try testing.expectEqualSlices(CommandUnit, expected_buf[0..expected_len], tab.getShellCmd());
+}
+
+test "appwindow: ai history content width accounts for right panels" {
+    try std.testing.expectEqual(@as(f32, 700), aiHistoryContentWidth(1000, 200, 100));
+    try std.testing.expectEqual(@as(f32, 0), aiHistoryContentWidth(250, 200, 100));
+}
+
+test "appwindow: remote layout serializes ai_history as non-terminal surface" {
+    const allocator = std.testing.allocator;
+    for (0..tab.MAX_TABS) |idx| tab.g_tabs[idx] = null;
+    tab.g_tab_count = 0;
+    active_tab_state.g_active_tab = 0;
+    defer {
+        for (0..tab.MAX_TABS) |idx| tab.g_tabs[idx] = null;
+        tab.g_tab_count = 0;
+        active_tab_state.g_active_tab = 0;
+    }
+
+    var session = @import("ai_history_session.zig").Session.init(allocator, .{
+        .id = "local-history",
+        .name = "Local History",
+        .target = .local,
+    });
+    defer session.deinit();
+    var tab_state = tab.TabState{
+        .kind = .ai_history,
+        .tree = .empty,
+        .focused = .root,
+        .ai_chat_session = null,
+        .ai_history_session = &session,
+        .copilot_session = null,
+    };
+    tab.g_tabs[0] = &tab_state;
+    tab.g_tab_count = 1;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    try buildRemoteLayoutJson(allocator, &out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"kind\":\"terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"kind\":\"ai_chat\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"readOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"surfaces\":[]") == null);
 }
