@@ -24,6 +24,8 @@ const sync_output = @import("sync_output.zig");
 const notification = @import("notification.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
 const platform_process = @import("platform/process.zig");
+const ssh_connection_mod = @import("ssh_connection.zig");
+const clipboard_osc52 = @import("clipboard_osc52.zig");
 
 const Surface = @This();
 
@@ -66,40 +68,7 @@ const WISPTERM_IMAGE_OSC_MAX = 16 * 1024;
 /// Coarse launch environment for terminal-side integrations such as path paste.
 pub const LaunchKind = platform_pty_command.LaunchKind;
 
-pub const SshConnection = struct {
-    user_buf: [128]u8 = undefined,
-    user_len: usize = 0,
-    host_buf: [128]u8 = undefined,
-    host_len: usize = 0,
-    port_buf: [16]u8 = undefined,
-    port_len: usize = 0,
-    password_buf: [128]u8 = undefined,
-    password_len: usize = 0,
-    proxy_jump_buf: [256]u8 = undefined,
-    proxy_jump_len: usize = 0,
-    password_auth: bool = false,
-    legacy_algorithms: bool = false,
-
-    pub fn user(self: *const SshConnection) []const u8 {
-        return self.user_buf[0..self.user_len];
-    }
-
-    pub fn proxyJump(self: *const SshConnection) []const u8 {
-        return self.proxy_jump_buf[0..self.proxy_jump_len];
-    }
-
-    pub fn host(self: *const SshConnection) []const u8 {
-        return self.host_buf[0..self.host_len];
-    }
-
-    pub fn port(self: *const SshConnection) []const u8 {
-        return self.port_buf[0..self.port_len];
-    }
-
-    pub fn password(self: *const SshConnection) []const u8 {
-        return self.password_buf[0..self.password_len];
-    }
-};
+pub const SshConnection = ssh_connection_mod.SshConnection;
 
 // ============================================================================
 // VT stream handler — wraps ghostty's readonly handler to intercept bell
@@ -143,6 +112,14 @@ pub const VtHandler = struct {
                 value.title,
                 value.body,
             );
+            return;
+        }
+
+        // OSC 52 clipboard writes: ghostty's read-only handler discards these,
+        // so we decode the payload here and hand the text to the main thread,
+        // which owns the system clipboard.
+        if (action == .clipboard_contents) {
+            self.surface.ingestClipboardWrite(value.kind, value.data);
             return;
         }
 
@@ -243,6 +220,16 @@ last_bell_time: i64 = 0,
 
 /// Notifications pushed by the IO reader thread, drained on the main thread.
 notif_queue: notification.Queue = .{},
+
+// ============================================================================
+// OSC 52 clipboard write state
+// ============================================================================
+
+/// Pending OSC 52 clipboard text, decoded by the IO reader thread and drained
+/// by the main thread (which owns the platform clipboard). Latest write wins:
+/// a new sequence frees and replaces an undrained one. Owned by `allocator`.
+clipboard_write_pending: ?[]u8 = null,
+clipboard_write_mutex: std.Thread.Mutex = .{},
 /// Last delivered notification's content hash + time, for dedup / rate limit.
 last_notif_hash: u64 = 0,
 last_notif_time: i64 = 0,
@@ -407,6 +394,11 @@ pub fn init(
     surface.last_notif_hash = 0;
     surface.last_notif_time = 0;
 
+    // OSC 52 clipboard write state. Same caveat as notif_queue above: the mutex
+    // must be explicitly initialized or its first lock corrupts on garbage memory.
+    surface.clipboard_write_pending = null;
+    surface.clipboard_write_mutex = .{};
+
     // Initialize mailbox for main thread → IO writer communication
     surface.mailbox = try termio.Mailbox.init();
     errdefer surface.mailbox.deinit();
@@ -531,6 +523,10 @@ pub fn deinit(self: *Surface, allocator: std.mem.Allocator) void {
     self.mailbox.deinit();
 
     // 3. Now safe to tear down everything — no other thread is accessing.
+    if (self.clipboard_write_pending) |pending| {
+        self.allocator.free(pending);
+        self.clipboard_write_pending = null;
+    }
     self.wispterm_image_osc_buf.deinit(allocator);
     self.vt_stream.deinit();
     self.command.deinit();
@@ -802,6 +798,30 @@ fn captureInitialCwd(self: *Surface, cwd: platform_pty_command.Cwd) void {
 /// Reset OSC batch state — call before each PTY read batch.
 pub fn resetOscBatch(self: *Surface) void {
     self.got_osc7_this_batch = false;
+}
+
+/// Decode an OSC 52 clipboard write (IO reader thread) and stage it for the
+/// main thread. Read queries / clears / undecodable payloads are dropped.
+pub fn ingestClipboardWrite(self: *Surface, kind: u8, data: []const u8) void {
+    const action = clipboard_osc52.decode(self.allocator, kind, data) catch return;
+    const text = switch (action) {
+        .write => |t| t,
+        .ignore => return,
+    };
+    self.clipboard_write_mutex.lock();
+    defer self.clipboard_write_mutex.unlock();
+    if (self.clipboard_write_pending) |old| self.allocator.free(old);
+    self.clipboard_write_pending = text;
+}
+
+/// Take ownership of any pending OSC 52 clipboard text (main thread). The
+/// caller must free the returned slice with `self.allocator`.
+pub fn takeClipboardWrite(self: *Surface) ?[]u8 {
+    self.clipboard_write_mutex.lock();
+    defer self.clipboard_write_mutex.unlock();
+    const text = self.clipboard_write_pending;
+    self.clipboard_write_pending = null;
+    return text;
 }
 
 /// Track DEC synchronized output mode (2026) transitions. This mirrors

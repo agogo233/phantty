@@ -9,33 +9,44 @@ const builtin = @import("builtin");
 const ai_chat_input_text = @import("ai_chat_input_text.zig");
 const input_key = @import("input/key.zig");
 const platform_agent_prompt = @import("platform/agent_prompt.zig");
-const platform_dirs = @import("platform/dirs.zig");
 const platform_process = @import("platform/process.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
-const agent_detector = @import("agent_detector.zig");
 const agent_history = @import("agent_history.zig");
 const skill_registry = @import("skill_registry.zig");
 const command_registry = @import("command_registry.zig");
-const wispterm_docs = @import("wispterm_docs.zig");
 const markdown_text = @import("markdown_text.zig");
 const ai_chat_protocol = @import("ai_chat_protocol.zig");
 const ai_chat_composer = @import("ai_chat_composer.zig");
+const ai_chat_skills = @import("ai_chat_skills.zig");
+const ai_chat_types = @import("ai_chat_types.zig");
+const ai_chat_tools = @import("ai_chat_tools.zig");
+const ai_chat_markdown = @import("ai_chat_markdown.zig");
 const weixin_types = @import("weixin/types.zig");
+
+pub const AgentSettings = ai_chat_types.AgentSettings;
+pub const AgentPermission = ai_chat_types.AgentPermission;
+pub const ToolSurface = ai_chat_types.ToolSurface;
+pub const ToolSnapshot = ai_chat_types.ToolSnapshot;
+pub const ToolClosedTab = ai_chat_types.ToolClosedTab;
+pub const SshProfileSaveArgs = ai_chat_types.SshProfileSaveArgs;
+pub const SavedSshProfile = ai_chat_types.SavedSshProfile;
+pub const ToolHost = ai_chat_types.ToolHost;
+pub const ApprovalView = ai_chat_types.ApprovalView;
+const WeixinReplyContext = ai_chat_types.WeixinReplyContext;
+pub const ToolContext = ai_chat_types.ToolContext;
 
 pub const DEFAULT_NAME = "DeepSeek";
 pub const DEFAULT_BASE_URL = "https://api.deepseek.com";
 pub const DEFAULT_MODEL = "deepseek-v4-pro";
 pub const DEFAULT_SYSTEM_PROMPT = platform_agent_prompt.defaultSystemPrompt;
 pub const COPILOT_SYSTEM_PROMPT = platform_agent_prompt.copilotSystemPrompt;
-pub const DEFAULT_THINKING = "enabled";
-pub const DEFAULT_REASONING_EFFORT = "high";
-pub const DEFAULT_STREAM = "false";
-pub const DEFAULT_AGENT = "true";
+pub const DEFAULT_THINKING = ai_chat_protocol.DEFAULT_THINKING;
+pub const DEFAULT_REASONING_EFFORT = ai_chat_protocol.DEFAULT_REASONING_EFFORT;
+pub const DEFAULT_STREAM = ai_chat_protocol.DEFAULT_STREAM;
+pub const DEFAULT_AGENT = ai_chat_protocol.DEFAULT_AGENT;
 pub const DEFAULT_PROTOCOL = ai_chat_protocol.DEFAULT_PROTOCOL;
-pub const DEFAULT_MAX_TOKENS = "8192";
+pub const DEFAULT_MAX_TOKENS = ai_chat_protocol.DEFAULT_MAX_TOKENS;
 
-const DEFAULT_AGENT_TIMEOUT_MS: u32 = 60_000;
-const DEFAULT_AGENT_OUTPUT_LIMIT: u32 = 16 * 1024;
 const REMOTE_SNAPSHOT_MAX_BYTES: usize = 24 * 1024;
 const INPUT_PROMPT_MAX_BYTES: usize = 64 * 1024;
 const SYSTEM_PROMPT_MAX_BYTES: usize = 16 * 1024;
@@ -102,181 +113,9 @@ pub const TranscriptSelection = struct {
 const RequestMessage = ai_chat_protocol.RequestMessage;
 const ai_chat_title = @import("ai_chat_title.zig");
 const ToolCall = ai_chat_protocol.ToolCall;
+const ai_chat_request = @import("ai_chat_request.zig");
 
-pub const AgentPermission = enum {
-    confirm,
-    full,
-
-    pub fn parse(value: []const u8) ?AgentPermission {
-        if (std.mem.eql(u8, value, "confirm")) return .confirm;
-        if (std.mem.eql(u8, value, "full") or std.mem.eql(u8, value, "full-permission")) return .full;
-        return null;
-    }
-
-    pub fn name(self: AgentPermission) []const u8 {
-        return switch (self) {
-            .confirm => "confirm",
-            .full => "full",
-        };
-    }
-};
-
-pub const AgentSettings = struct {
-    enabled: bool = false,
-    permission: AgentPermission = .confirm,
-    command_timeout_ms: u32 = DEFAULT_AGENT_TIMEOUT_MS,
-    output_limit: u32 = DEFAULT_AGENT_OUTPUT_LIMIT,
-};
-
-pub const ToolSurface = struct {
-    id: []u8,
-    title: []u8,
-    cwd: []u8,
-    snapshot: []u8,
-    tab_index: usize,
-    focused: bool,
-    is_ssh: bool,
-    is_wsl: bool,
-    agent_app: agent_detector.App = .none,
-    agent_state: agent_detector.State = .none,
-    agent_confidence: u8 = 0,
-    ptr: *anyopaque,
-
-    pub fn deinit(self: ToolSurface, allocator: std.mem.Allocator) void {
-        allocator.free(self.id);
-        allocator.free(self.title);
-        allocator.free(self.cwd);
-        allocator.free(self.snapshot);
-    }
-
-    pub fn clone(self: ToolSurface, allocator: std.mem.Allocator) !ToolSurface {
-        const id = try allocator.dupe(u8, self.id);
-        errdefer allocator.free(id);
-        const title = try allocator.dupe(u8, self.title);
-        errdefer allocator.free(title);
-        const cwd = try allocator.dupe(u8, self.cwd);
-        errdefer allocator.free(cwd);
-        const snapshot = try allocator.dupe(u8, self.snapshot);
-        errdefer allocator.free(snapshot);
-        return .{
-            .id = id,
-            .title = title,
-            .cwd = cwd,
-            .snapshot = snapshot,
-            .tab_index = self.tab_index,
-            .focused = self.focused,
-            .is_ssh = self.is_ssh,
-            .is_wsl = self.is_wsl,
-            .agent_app = self.agent_app,
-            .agent_state = self.agent_state,
-            .agent_confidence = self.agent_confidence,
-            .ptr = self.ptr,
-        };
-    }
-};
-
-pub const ToolSnapshot = struct {
-    surfaces: []ToolSurface,
-    active_tab: usize,
-
-    pub fn deinit(self: ToolSnapshot, allocator: std.mem.Allocator) void {
-        for (self.surfaces) |surface| surface.deinit(allocator);
-        allocator.free(self.surfaces);
-    }
-
-    pub fn clone(self: ToolSnapshot, allocator: std.mem.Allocator) !ToolSnapshot {
-        const surfaces = try allocator.alloc(ToolSurface, self.surfaces.len);
-        errdefer allocator.free(surfaces);
-        var written: usize = 0;
-        errdefer {
-            for (surfaces[0..written]) |surface| surface.deinit(allocator);
-        }
-        for (self.surfaces) |surface| {
-            surfaces[written] = try surface.clone(allocator);
-            written += 1;
-        }
-        return .{
-            .surfaces = surfaces,
-            .active_tab = self.active_tab,
-        };
-    }
-};
-
-pub const ToolClosedTab = struct {
-    tab_index: usize,
-    active_tab: usize,
-    title: []u8,
-
-    pub fn deinit(self: ToolClosedTab, allocator: std.mem.Allocator) void {
-        allocator.free(self.title);
-    }
-};
-
-pub const SshProfileSaveArgs = struct {
-    name: []const u8 = "",
-    host: []const u8,
-    user: []const u8,
-    password: []const u8 = "",
-    port: []const u8 = "",
-    proxy_jump: []const u8 = "",
-};
-
-pub const SavedSshProfile = struct {
-    name: []u8,
-    host: []u8,
-    user: []u8,
-    port: []u8,
-    updated_existing: bool,
-    password_saved: bool,
-
-    pub fn deinit(self: SavedSshProfile, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.host);
-        allocator.free(self.user);
-        allocator.free(self.port);
-    }
-};
-
-pub const ToolHost = struct {
-    ctx: *anyopaque,
-    collectSnapshot: *const fn (*anyopaque, std.mem.Allocator) anyerror!ToolSnapshot,
-    surfaceSnapshot: *const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror![]u8,
-    writeSurface: *const fn (*anyopaque, *anyopaque, []const u8) bool,
-    spawnTab: *const fn (*anyopaque, std.mem.Allocator, []const u8, ?[]const u8) anyerror!ToolSurface,
-    closeTab: *const fn (*anyopaque, std.mem.Allocator, ?usize, ?[]const u8, ?[]const u8) anyerror!ToolClosedTab,
-    saveSshProfile: *const fn (*anyopaque, std.mem.Allocator, SshProfileSaveArgs) anyerror!SavedSshProfile,
-    connectSshProfile: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!ToolSurface,
-};
-
-const WeixinReplyContext = struct {
-    sender: weixin_types.AttachmentSender,
-    to_user_id: []u8,
-    context_token: []u8,
-
-    fn init(allocator: std.mem.Allocator, ctx: weixin_types.ReplyContext) !WeixinReplyContext {
-        return .{
-            .sender = ctx.sender,
-            .to_user_id = try allocator.dupe(u8, ctx.to_user_id),
-            .context_token = try allocator.dupe(u8, ctx.context_token),
-        };
-    }
-
-    fn clone(self: WeixinReplyContext, allocator: std.mem.Allocator) !WeixinReplyContext {
-        return .{
-            .sender = self.sender,
-            .to_user_id = try allocator.dupe(u8, self.to_user_id),
-            .context_token = try allocator.dupe(u8, self.context_token),
-        };
-    }
-
-    fn deinit(self: *WeixinReplyContext, allocator: std.mem.Allocator) void {
-        allocator.free(self.to_user_id);
-        allocator.free(self.context_token);
-        self.* = undefined;
-    }
-};
-
-const ChatRequest = struct {
+pub const ChatRequest = struct {
     allocator: std.mem.Allocator,
     session: *Session,
     base_url: []u8,
@@ -298,7 +137,7 @@ const ChatRequest = struct {
     write_context_surface_id: [64]u8 = undefined,
     write_context_surface_id_len: usize = 0,
 
-    fn deinit(self: *ChatRequest) void {
+    pub fn deinit(self: *ChatRequest) void {
         self.allocator.free(self.base_url);
         self.allocator.free(self.api_key);
         self.allocator.free(self.model);
@@ -311,7 +150,7 @@ const ChatRequest = struct {
         self.allocator.destroy(self);
     }
 
-    fn toParams(self: *const ChatRequest) ai_chat_protocol.RequestParams {
+    pub fn toParams(self: *const ChatRequest) ai_chat_protocol.RequestParams {
         return .{
             .model = self.model,
             .system_prompt = self.system_prompt,
@@ -326,12 +165,6 @@ const ChatRequest = struct {
 
 const ApiResult = ai_chat_protocol.ApiResult;
 pub const ApiUsage = ai_chat_protocol.ApiUsage;
-
-pub const ApprovalView = struct {
-    tool: []const u8,
-    command: []const u8,
-    reason: []const u8,
-};
 
 /// History hooks may run on request worker threads as well as the UI thread.
 /// Consumers must treat the callback as asynchronous cross-thread delivery and
@@ -417,7 +250,7 @@ pub fn setToolHost(host: ?ToolHost) void {
     g_tool_host = host;
 }
 
-fn currentAgentSettings() AgentSettings {
+pub fn currentAgentSettings() AgentSettings {
     g_agent_mutex.lock();
     defer g_agent_mutex.unlock();
     return g_agent_settings;
@@ -457,7 +290,7 @@ pub const composerSuggestionAtForInput = ai_chat_composer.composerSuggestionAtFo
 
 fn slashCommandOutput(allocator: std.mem.Allocator, command: SlashCommand) ![]u8 {
     return switch (command) {
-        .commands => slashCommandListOutput(allocator),
+        .commands => ai_chat_skills.slashCommandListOutput(allocator),
         .reload_skills => allocator.dupe(u8, "Skills will be re-read from disk on the next skill call."),
         .reload_commands => allocator.dupe(u8, "Custom commands will be re-read from the commands directory."),
         .update_skills => allocator.dupe(u8, "Downloading the latest skills from GitHub in the background..."),
@@ -467,281 +300,13 @@ fn slashCommandOutput(allocator: std.mem.Allocator, command: SlashCommand) ![]u8
         .permission => permissionStatusOutput(allocator),
         .export_markdown => allocator.dupe(u8, "Exporting the conversation as Markdown..."),
         .unknown => allocator.dupe(u8, "Unknown command. Use /commands to list commands."),
-        .skills => listSkillsForDisplay(allocator),
+        .skills => ai_chat_skills.listSkillsForDisplay(allocator),
     };
 }
 
 fn permissionStatusOutput(allocator: std.mem.Allocator) ![]u8 {
     const current = currentAgentSettings().permission;
     return std.fmt.allocPrint(allocator, "Agent permission is '{s}'. Use /permission confirm or /permission full to change it.", .{current.name()});
-}
-
-fn slashCommandListOutput(allocator: std.mem.Allocator) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "Available commands:");
-    for (slash_command_entries) |entry| {
-        try out.print(allocator, "\n{s} - {s}", .{ entry.suggestion.command, entry.suggestion.description });
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn listSkillsForDisplay(allocator: std.mem.Allocator) ![]u8 {
-    const roots = try defaultSkillRootPaths(allocator);
-    defer freeSkillRootPaths(allocator, roots);
-
-    return listSkillsForDisplayFromRoots(allocator, roots);
-}
-
-fn listSkillsForDisplayFromRoots(allocator: std.mem.Allocator, root_paths: []const []const u8) ![]u8 {
-    const merged = try loadSkillSuggestionListFromRoots(allocator, root_paths);
-    defer {
-        freeOwnedSkillMetaList(allocator, merged);
-        allocator.free(merged);
-    }
-
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    if (merged.len == 0) {
-        try out.appendSlice(allocator, "No skills found under configured skill roots.");
-    } else {
-        try out.appendSlice(allocator, "Available skills:\n");
-        for (merged) |meta| {
-            try out.print(allocator, "- ${s}: {s}\n", .{ meta.name, meta.description });
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn loadSkillSuggestionListFromRoots(allocator: std.mem.Allocator, root_paths: []const []const u8) ![]skill_registry.SkillMeta {
-    var merged: std.ArrayListUnmanaged(skill_registry.SkillMeta) = .empty;
-    errdefer {
-        freeOwnedSkillMetaList(allocator, merged.items);
-        merged.deinit(allocator);
-    }
-
-    for (root_paths) |root_path| {
-        var root = openSkillRoot(root_path) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => continue,
-            else => |e| return e,
-        };
-        defer root.deinit();
-
-        const list = try skill_registry.listSkills(allocator, root.dir, root.skills_rel);
-        defer allocator.free(list);
-        for (list) |*meta| {
-            if (skillMetaNameExists(merged.items, meta.name)) {
-                meta.deinit(allocator);
-                continue;
-            }
-            try merged.append(allocator, meta.*);
-            meta.* = undefined;
-        }
-    }
-
-    std.sort.insertion(skill_registry.SkillMeta, merged.items, {}, skillMetaNameLessThan);
-    return merged.toOwnedSlice(allocator);
-}
-
-fn loadSkillPreloadContent(allocator: std.mem.Allocator, skill_name: []const u8) !?[]u8 {
-    const roots = try defaultSkillRootPaths(allocator);
-    defer freeSkillRootPaths(allocator, roots);
-    return loadSkillPreloadContentFromRoots(allocator, skill_name, roots);
-}
-
-fn loadSkillPreloadContentFromRoots(allocator: std.mem.Allocator, skill_name: []const u8, root_paths: []const []const u8) !?[]u8 {
-    var snapshot = loadSkillSnapshotFromRoots(allocator, skill_name, root_paths) catch |err| switch (err) {
-        skill_registry.LookupError.SkillNotFound,
-        skill_registry.LookupError.DuplicateSkillName,
-        skill_registry.LookupError.InvalidSkillMarkdown,
-        skill_registry.LookupError.SkillTooLarge,
-        => return null,
-        else => |e| return e,
-    };
-    defer snapshot.deinit(allocator);
-    return try allocator.dupe(u8, snapshot.content);
-}
-
-fn loadSkillSnapshotFromRoots(
-    allocator: std.mem.Allocator,
-    skill_name: []const u8,
-    root_paths: []const []const u8,
-) !skill_registry.Snapshot {
-    for (root_paths) |root_path| {
-        var root = openSkillRoot(root_path) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => continue,
-            else => |e| return e,
-        };
-        defer root.deinit();
-
-        return skill_registry.loadSkillSnapshot(allocator, root.dir, root.skills_rel, skill_name) catch |err| switch (err) {
-            skill_registry.LookupError.SkillNotFound => continue,
-            else => |e| return e,
-        };
-    }
-    return skill_registry.LookupError.SkillNotFound;
-}
-
-const SkillRoot = struct {
-    dir: std.fs.Dir,
-    skills_rel: []const u8,
-    owns_dir: bool,
-
-    fn deinit(self: *SkillRoot) void {
-        if (self.owns_dir) self.dir.close();
-        self.* = undefined;
-    }
-};
-
-fn openSkillRoot(root_path: []const u8) !SkillRoot {
-    if (std.fs.path.dirname(root_path)) |parent| {
-        return .{
-            .dir = try openDirectoryPath(parent),
-            .skills_rel = std.fs.path.basename(root_path),
-            .owns_dir = true,
-        };
-    }
-    return .{
-        .dir = std.fs.cwd(),
-        .skills_rel = root_path,
-        .owns_dir = false,
-    };
-}
-
-fn openDirectoryPath(path: []const u8) !std.fs.Dir {
-    if (std.fs.path.isAbsolute(path)) {
-        return std.fs.openDirAbsolute(path, .{ .iterate = true });
-    }
-    return std.fs.cwd().openDir(path, .{ .iterate = true });
-}
-
-fn defaultSkillRootPaths(allocator: std.mem.Allocator) ![][]const u8 {
-    var roots: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer {
-        for (roots.items) |root| allocator.free(root);
-        roots.deinit(allocator);
-    }
-
-    if (platform_dirs.skillsDir(allocator)) |appdata_skills| {
-        try appendOwnedSkillRootPath(allocator, &roots, appdata_skills);
-    } else |_| {}
-    if (platform_dirs.pluginSkillsDir(allocator)) |appdata_plugin_skills| {
-        try appendOwnedSkillRootPath(allocator, &roots, appdata_plugin_skills);
-    } else |_| {}
-
-    try appendSkillRootPath(allocator, &roots, "skills");
-    try appendSkillRootPath(allocator, &roots, "plugins/skills");
-
-    if (std.fs.selfExeDirPathAlloc(allocator)) |exe_dir| {
-        defer allocator.free(exe_dir);
-        const exe_skills = try std.fs.path.join(allocator, &.{ exe_dir, "skills" });
-        try appendOwnedSkillRootPath(allocator, &roots, exe_skills);
-        const exe_plugin_skills = try std.fs.path.join(allocator, &.{ exe_dir, "plugins", "skills" });
-        try appendOwnedSkillRootPath(allocator, &roots, exe_plugin_skills);
-
-        // macOS .app bundle layout: the executable lives in Contents/MacOS and
-        // the bundled plugins are shipped under Contents/Resources/plugins.
-        const res_skills = try std.fs.path.join(allocator, &.{ exe_dir, "..", "Resources", "skills" });
-        try appendOwnedSkillRootPath(allocator, &roots, res_skills);
-        const res_plugin_skills = try std.fs.path.join(allocator, &.{ exe_dir, "..", "Resources", "plugins", "skills" });
-        try appendOwnedSkillRootPath(allocator, &roots, res_plugin_skills);
-    } else |_| {}
-
-    return roots.toOwnedSlice(allocator);
-}
-
-fn defaultCommandRootPaths(allocator: std.mem.Allocator) ![][]const u8 {
-    var roots: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer {
-        for (roots.items) |r| allocator.free(r);
-        roots.deinit(allocator);
-    }
-    if (platform_dirs.commandsDir(allocator)) |d| {
-        try appendOwnedSkillRootPath(allocator, &roots, d);
-    } else |_| {}
-    try appendSkillRootPath(allocator, &roots, "commands");
-    return roots.toOwnedSlice(allocator);
-}
-
-fn appendSkillRootPath(
-    allocator: std.mem.Allocator,
-    roots: *std.ArrayListUnmanaged([]const u8),
-    root_path: []const u8,
-) !void {
-    const owned = try allocator.dupe(u8, root_path);
-    errdefer allocator.free(owned);
-    try appendOwnedSkillRootPath(allocator, roots, owned);
-}
-
-fn appendOwnedSkillRootPath(
-    allocator: std.mem.Allocator,
-    roots: *std.ArrayListUnmanaged([]const u8),
-    owned_root_path: []const u8,
-) !void {
-    for (roots.items) |existing| {
-        if (std.mem.eql(u8, existing, owned_root_path)) {
-            allocator.free(owned_root_path);
-            return;
-        }
-    }
-    errdefer allocator.free(owned_root_path);
-    try roots.append(allocator, owned_root_path);
-}
-
-fn freeSkillRootPaths(allocator: std.mem.Allocator, roots: [][]const u8) void {
-    for (roots) |root| allocator.free(root);
-    allocator.free(roots);
-}
-
-/// Maps a custom command's `action:` frontmatter value to the built-in slash
-/// command it triggers. Returns null for unrecognized actions (those commands
-/// are dropped during load).
-fn knownActionFromName(value: []const u8) ?SlashCommand {
-    if (std.mem.eql(u8, value, "clear_context")) return .clear;
-    if (std.mem.eql(u8, value, "restore_session")) return .resume_session;
-    if (std.mem.eql(u8, value, "set_permission")) return .permission;
-    if (std.mem.eql(u8, value, "export_markdown")) return .export_markdown;
-    return null;
-}
-
-/// True when `name` (without a leading slash) collides with a built-in slash
-/// command. The registry stores names without a slash (e.g. "review"); built-in
-/// entries store them with one (e.g. "/clear").
-fn isBuiltinCommandName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    var buf: [128]u8 = undefined;
-    if (name.len + 1 > buf.len) return false;
-    buf[0] = '/';
-    @memcpy(buf[1 .. 1 + name.len], name);
-    const slashed = buf[0 .. 1 + name.len];
-    for (slash_command_entries) |entry| {
-        if (std.mem.eql(u8, slashed, entry.suggestion.command)) return true;
-    }
-    return false;
-}
-
-fn hasName(items: []const command_registry.CustomCommand, name: []const u8) bool {
-    for (items) |c| {
-        if (std.mem.eql(u8, c.name, name)) return true;
-    }
-    return false;
-}
-
-fn freeOwnedSkillMetaList(allocator: std.mem.Allocator, list: []skill_registry.SkillMeta) void {
-    for (list) |*skill| {
-        skill.deinit(allocator);
-    }
-}
-
-fn skillMetaNameExists(list: []const skill_registry.SkillMeta, name: []const u8) bool {
-    for (list) |meta| {
-        if (std.mem.eql(u8, meta.name, name)) return true;
-    }
-    return false;
-}
-
-fn skillMetaNameLessThan(_: void, lhs: skill_registry.SkillMeta, rhs: skill_registry.SkillMeta) bool {
-    return std.mem.lessThan(u8, lhs.name, rhs.name);
 }
 
 pub fn agentPermission() AgentPermission {
@@ -1100,9 +665,9 @@ pub const Session = struct {
     }
 
     fn loadSkillSuggestionsFromRoots(self: *Session, root_paths: []const []const u8) !void {
-        const suggestions = try loadSkillSuggestionListFromRoots(self.allocator, root_paths);
+        const suggestions = try ai_chat_skills.loadSkillSuggestionListFromRoots(self.allocator, root_paths);
         errdefer {
-            freeOwnedSkillMetaList(self.allocator, suggestions);
+            ai_chat_skills.freeOwnedSkillMetaList(self.allocator, suggestions);
             self.allocator.free(suggestions);
         }
 
@@ -1115,13 +680,13 @@ pub const Session = struct {
         const prefix = composerSuggestionPrefix(self.input(), self.input_cursor) orelse return;
         if (prefix.kind != .skill or self.skill_suggestions_loaded) return;
 
-        const roots = defaultSkillRootPaths(self.allocator) catch {
+        const roots = ai_chat_skills.defaultSkillRootPaths(self.allocator) catch {
             self.skill_suggestions_loaded = true;
             return;
         };
-        defer freeSkillRootPaths(self.allocator, roots);
+        defer ai_chat_skills.freeSkillRootPaths(self.allocator, roots);
 
-        const suggestions = loadSkillSuggestionListFromRoots(self.allocator, roots) catch {
+        const suggestions = ai_chat_skills.loadSkillSuggestionListFromRoots(self.allocator, roots) catch {
             self.skill_suggestions_loaded = true;
             return;
         };
@@ -1138,7 +703,7 @@ pub const Session = struct {
 
     fn freeSkillSuggestions(self: *Session) void {
         if (self.skill_suggestions_owned) {
-            freeOwnedSkillMetaList(self.allocator, self.skill_suggestions);
+            ai_chat_skills.freeOwnedSkillMetaList(self.allocator, self.skill_suggestions);
             self.allocator.free(self.skill_suggestions);
         }
         self.skill_suggestions = &.{};
@@ -1160,23 +725,23 @@ pub const Session = struct {
     /// name, and replaces `self.custom_commands`. Best-effort: missing dirs or
     /// allocation failures leave the session usable (possibly with no commands).
     pub fn reloadCustomCommands(self: *Session) void {
-        const roots = defaultCommandRootPaths(self.allocator) catch return;
-        defer freeSkillRootPaths(self.allocator, roots);
+        const roots = ai_chat_skills.defaultCommandRootPaths(self.allocator) catch return;
+        defer ai_chat_skills.freeSkillRootPaths(self.allocator, roots);
         var merged: std.ArrayListUnmanaged(command_registry.CustomCommand) = .empty;
         for (roots) |root| {
-            var dir = openDirectoryPath(root) catch continue;
+            var dir = ai_chat_skills.openDirectoryPath(root) catch continue;
             defer dir.close();
             const cmds = command_registry.listCommands(self.allocator, dir, "") catch continue;
             defer self.allocator.free(cmds); // free the slice; item ownership moves to `merged` or is deinit'd below
             for (cmds) |cmd| {
                 var c = cmd;
-                if (c.action) |av| if (knownActionFromName(av) == null) {
+                if (c.action) |av| if (ai_chat_skills.knownActionFromName(av) == null) {
                     c.deinit(self.allocator);
                     continue;
                 };
                 // Dedup ONLY against built-ins + commands already merged in THIS reload.
                 // Do NOT check self.custom_commands (it is the old list being replaced).
-                if (isBuiltinCommandName(c.name) or hasName(merged.items, c.name)) {
+                if (ai_chat_skills.isBuiltinCommandName(c.name) or ai_chat_skills.hasName(merged.items, c.name)) {
                     c.deinit(self.allocator);
                     continue;
                 }
@@ -1676,7 +1241,7 @@ pub const Session = struct {
         return true;
     }
 
-    fn requestApproval(self: *Session, tool: []const u8, command: []const u8, reason: []const u8) bool {
+    pub fn requestApproval(self: *Session, tool: []const u8, command: []const u8, reason: []const u8) bool {
         if (self.stop_requested.load(.acquire)) return false;
         self.approval_mutex.lock();
         self.copyApprovalLocked(tool, command, reason);
@@ -1747,7 +1312,7 @@ pub const Session = struct {
         if (ai_chat_composer.matchCustomCommandIndex(first_tok, self.customCommandSuggestions())) |idx| {
             const cmd = self.custom_commands[idx];
             if (cmd.action) |av| {
-                if (knownActionFromName(av)) |builtin_command| {
+                if (ai_chat_skills.knownActionFromName(av)) |builtin_command| {
                     const r = self.runBuiltinCommandLocked(builtin_command, arg);
                     self.clearPendingWeixinReplyContextLocked();
                     self.mutex.unlock();
@@ -1783,7 +1348,7 @@ pub const Session = struct {
         const invocation = parseSkillInvocation(prompt_raw);
         var skill_preload_content: ?[]u8 = null;
         if (invocation) |parsed| {
-            skill_preload_content = loadSkillPreloadContent(self.allocator, parsed.skill_name) catch {
+            skill_preload_content = ai_chat_skills.loadSkillPreloadContent(self.allocator, parsed.skill_name) catch {
                 self.setStatusLocked("Could not load skill");
                 self.clearPendingWeixinReplyContextLocked();
                 self.mutex.unlock();
@@ -1883,7 +1448,7 @@ pub const Session = struct {
         self.mutex.unlock();
         if (!skill_preload_appended) self.notifyHistoryChange(history_change);
 
-        const thread = std.Thread.spawn(.{}, requestThreadMain, .{request}) catch {
+        const thread = std.Thread.spawn(.{}, ai_chat_request.requestThreadMain, .{request}) catch {
             request.deinit();
             self.mutex.lock();
             self.request_inflight = false;
@@ -2506,8 +2071,8 @@ pub const Session = struct {
         var copilot_target_idx: ?usize = null;
         if (self.copilot and self.bound_surface_id_len > 0) {
             if (tool_snapshot) |snap| {
-                if (findSurface(snap, self.boundSurfaceId())) |surface| {
-                    copilot_ctx = buildCopilotContext(self.allocator, surface.cwd, surface.snapshot) catch null;
+                if (ai_chat_tools.findSurface(snap, self.boundSurfaceId())) |surface| {
+                    copilot_ctx = ai_chat_tools.buildCopilotContext(self.allocator, surface.cwd, surface.snapshot) catch null;
                     if (copilot_ctx != null) {
                         // index of the LAST user message in self.messages
                         var k: usize = self.messages.items.len;
@@ -2550,9 +2115,9 @@ pub const Session = struct {
                 const name = msg.tool_name orelse continue;
                 if (id.len == 0 or name.len == 0) continue;
 
-                messages[written] = try durableToolAssistantRequestMessage(self.allocator, id, name);
+                messages[written] = try ai_chat_request.durableToolAssistantRequestMessage(self.allocator, id, name);
                 written += 1;
-                messages[written] = try requestMessageWithClonedFields(self.allocator, .tool, msg.content, null, id, null);
+                messages[written] = try ai_chat_request.requestMessageWithClonedFields(self.allocator, .tool, msg.content, null, id, null);
                 written += 1;
                 continue;
             }
@@ -2560,9 +2125,9 @@ pub const Session = struct {
             if (copilot_target_idx != null and idx == copilot_target_idx.? and copilot_ctx != null) {
                 const combined = try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ msg.content, copilot_ctx.? });
                 defer self.allocator.free(combined);
-                messages[written] = try requestMessageWithClonedFields(self.allocator, msg.role, combined, msg.reasoning, null, null);
+                messages[written] = try ai_chat_request.requestMessageWithClonedFields(self.allocator, msg.role, combined, msg.reasoning, null, null);
             } else {
-                messages[written] = try requestMessageWithClonedFields(self.allocator, msg.role, msg.content, msg.reasoning, null, null);
+                messages[written] = try ai_chat_request.requestMessageWithClonedFields(self.allocator, msg.role, msg.content, msg.reasoning, null, null);
             }
             written += 1;
         }
@@ -2610,7 +2175,13 @@ pub const Session = struct {
         reasoning_effort_owned = false;
         weixin_ctx = null;
         if (self.copilot and self.bound_surface_id_len > 0) {
-            setWriteContext(req, self.boundSurfaceId());
+            // Inline the write-context seed directly on ChatRequest (the field
+            // layout is identical to ToolContext; setWriteContext in
+            // ai_chat_tools operates on ToolContext).
+            const bound_id = self.boundSurfaceId();
+            const len = @min(bound_id.len, req.write_context_surface_id.len);
+            @memcpy(req.write_context_surface_id[0..len], bound_id[0..len]);
+            req.write_context_surface_id_len = len;
         }
         return req;
     }
@@ -2809,138 +2380,12 @@ const visualRowAt = ai_chat_input_text.visualRowAt;
 const byteOffsetForVisualPosition = ai_chat_input_text.byteOffsetForVisualPosition;
 pub const inputWrappedLineCount = ai_chat_input_text.inputWrappedLineCount;
 
-fn appendClipboardSection(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    label: []const u8,
-    text: []const u8,
-) !void {
-    if (out.items.len > 0) try out.appendSlice(allocator, "\r\n\r\n");
-    try out.appendSlice(allocator, label);
-    try out.appendSlice(allocator, ":\r\n");
-    try out.appendSlice(allocator, text);
-}
-
-fn appendMarkdownDocumentHeader(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    title: []const u8,
-    model: []const u8,
-    session_id: []const u8,
-    include_metadata: bool,
-) !void {
-    try out.appendSlice(allocator, "# ");
-    try appendMarkdownInline(allocator, out, if (title.len > 0) title else "WispTerm AI Chat");
-    try out.appendSlice(allocator, "\n\n");
-    if (!include_metadata) return;
-    if (model.len > 0) {
-        try out.appendSlice(allocator, "- Model: `");
-        try appendMarkdownInline(allocator, out, model);
-        try out.appendSlice(allocator, "`\n");
-    }
-    if (session_id.len > 0) {
-        try out.appendSlice(allocator, "- Session: `");
-        try appendMarkdownInline(allocator, out, session_id);
-        try out.appendSlice(allocator, "`\n");
-    }
-    try out.appendSlice(allocator, "\n");
-}
-
-fn appendMarkdownSection(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    label: []const u8,
-    text: []const u8,
-) !void {
-    try out.appendSlice(allocator, "## ");
-    try appendMarkdownInline(allocator, out, label);
-    try out.appendSlice(allocator, "\n\n");
-    try appendMarkdownBody(allocator, out, text);
-    try out.appendSlice(allocator, "\n\n");
-}
-
-fn appendMarkdownCodeSection(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    label: []const u8,
-    text: []const u8,
-) !void {
-    try out.appendSlice(allocator, "## ");
-    try appendMarkdownInline(allocator, out, label);
-    try out.appendSlice(allocator, "\n\n");
-    try appendMarkdownFence(allocator, out, text);
-    try out.appendSlice(allocator, "\n");
-}
-
-fn appendMarkdownInline(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    text: []const u8,
-) !void {
-    var previous_space = false;
-    for (text) |ch| {
-        if (ch == '\r' or ch == '\n' or ch == '\t') {
-            if (!previous_space) {
-                try out.append(allocator, ' ');
-                previous_space = true;
-            }
-            continue;
-        }
-        try out.append(allocator, ch);
-        previous_space = ch == ' ';
-    }
-}
-
-fn appendMarkdownBody(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    text: []const u8,
-) !void {
-    if (text.len == 0) {
-        try out.appendSlice(allocator, "_(empty)_\n");
-        return;
-    }
-    try out.appendSlice(allocator, text);
-    if (text[text.len - 1] != '\n') try out.append(allocator, '\n');
-}
-
-fn appendMarkdownFence(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    text: []const u8,
-) !void {
-    const fence_len = @max(@as(usize, 3), longestBacktickRun(text) + 1);
-    try appendRepeatedByte(allocator, out, '`', fence_len);
-    try out.appendSlice(allocator, "text\n");
-    try out.appendSlice(allocator, text);
-    if (text.len == 0 or text[text.len - 1] != '\n') try out.append(allocator, '\n');
-    try appendRepeatedByte(allocator, out, '`', fence_len);
-    try out.appendSlice(allocator, "\n");
-}
-
-fn appendRepeatedByte(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    byte: u8,
-    count: usize,
-) !void {
-    var i: usize = 0;
-    while (i < count) : (i += 1) try out.append(allocator, byte);
-}
-
-fn longestBacktickRun(text: []const u8) usize {
-    var longest: usize = 0;
-    var current: usize = 0;
-    for (text) |ch| {
-        if (ch == '`') {
-            current += 1;
-            longest = @max(longest, current);
-        } else {
-            current = 0;
-        }
-    }
-    return longest;
-}
+// Markdown export helpers — defined in ai_chat_markdown.zig (pure leaf, no Session).
+const appendClipboardSection = ai_chat_markdown.appendClipboardSection;
+const appendMarkdownDocumentHeader = ai_chat_markdown.appendMarkdownDocumentHeader;
+const appendMarkdownSection = ai_chat_markdown.appendMarkdownSection;
+const appendMarkdownCodeSection = ai_chat_markdown.appendMarkdownCodeSection;
+const appendMarkdownBody = ai_chat_markdown.appendMarkdownBody;
 
 fn latestAssistantContent(messages: []const Message) ?[]const u8 {
     var i = messages.len;
@@ -3026,74 +2471,17 @@ fn allocRemoteToolSummary(allocator: std.mem.Allocator, msg: Message) ![]u8 {
     return allocator.dupe(u8, trimmed);
 }
 
-fn requestThreadMain(request: *ChatRequest) void {
-    const allocator = request.allocator;
-    defer request.deinit();
+// requestThreadMain has moved to ai_chat_request.zig.
 
-    if (request.agent_enabled) {
-        const result = runAgentRequest(request) catch |err| blk: {
-            if (requestCancelled(request)) {
-                finishStoppedRequest(request.session);
-                return;
-            }
-            const text = std.fmt.allocPrint(allocator, "Agent request failed: {}", .{err}) catch return;
-            break :blk ApiResult{ .content = text };
-        };
-        defer result.deinit(allocator);
-        if (requestCancelled(request)) {
-            finishStoppedRequest(request.session);
-            return;
-        }
-        appendAssistantResult(request.session, result, request.started_ms);
-        maybeAutoTitle(request.session);
-        return;
-    }
-
-    if (request.stream) {
-        runChatRequestStreaming(request) catch |err| {
-            if (requestCancelled(request)) {
-                finishStoppedRequest(request.session);
-                return;
-            }
-            const text = std.fmt.allocPrint(allocator, "AI stream failed: {}", .{err}) catch return;
-            defer allocator.free(text);
-            appendAssistantResult(request.session, .{ .content = text }, request.started_ms);
-        };
-        if (requestCancelled(request)) {
-            finishStoppedRequest(request.session);
-            return;
-        }
-        maybeAutoTitle(request.session);
-        return;
-    }
-
-    const result = runChatRequest(request) catch |err| blk: {
-        if (requestCancelled(request)) {
-            finishStoppedRequest(request.session);
-            return;
-        }
-        const text = std.fmt.allocPrint(allocator, "AI request failed: {}", .{err}) catch return;
-        break :blk ApiResult{ .content = text };
-    };
-    defer result.deinit(allocator);
-
-    if (requestCancelled(request)) {
-        finishStoppedRequest(request.session);
-        return;
-    }
-    appendAssistantResult(request.session, result, request.started_ms);
-    maybeAutoTitle(request.session);
-}
-
-fn requestCancelled(request: *const ChatRequest) bool {
+pub fn requestCancelled(request: *const ChatRequest) bool {
     return request.session.closing.load(.acquire) or request.session.stop_requested.load(.acquire);
 }
 
-fn sessionCancelled(session: *Session) bool {
+pub fn sessionCancelled(session: *Session) bool {
     return session.closing.load(.acquire) or session.stop_requested.load(.acquire);
 }
 
-fn finishStoppedRequest(session: *Session) void {
+pub fn finishStoppedRequest(session: *Session) void {
     if (session.closing.load(.acquire)) return;
     session.mutex.lock();
     defer session.mutex.unlock();
@@ -3108,7 +2496,7 @@ fn finishStoppedRequest(session: *Session) void {
 /// Clean a raw model title response and apply it to the session, but only if the
 /// title is still the default (a manual rename in the meantime always wins) and
 /// the session is not closing.
-fn applyGeneratedTitle(session: *Session, raw: []const u8) void {
+pub fn applyGeneratedTitle(session: *Session, raw: []const u8) void {
     if (session.closing.load(.acquire)) return;
     var buf: [ai_chat_title.max_title_bytes]u8 = undefined;
     const cleaned = ai_chat_title.cleanTitle(raw, &buf) orelse return;
@@ -3165,26 +2553,14 @@ fn buildTitleRequestLocked(session: *Session, turn: ai_chat_title.FirstTurn) !*C
     return req;
 }
 
-/// Background worker for one title request. Owns `req` and frees it on exit.
-fn titleThreadMain(req: *ChatRequest) void {
-    defer req.deinit();
-    const session = req.session;
-    const allocator = req.allocator;
-    if (session.closing.load(.acquire)) return;
-
-    const result = runChatRequestForMessages(req, req.messages, false) catch return;
-    defer result.deinit(allocator);
-    if (session.closing.load(.acquire)) return;
-
-    applyGeneratedTitle(session, result.content);
-}
+// titleThreadMain has moved to ai_chat_request.zig.
 
 /// After a completed turn, generate a title in the background if the gate
 /// passes. Called from the request worker (`requestThreadMain`) with no lock
 /// held. The worker thread that calls this is `session.request_thread`, which
 /// `deinit` joins before it joins `title_thread`, so storing the handle here
 /// races neither deinit nor the title worker.
-fn maybeAutoTitle(session: *Session) void {
+pub fn maybeAutoTitle(session: *Session) void {
     if (session.closing.load(.acquire)) return;
     const allocator = session.allocator;
 
@@ -3212,7 +2588,7 @@ fn maybeAutoTitle(session: *Session) void {
     session.mutex.unlock();
 
     const req = spawned_req orelse return;
-    const thread = std.Thread.spawn(.{}, titleThreadMain, .{req}) catch {
+    const thread = std.Thread.spawn(.{}, ai_chat_request.titleThreadMain, .{req}) catch {
         req.deinit();
         return;
     };
@@ -3221,173 +2597,11 @@ fn maybeAutoTitle(session: *Session) void {
     session.mutex.unlock();
 }
 
-fn runAgentRequest(request: *ChatRequest) !ApiResult {
-    var transcript: std.ArrayListUnmanaged(RequestMessage) = .empty;
-    defer {
-        for (transcript.items) |msg| msg.deinit(request.allocator);
-        transcript.deinit(request.allocator);
-    }
+// runAgentRequest, cloneRequestMessage, cloneToolCalls, assistantToolCallMessage,
+// requestMessageWithClonedFields, durableToolAssistantRequestMessage have moved
+// to ai_chat_request.zig.
 
-    for (request.messages) |msg| {
-        var cloned = try cloneRequestMessage(request.allocator, msg);
-        var cloned_owned = true;
-        errdefer if (cloned_owned) cloned.deinit(request.allocator);
-        try transcript.append(request.allocator, cloned);
-        cloned_owned = false;
-    }
-
-    var total_usage: ApiUsage = .{};
-    var has_usage = false;
-    while (true) {
-        if (requestCancelled(request)) return error.Canceled;
-        const result = try runChatRequestForMessages(request, transcript.items, true);
-        if (requestCancelled(request)) {
-            result.deinit(request.allocator);
-            return error.Canceled;
-        }
-        if (result.usage) |usage| {
-            total_usage.add(usage);
-            has_usage = true;
-        }
-        if (result.tool_calls == null or result.tool_calls.?.len == 0) {
-            var final = result;
-            if (has_usage) final.usage = total_usage;
-            return final;
-        }
-        errdefer result.deinit(request.allocator);
-
-        if (result.content.len > 0) {
-            appendProgressMessage(request.session, result.content) catch {};
-        }
-
-        var assistant_msg = try assistantToolCallMessage(request.allocator, result.content, result.reasoning, result.tool_calls.?);
-        var assistant_msg_owned = true;
-        errdefer if (assistant_msg_owned) assistant_msg.deinit(request.allocator);
-        try transcript.append(request.allocator, assistant_msg);
-        assistant_msg_owned = false;
-
-        for (result.tool_calls.?) |call| {
-            if (requestCancelled(request)) return error.Canceled;
-            const progress = try std.fmt.allocPrint(request.allocator, "running {s} {s}", .{ call.name, call.arguments });
-            defer request.allocator.free(progress);
-            appendProgressMessage(request.session, progress) catch {};
-
-            const tool_result = try executeToolCall(request, call);
-            defer request.allocator.free(tool_result);
-            if (requestCancelled(request)) return error.Canceled;
-            if (std.mem.eql(u8, call.name, "skill_info")) {
-                appendReplayableToolMessage(request.session, call.id, call.name, tool_result) catch {};
-            }
-
-            var tool_msg = try requestMessageWithClonedFields(request.allocator, .tool, tool_result, null, call.id, null);
-            var tool_msg_owned = true;
-            errdefer if (tool_msg_owned) tool_msg.deinit(request.allocator);
-            try transcript.append(request.allocator, tool_msg);
-            tool_msg_owned = false;
-        }
-        result.deinit(request.allocator);
-    }
-}
-
-fn cloneRequestMessage(allocator: std.mem.Allocator, msg: RequestMessage) !RequestMessage {
-    return requestMessageWithClonedFields(allocator, msg.role, msg.content, msg.reasoning, msg.tool_call_id, msg.tool_calls);
-}
-
-fn cloneToolCalls(allocator: std.mem.Allocator, calls: []const ToolCall) ![]ToolCall {
-    const out = try allocator.alloc(ToolCall, calls.len);
-    errdefer allocator.free(out);
-    var written: usize = 0;
-    errdefer {
-        for (out[0..written]) |call| call.deinit(allocator);
-    }
-    for (calls, 0..) |call, i| {
-        {
-            const id = try allocator.dupe(u8, call.id);
-            errdefer allocator.free(id);
-            const name = try allocator.dupe(u8, call.name);
-            errdefer allocator.free(name);
-            const arguments = try allocator.dupe(u8, call.arguments);
-            errdefer allocator.free(arguments);
-            out[i] = .{
-                .id = id,
-                .name = name,
-                .arguments = arguments,
-            };
-        }
-        written += 1;
-    }
-    return out;
-}
-
-fn assistantToolCallMessage(allocator: std.mem.Allocator, content: []const u8, reasoning: ?[]const u8, calls: []const ToolCall) !RequestMessage {
-    return requestMessageWithClonedFields(allocator, .assistant, content, reasoning, null, calls);
-}
-
-fn requestMessageWithClonedFields(
-    allocator: std.mem.Allocator,
-    role: Role,
-    content: []const u8,
-    reasoning: ?[]const u8,
-    tool_call_id: ?[]const u8,
-    tool_calls: ?[]const ToolCall,
-) !RequestMessage {
-    const content_copy = try allocator.dupe(u8, content);
-    errdefer allocator.free(content_copy);
-
-    var reasoning_copy: ?[]u8 = null;
-    errdefer if (reasoning_copy) |text| allocator.free(text);
-    if (reasoning) |text| reasoning_copy = try allocator.dupe(u8, text);
-
-    var tool_call_id_copy: ?[]u8 = null;
-    errdefer if (tool_call_id_copy) |id| allocator.free(id);
-    if (tool_call_id) |id| tool_call_id_copy = try allocator.dupe(u8, id);
-
-    var tool_calls_copy: ?[]ToolCall = null;
-    errdefer if (tool_calls_copy) |calls| {
-        for (calls) |call| call.deinit(allocator);
-        allocator.free(calls);
-    };
-    if (tool_calls) |calls| tool_calls_copy = try cloneToolCalls(allocator, calls);
-
-    return .{
-        .role = role,
-        .content = content_copy,
-        .reasoning = reasoning_copy,
-        .tool_call_id = tool_call_id_copy,
-        .tool_calls = tool_calls_copy,
-    };
-}
-
-fn durableToolAssistantRequestMessage(allocator: std.mem.Allocator, id: []const u8, name: []const u8) !RequestMessage {
-    const content = try allocator.dupe(u8, "");
-    errdefer allocator.free(content);
-
-    const calls = try allocator.alloc(ToolCall, 1);
-    errdefer allocator.free(calls);
-
-    {
-        const id_copy = try allocator.dupe(u8, id);
-        errdefer allocator.free(id_copy);
-        const name_copy = try allocator.dupe(u8, name);
-        errdefer allocator.free(name_copy);
-        const arguments = try allocator.dupe(u8, "{}");
-        errdefer allocator.free(arguments);
-
-        calls[0] = .{
-            .id = id_copy,
-            .name = name_copy,
-            .arguments = arguments,
-        };
-    }
-
-    return .{
-        .role = .assistant,
-        .content = content,
-        .tool_calls = calls,
-    };
-}
-
-fn appendAssistantResult(session: *Session, result: ApiResult, started_ms: i64) void {
+pub fn appendAssistantResult(session: *Session, result: ApiResult, started_ms: i64) void {
     const allocator = session.allocator;
     if (session.closing.load(.acquire)) return;
     if (session.stop_requested.load(.acquire)) {
@@ -3446,7 +2660,7 @@ fn appendAssistantResult(session: *Session, result: ApiResult, started_ms: i64) 
     history_change = session.captureHistoryChangeLocked();
 }
 
-fn appendProgressMessage(session: *Session, text: []const u8) !void {
+pub fn appendProgressMessage(session: *Session, text: []const u8) !void {
     if (sessionCancelled(session)) return error.Canceled;
     const allocator = session.allocator;
     const content = try allocator.dupe(u8, text);
@@ -3467,7 +2681,7 @@ fn appendProgressMessage(session: *Session, text: []const u8) !void {
     session.setStatusLocked("Running tools...");
 }
 
-fn appendReplayableToolMessage(
+pub fn appendReplayableToolMessage(
     session: *Session,
     tool_call_id: []const u8,
     tool_name: []const u8,
@@ -3512,7 +2726,7 @@ fn appendReplayableToolMessage(
     history_change = session.captureHistoryChangeLocked();
 }
 
-fn beginAssistantStream(session: *Session) !usize {
+pub fn beginAssistantStream(session: *Session) !usize {
     const allocator = session.allocator;
     if (sessionCancelled(session)) return error.Canceled;
 
@@ -3574,7 +2788,7 @@ fn appendAssistantStreamDelta(session: *Session, message_idx: usize, content_del
     history_change = session.captureHistoryChangeLocked();
 }
 
-fn finishAssistantStream(session: *Session, message_idx: usize, started_ms: i64, usage: ?ApiUsage) void {
+pub fn finishAssistantStream(session: *Session, message_idx: usize, started_ms: i64, usage: ?ApiUsage) void {
     if (session.closing.load(.acquire)) return;
     if (session.stop_requested.load(.acquire)) {
         finishStoppedRequest(session);
@@ -3613,7 +2827,7 @@ fn finishAssistantStream(session: *Session, message_idx: usize, started_ms: i64,
     session.setCompletionStatusLocked(started_ms, usage);
 }
 
-fn failAssistantStream(session: *Session, message_idx: ?usize, text: []const u8) void {
+pub fn failAssistantStream(session: *Session, message_idx: ?usize, text: []const u8) void {
     if (session.stop_requested.load(.acquire)) {
         finishStoppedRequest(session);
         return;
@@ -3627,1416 +2841,56 @@ fn failAssistantStream(session: *Session, message_idx: ?usize, text: []const u8)
     appendAssistantResult(session, .{ .content = @constCast(text) }, 0);
 }
 
-fn runChatRequest(request: *const ChatRequest) !ApiResult {
-    return runChatRequestForMessages(request, request.messages, request.agent_enabled);
-}
+// runChatRequest, runChatRequestForMessages, runChatRequestStreaming,
+// buildRequestJson, buildRequestJsonForMessages, and the ToolContext seam
+// adapters (toolApprove, toolCancelled, toolContextFromRequest, executeToolCall)
+// have moved to ai_chat_request.zig.
 
-fn runChatRequestForMessages(request: *const ChatRequest, messages: []const RequestMessage, include_tools: bool) !ApiResult {
-    if (requestCancelled(request)) return error.Canceled;
-    const allocator = request.allocator;
-    const endpoint = try apiEndpoint(allocator, request.base_url, request.protocol);
-    defer allocator.free(endpoint);
-
-    const body = try buildRequestJsonForMessages(allocator, request, messages, include_tools);
-    defer allocator.free(body);
-
-    const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
-    defer allocator.free(bearer);
-
-    var client: std.http.Client = .{
-        .allocator = allocator,
-        .write_buffer_size = 16384,
-    };
-    defer client.deinit();
-
-    var resp_buf: std.Io.Writer.Allocating = .init(allocator);
-    defer resp_buf.deinit();
-
-    const is_anthropic = request.protocol == .anthropic;
-    const anthropic_headers = [_]std.http.Header{
-        .{ .name = "x-api-key", .value = request.api_key },
-        .{ .name = "anthropic-version", .value = "2023-06-01" },
-    };
-    const result = client.fetch(.{
-        .location = .{ .url = endpoint },
-        .method = .POST,
-        .payload = body,
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
-            .authorization = if (is_anthropic) .omit else .{ .override = bearer },
-        },
-        .extra_headers = if (is_anthropic) &anthropic_headers else &.{},
-        .response_writer = &resp_buf.writer,
-    }) catch return error.RequestFailed;
-    if (requestCancelled(request)) return error.Canceled;
-
-    var resp_list = resp_buf.toArrayList();
-    defer resp_list.deinit(allocator);
-
-    if (result.status != .ok) {
-        const trimmed = std.mem.trim(u8, resp_list.items, " \t\r\n");
-        if (trimmed.len > 0) return ApiResult{ .content = try allocator.dupe(u8, trimmed) };
-        return ApiResult{ .content = try std.fmt.allocPrint(allocator, "HTTP {d}", .{@intFromEnum(result.status)}) };
-    }
-
-    return if (request.stream)
-        parseApiStreamResponse(allocator, resp_list.items)
-    else
-        parseApiResponse(allocator, resp_list.items, request.protocol);
-}
-
-fn runChatRequestStreaming(request: *const ChatRequest) !void {
-    if (requestCancelled(request)) return error.Canceled;
-    const allocator = request.allocator;
-    const endpoint = try apiEndpoint(allocator, request.base_url, request.protocol);
-    defer allocator.free(endpoint);
-
-    const body = try buildRequestJson(allocator, request);
-    defer allocator.free(body);
-
-    const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
-    defer allocator.free(bearer);
-
-    var client: std.http.Client = .{
-        .allocator = allocator,
-        .write_buffer_size = 16384,
-    };
-    defer client.deinit();
-
-    const is_anthropic = request.protocol == .anthropic;
-    const anthropic_headers = [_]std.http.Header{
-        .{ .name = "x-api-key", .value = request.api_key },
-        .{ .name = "anthropic-version", .value = "2023-06-01" },
-    };
-    const uri = try std.Uri.parse(endpoint);
-    var req = try client.request(.POST, uri, .{
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
-            .authorization = if (is_anthropic) .omit else .{ .override = bearer },
-        },
-        .extra_headers = if (is_anthropic) &anthropic_headers else &.{},
-        .keep_alive = false,
-    });
-    defer req.deinit();
-
-    try req.sendBodyComplete(body);
-
-    var redirect_buffer: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buffer);
-    if (requestCancelled(request)) return error.Canceled;
-    var transfer_buffer: [16 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-
-    if (response.head.status != .ok) {
-        var err_buf: std.Io.Writer.Allocating = .init(allocator);
-        defer err_buf.deinit();
-        _ = reader.streamRemaining(&err_buf.writer) catch {};
-        var err_list = err_buf.toArrayList();
-        defer err_list.deinit(allocator);
-        const trimmed = std.mem.trim(u8, err_list.items, " \t\r\n");
-        if (trimmed.len > 0) {
-            failAssistantStream(request.session, null, trimmed);
-        } else {
-            const msg = try std.fmt.allocPrint(allocator, "HTTP {d}", .{@intFromEnum(response.head.status)});
-            defer allocator.free(msg);
-            failAssistantStream(request.session, null, msg);
-        }
-        return;
-    }
-
-    const message_idx = try beginAssistantStream(request.session);
-    var usage: ?ApiUsage = null;
-    while (true) {
-        if (requestCancelled(request)) return error.Canceled;
-        const line = reader.takeDelimiter('\n') catch |err| {
-            if (requestCancelled(request)) return error.Canceled;
-            const msg = std.fmt.allocPrint(allocator, "Stream read failed: {}", .{err}) catch return err;
-            defer allocator.free(msg);
-            failAssistantStream(request.session, message_idx, msg);
-            return;
-        } orelse break;
-
-        if (requestCancelled(request)) return error.Canceled;
-        if (try applyApiStreamLineToSession(allocator, request.session, message_idx, line, &usage)) break;
-    }
-    finishAssistantStream(request.session, message_idx, request.started_ms, usage);
-}
-
-// Endpoint and request-building delegates to ai_chat_protocol
+// Protocol aliases still referenced internally (e.g. in tests).
 const apiEndpoint = ai_chat_protocol.apiEndpoint;
 const chatEndpoint = ai_chat_protocol.chatEndpoint;
-const appendJsonString = ai_chat_protocol.appendJsonString;
 const isDeepSeekBaseUrl = ai_chat_protocol.isDeepSeekBaseUrl;
 const isAnthropicBaseUrl = ai_chat_protocol.isAnthropicBaseUrl;
 
-fn buildRequestJson(allocator: std.mem.Allocator, request: *const ChatRequest) ![]u8 {
-    return ai_chat_protocol.buildRequestJson(allocator, request.toParams(), request.messages, request.agent_enabled);
-}
-
-fn buildRequestJsonForMessages(allocator: std.mem.Allocator, request: *const ChatRequest, messages: []const RequestMessage, include_tools: bool) ![]u8 {
-    return ai_chat_protocol.buildRequestJson(allocator, request.toParams(), messages, include_tools);
-}
-
-fn executeToolCall(request: *ChatRequest, call: ToolCall) ![]u8 {
-    if (requestCancelled(request)) return request.allocator.dupe(u8, "Canceled.");
-    if (std.mem.eql(u8, call.name, "terminal_list")) {
-        return terminalListTool(request);
-    }
-    if (std.mem.eql(u8, call.name, "terminal_snapshot")) {
-        const args = parseArgs(request.allocator, call.arguments);
-        defer if (args) |parsed| parsed.deinit();
-        const surface_id = if (args) |parsed| jsonStringArg(parsed.value, "surface_id") else null;
-        return terminalSnapshotTool(request, surface_id);
-    }
-    if (std.mem.eql(u8, call.name, "terminal_select")) {
-        const args = parseArgs(request.allocator, call.arguments) orelse return request.allocator.dupe(u8, "Invalid tool arguments");
-        defer args.deinit();
-        const surface_id = jsonStringArg(args.value, "surface_id") orelse return request.allocator.dupe(u8, "Missing surface_id");
-        return terminalSelectTool(request, surface_id);
-    }
-    if (std.mem.eql(u8, call.name, platform_process.localCommandToolName())) {
-        const args = parseArgs(request.allocator, call.arguments) orelse return request.allocator.dupe(u8, "Invalid tool arguments");
-        defer args.deinit();
-        const command = jsonStringArg(args.value, "command") orelse return request.allocator.dupe(u8, "Missing command");
-        const cwd = jsonStringArg(args.value, "cwd");
-        const timeout_ms = jsonIntArg(args.value, "timeout_ms") orelse currentAgentSettings().command_timeout_ms;
-        return localCommandExecTool(request, command, cwd, timeout_ms);
-    }
-    if (std.mem.eql(u8, call.name, "ssh_session_exec")) {
-        const args = parseArgs(request.allocator, call.arguments) orelse return request.allocator.dupe(u8, "Invalid tool arguments");
-        defer args.deinit();
-        const surface_id = jsonStringArg(args.value, "surface_id") orelse defaultExecSurfaceId(request) orelse return request.allocator.dupe(u8, "Missing surface_id");
-        const command = jsonStringArg(args.value, "command") orelse return request.allocator.dupe(u8, "Missing command");
-        const timeout_ms = jsonIntArg(args.value, "timeout_ms") orelse currentAgentSettings().command_timeout_ms;
-        return sshSessionExecTool(request, surface_id, command, timeout_ms);
-    }
-    if (std.mem.eql(u8, call.name, "wsl_session_exec")) {
-        const args = parseArgs(request.allocator, call.arguments) orelse return request.allocator.dupe(u8, "Invalid tool arguments");
-        defer args.deinit();
-        const surface_id = jsonStringArg(args.value, "surface_id") orelse defaultExecSurfaceId(request) orelse return request.allocator.dupe(u8, "Missing surface_id");
-        const command = jsonStringArg(args.value, "command") orelse return request.allocator.dupe(u8, "Missing command");
-        const timeout_ms = jsonIntArg(args.value, "timeout_ms") orelse currentAgentSettings().command_timeout_ms;
-        return wslSessionExecTool(request, surface_id, command, timeout_ms);
-    }
-    if (std.mem.eql(u8, call.name, "terminal_repl_exec")) {
-        const args = parseArgs(request.allocator, call.arguments) orelse return request.allocator.dupe(u8, "Invalid tool arguments");
-        defer args.deinit();
-        const surface_id = jsonStringArg(args.value, "surface_id") orelse defaultExecSurfaceId(request) orelse return request.allocator.dupe(u8, "Missing surface_id");
-        const repl = jsonStringArg(args.value, "repl") orelse return request.allocator.dupe(u8, "Missing repl");
-        const code = jsonStringArg(args.value, "code") orelse return request.allocator.dupe(u8, "Missing code");
-        const timeout_ms = jsonIntArg(args.value, "timeout_ms") orelse currentAgentSettings().command_timeout_ms;
-        return terminalReplExecTool(request, surface_id, repl, code, timeout_ms);
-    }
-    if (std.mem.eql(u8, call.name, "ssh_profile_save")) {
-        const args = parseArgs(request.allocator, call.arguments) orelse return request.allocator.dupe(u8, "Invalid tool arguments");
-        defer args.deinit();
-        const host = jsonStringArg(args.value, "host") orelse return request.allocator.dupe(u8, "Missing host");
-        const user = jsonStringArg(args.value, "user") orelse return request.allocator.dupe(u8, "Missing user");
-        return sshProfileSaveTool(request, .{
-            .name = jsonStringArg(args.value, "name") orelse "",
-            .host = host,
-            .user = user,
-            .password = jsonStringArg(args.value, "password") orelse "",
-            .port = jsonStringArg(args.value, "port") orelse "",
-            .proxy_jump = jsonStringArg(args.value, "proxy_jump") orelse "",
-        });
-    }
-    if (std.mem.eql(u8, call.name, "ssh_profile_connect")) {
-        const args = parseArgs(request.allocator, call.arguments) orelse return request.allocator.dupe(u8, "Invalid tool arguments");
-        defer args.deinit();
-        const profile_name = jsonStringArg(args.value, "profile_name") orelse return request.allocator.dupe(u8, "Missing profile_name");
-        return sshProfileConnectTool(request, profile_name);
-    }
-    if (std.mem.eql(u8, call.name, "tab_new")) {
-        const args = parseArgs(request.allocator, call.arguments) orelse return request.allocator.dupe(u8, "Invalid tool arguments");
-        defer args.deinit();
-        const kind = jsonStringArg(args.value, "kind") orelse "default";
-        const command = jsonStringArg(args.value, "command");
-        return tabNewTool(request, kind, command);
-    }
-    if (std.mem.eql(u8, call.name, "tab_close")) {
-        const args = parseArgs(request.allocator, call.arguments) orelse return request.allocator.dupe(u8, "Invalid tool arguments");
-        defer args.deinit();
-        var tab_index = jsonIndexArg(args.value, "tab_index");
-        if (tab_index == null) {
-            if (jsonIndexArg(args.value, "tab_number")) |tab_number| {
-                if (tab_number > 0) tab_index = tab_number - 1;
-            }
-        }
-        const surface_id = jsonStringArg(args.value, "surface_id");
-        const title = jsonStringArg(args.value, "title");
-        return tabCloseTool(request, tab_index, surface_id, title);
-    }
-    if (std.mem.eql(u8, call.name, "skill_info")) {
-        const args = parseArgs(request.allocator, call.arguments) orelse return request.allocator.dupe(u8, "Invalid tool arguments");
-        defer args.deinit();
-        const skill_name = jsonStringArg(args.value, "skill_name") orelse return request.allocator.dupe(u8, "Missing skill_name");
-        return skillInfoTool(request.allocator, skill_name);
-    }
-    if (std.mem.eql(u8, call.name, "wispterm_docs")) {
-        const args = parseArgs(request.allocator, call.arguments);
-        defer if (args) |parsed| parsed.deinit();
-        const topic = if (args) |parsed| jsonStringArg(parsed.value, "topic") else null;
-        return wisptermDocsTool(request.allocator, topic);
-    }
-    if (std.mem.eql(u8, call.name, "weixin_send_attachment")) {
-        const args = parseArgs(request.allocator, call.arguments) orelse return request.allocator.dupe(u8, "Invalid tool arguments");
-        defer args.deinit();
-        const kind_text = jsonStringArg(args.value, "kind") orelse return request.allocator.dupe(u8, "Missing kind");
-        const kind = weixin_types.AttachmentKind.parse(kind_text) orelse return request.allocator.dupe(u8, "Invalid kind; expected file, image, or voice");
-        const path = jsonStringArg(args.value, "path") orelse return request.allocator.dupe(u8, "Missing path");
-        const display_name = jsonStringArg(args.value, "display_name") orelse "";
-        return weixinSendAttachmentTool(request, kind, path, display_name);
-    }
-    return std.fmt.allocPrint(request.allocator, "Unknown tool: {s}", .{call.name});
-}
-
-fn parseArgs(allocator: std.mem.Allocator, text: []const u8) ?std.json.Parsed(std.json.Value) {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    const body = if (trimmed.len == 0) "{}" else trimmed;
-    return std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch null;
-}
-
-fn jsonStringArg(root: std.json.Value, name: []const u8) ?[]const u8 {
-    if (root != .object) return null;
-    const value = root.object.get(name) orelse return null;
-    if (value != .string or value.string.len == 0) return null;
-    return value.string;
-}
-
-fn jsonIntArg(root: std.json.Value, name: []const u8) ?u32 {
-    if (root != .object) return null;
-    const value = root.object.get(name) orelse return null;
-    return switch (value) {
-        .integer => |v| if (v > 0 and v <= std.math.maxInt(u32)) @intCast(v) else null,
-        .float => |v| if (v > 0 and v <= @as(f64, @floatFromInt(std.math.maxInt(u32)))) @intFromFloat(v) else null,
-        else => null,
-    };
-}
-
-fn jsonIndexArg(root: std.json.Value, name: []const u8) ?usize {
-    if (root != .object) return null;
-    const value = root.object.get(name) orelse return null;
-    return switch (value) {
-        .integer => |v| if (v >= 0 and v <= std.math.maxInt(usize)) @intCast(v) else null,
-        .float => |v| if (v >= 0 and v <= @as(f64, @floatFromInt(std.math.maxInt(usize)))) @intFromFloat(v) else null,
-        else => null,
-    };
-}
-
-fn skillInfoTool(allocator: std.mem.Allocator, skill_name: []const u8) ![]u8 {
-    const roots = try defaultSkillRootPaths(allocator);
-    defer freeSkillRootPaths(allocator, roots);
-    return skillInfoToolFromRoots(allocator, skill_name, roots);
-}
-
-fn skillInfoToolFromRoots(allocator: std.mem.Allocator, skill_name: []const u8, root_paths: []const []const u8) ![]u8 {
-    var snapshot = loadSkillSnapshotFromRoots(allocator, skill_name, root_paths) catch |err| switch (err) {
-        skill_registry.LookupError.SkillNotFound => return std.fmt.allocPrint(allocator, "Skill not found: {s}", .{skill_name}),
-        skill_registry.LookupError.DuplicateSkillName => return std.fmt.allocPrint(allocator, "Duplicate skill name: {s}", .{skill_name}),
-        skill_registry.LookupError.InvalidSkillMarkdown => return std.fmt.allocPrint(allocator, "Invalid SKILL.md for skill: {s}", .{skill_name}),
-        skill_registry.LookupError.SkillTooLarge => return std.fmt.allocPrint(allocator, "SKILL.md too large for skill: {s}", .{skill_name}),
-        else => |e| return std.fmt.allocPrint(allocator, "Failed to load skill {s}: {}", .{ skill_name, e }),
-    };
-    defer snapshot.deinit(allocator);
-    return allocator.dupe(u8, snapshot.content);
-}
-
-fn wisptermDocsTool(allocator: std.mem.Allocator, topic: ?[]const u8) ![]u8 {
-    if (topic) |name| {
-        if (wispterm_docs.readTopic(name)) |content| {
-            return allocator.dupe(u8, content);
-        }
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer out.deinit(allocator);
-        try out.print(allocator, "Unknown topic \"{s}\". Available topics:", .{name});
-        for (wispterm_docs.topics) |t| {
-            try out.print(allocator, " {s}", .{t.name});
-        }
-        return out.toOwnedSlice(allocator);
-    }
-    return wispterm_docs.listTopics(allocator);
-}
-
-fn weixinSendAttachmentTool(
-    request: *ChatRequest,
-    kind: weixin_types.AttachmentKind,
-    path: []const u8,
-    display_name: []const u8,
-) ![]u8 {
-    const ctx = request.weixin_reply_context orelse {
-        return request.allocator.dupe(u8, "No active Weixin reply context; cannot send attachment.");
-    };
-    ctx.sender.sendAttachment(kind, path, display_name, ctx.to_user_id, ctx.context_token) catch |err| {
-        return std.fmt.allocPrint(request.allocator, "Failed to send {s} to Weixin: {}", .{ kind.name(), err });
-    };
-    const shown = if (display_name.len != 0) display_name else std.fs.path.basename(path);
-    return std.fmt.allocPrint(request.allocator, "Sent {s} to Weixin: {s}", .{ kind.name(), shown });
-}
-
-fn toolSurfaceKind(surface: ToolSurface) []const u8 {
-    if (surface.is_ssh) return "ssh";
-    if (surface.is_wsl) return "wsl";
-    return "terminal";
-}
-
-fn terminalListTool(request: *const ChatRequest) ![]u8 {
-    const snapshot = collectToolSnapshot(request) catch return request.allocator.dupe(u8, "No terminal snapshot host is available.");
-    defer snapshot.deinit(request.allocator);
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(request.allocator);
-    const selected = selectedWriteContext(request);
-    // tab/active_tab are shown one-based to match the tab numbers the user sees
-    // in the UI (the internal tab_index is zero-based).
-    try out.print(request.allocator, "active_tab={d}\n", .{snapshot.active_tab + 1});
-    if (selected) |id| {
-        try out.print(request.allocator, "selected_context={s}\n", .{id});
-    } else {
-        try out.appendSlice(request.allocator, "selected_context=none\n");
-    }
-    for (snapshot.surfaces) |surface| {
-        const is_selected = if (selected) |id| std.mem.eql(u8, id, surface.id) else false;
-        try out.print(request.allocator, "- id={s} tab={d} focused={} selected={} kind={s} title=\"{s}\" cwd=\"{s}\"", .{
-            surface.id,
-            surface.tab_index + 1,
-            surface.focused,
-            is_selected,
-            toolSurfaceKind(surface),
-            surface.title,
-            surface.cwd,
-        });
-        if (surface.agent_app != .none) {
-            try out.print(request.allocator, " agent={s}:{s} confidence={d}", .{
-                surface.agent_app.label(),
-                surface.agent_state.label(),
-                surface.agent_confidence,
-            });
-        }
-        try out.append(request.allocator, '\n');
-    }
-    return truncateOwned(request.allocator, try out.toOwnedSlice(request.allocator));
-}
-
-fn terminalSnapshotTool(request: *const ChatRequest, surface_id: ?[]const u8) ![]u8 {
-    const snapshot = collectToolSnapshot(request) catch return request.allocator.dupe(u8, "No terminal snapshot host is available.");
-    defer snapshot.deinit(request.allocator);
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(request.allocator);
-
-    for (snapshot.surfaces) |surface| {
-        if (surface_id) |id| {
-            if (!std.mem.eql(u8, surface.id, id)) continue;
-        }
-        try out.print(request.allocator, "surface={s} title=\"{s}\" kind={s} focused={}", .{
-            surface.id,
-            surface.title,
-            toolSurfaceKind(surface),
-            surface.focused,
-        });
-        if (surface.agent_app != .none) {
-            try out.print(request.allocator, " agent={s}:{s} confidence={d}", .{
-                surface.agent_app.label(),
-                surface.agent_state.label(),
-                surface.agent_confidence,
-            });
-        }
-        try out.append(request.allocator, '\n');
-        try out.appendSlice(request.allocator, surface.snapshot);
-        try out.appendSlice(request.allocator, "\n---\n");
-    }
-    if (out.items.len == 0) try out.appendSlice(request.allocator, "No matching terminal surface.");
-    return truncateOwned(request.allocator, try out.toOwnedSlice(request.allocator));
-}
-
-fn terminalSelectTool(request: *ChatRequest, surface_id: []const u8) ![]u8 {
-    const snapshot = collectToolSnapshot(request) catch return request.allocator.dupe(u8, "No terminal snapshot host is available.");
-    defer snapshot.deinit(request.allocator);
-    const surface = findSurface(snapshot, surface_id) orelse return std.fmt.allocPrint(request.allocator, "No matching terminal surface for surface_id={s}.", .{surface_id});
-    setWriteContext(request, surface.id);
-    return std.fmt.allocPrint(
-        request.allocator,
-        "selected surface_id={s} tab={d} focused={} kind={s} title=\"{s}\" cwd=\"{s}\"",
-        .{
-            surface.id,
-            surface.tab_index + 1,
-            surface.focused,
-            toolSurfaceKind(surface),
-            surface.title,
-            surface.cwd,
-        },
-    );
-}
-
-fn collectToolSnapshot(request: *const ChatRequest) !ToolSnapshot {
-    if (request.tool_snapshot) |snapshot| {
-        return snapshot.clone(request.allocator);
-    }
-    const host = request.tool_host orelse return error.NoTerminalSnapshotHost;
-    return host.collectSnapshot(host.ctx, request.allocator);
-}
-
-fn rememberConnectedSurface(request: *ChatRequest, surface: ToolSurface) !void {
-    setWriteContext(request, surface.id);
-    if (request.tool_snapshot) |*snapshot| {
-        for (snapshot.surfaces) |*existing| {
-            existing.focused = false;
-        }
-        const prev_len = snapshot.surfaces.len;
-        snapshot.surfaces = try request.allocator.realloc(snapshot.surfaces, prev_len + 1);
-        snapshot.surfaces[prev_len] = surface;
-        snapshot.active_tab = surface.tab_index;
-        return;
-    }
-
-    const surfaces = try request.allocator.alloc(ToolSurface, 1);
-    surfaces[0] = surface;
-    request.tool_snapshot = .{
-        .surfaces = surfaces,
-        .active_tab = surface.tab_index,
-    };
-}
-
-fn rememberClosedTab(request: *ChatRequest, closed: ToolClosedTab) !void {
-    if (request.tool_snapshot) |*snapshot| {
-        var write: usize = 0;
-        const closed_active = snapshot.active_tab == closed.tab_index;
-        for (snapshot.surfaces) |*surface| {
-            if (surface.tab_index == closed.tab_index) {
-                surface.deinit(request.allocator);
-                continue;
-            }
-            if (surface.tab_index > closed.tab_index) {
-                surface.tab_index -= 1;
-            }
-            snapshot.surfaces[write] = surface.*;
-            write += 1;
-        }
-
-        snapshot.surfaces = try request.allocator.realloc(snapshot.surfaces, write);
-        snapshot.active_tab = closed.active_tab;
-
-        if (closed_active) {
-            var focused_set = false;
-            for (snapshot.surfaces) |*surface| {
-                if (surface.tab_index == snapshot.active_tab and !focused_set) {
-                    surface.focused = true;
-                    focused_set = true;
-                } else {
-                    surface.focused = false;
-                }
-            }
-        } else {
-            for (snapshot.surfaces) |*surface| {
-                surface.focused = surface.focused and surface.tab_index == snapshot.active_tab;
-            }
-        }
-    }
-}
-
-fn localCommandExecTool(request: *const ChatRequest, command: []const u8, cwd: ?[]const u8, timeout_ms: u32) ![]u8 {
-    const settings = currentAgentSettings();
-    if (requestCancelled(request)) return request.allocator.dupe(u8, "Canceled.");
-    const dangerous = isDangerousCommand(command);
-    if (settings.permission != .full or dangerous) {
-        const reason = if (dangerous) DANGEROUS_COMMAND_APPROVAL_REASON else platform_process.localCommandApprovalLabel();
-        if (!request.session.requestApproval(platform_process.localCommandToolName(), command, reason)) {
-            return deniedResult(request.allocator, command, platform_process.localCommandDeniedReason());
-        }
-    }
-    const result = runShellCommand(request.allocator, command, cwd, settings.output_limit, timeout_ms, request.session) catch |err| {
-        return std.fmt.allocPrint(request.allocator, "{s} failed: {}", .{ platform_process.localCommandFailureLabel(), err });
-    };
-    defer request.allocator.free(result.stdout);
-    defer request.allocator.free(result.stderr);
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(request.allocator);
-    if (result.timed_out) try out.appendSlice(request.allocator, "timed_out=true\n");
-    try out.print(request.allocator, "exit_code={d}\nstdout:\n{s}\nstderr:\n{s}", .{ result.exit_code, result.stdout, result.stderr });
-    return truncateOwned(request.allocator, try out.toOwnedSlice(request.allocator));
-}
-
-const ShellResult = struct {
-    exit_code: i32,
-    stdout: []u8,
-    stderr: []u8,
-    timed_out: bool = false,
-};
-
-fn runShellCommand(allocator: std.mem.Allocator, command: []const u8, cwd: ?[]const u8, output_limit: u32, timeout_ms: u32, session: ?*Session) !ShellResult {
-    var index: usize = 0;
-    var last_err: ?anyerror = null;
-    while (platform_process.localShellFallbackCommandArgv(index, command)) |argv| : (index += 1) {
-        if (runArgv(allocator, argv.slice(), cwd, output_limit, timeout_ms, session)) |result| {
-            return result;
-        } else |err| {
-            last_err = err;
-        }
-    }
-    return if (last_err) |err| err else error.NoLocalShellFallback;
-}
-
-const CaptureOutput = struct {
-    allocator: std.mem.Allocator,
-    file: std.fs.File,
-    max_bytes: usize,
-    data: []u8 = &.{},
-    truncated: bool = false,
-    failed: bool = false,
-
-    fn deinit(self: *CaptureOutput) void {
-        self.allocator.free(self.data);
-        self.data = &.{};
-    }
-};
-
-fn runArgv(allocator: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8, output_limit: u32, timeout_ms: u32, session: ?*Session) !ShellResult {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.cwd = cwd;
-    child.create_no_window = true;
-    try child.spawn();
-
-    var stdout_capture = CaptureOutput{
-        .allocator = allocator,
-        .file = child.stdout.?,
-        .max_bytes = output_limit,
-    };
-    errdefer stdout_capture.deinit();
-    var stderr_capture = CaptureOutput{
-        .allocator = allocator,
-        .file = child.stderr.?,
-        .max_bytes = output_limit,
-    };
-    errdefer stderr_capture.deinit();
-
-    const stdout_thread = try std.Thread.spawn(.{}, captureOutputThread, .{&stdout_capture});
-    const stderr_thread = try std.Thread.spawn(.{}, captureOutputThread, .{&stderr_capture});
-
-    const wait_ms = @max(timeout_ms, 1);
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(wait_ms));
-    var timed_out = false;
-    var canceled = false;
-    while (true) {
-        switch (platform_process.childExited(child.id, 25)) {
-            .running => {},
-            .exited => |code| {
-                // On POSIX childExited() already reaped the zombie via
-                // waitpid(WNOHANG). Pre-set Child.term so the child.wait()
-                // below takes std's cleanup-only fast path instead of calling
-                // waitpid() a second time — that second wait would hit ECHILD,
-                // which Zig's std.posix.waitpid treats as `unreachable` (abort).
-                // On Windows the process handle is NOT consumed by the poll, so
-                // leave term unset and let child.wait() close the handle.
-                if (builtin.os.tag != .windows) child.term = .{ .Exited = @intCast(code) };
-                break;
-            },
-            .gone => {
-                if (builtin.os.tag != .windows) child.term = .{ .Unknown = 0 };
-                break;
-            },
-        }
-        if (session) |s| {
-            if (sessionCancelled(s)) {
-                canceled = true;
-                _ = child.kill() catch {};
-                break;
-            }
-        }
-        if (std.time.milliTimestamp() >= deadline) {
-            timed_out = true;
-            _ = child.kill() catch {};
-            break;
-        }
-    }
-
-    stdout_thread.join();
-    stderr_thread.join();
-
-    const exit_code: i32 = if (timed_out or canceled) 124 else blk: {
-        const term = try child.wait();
-        break :blk switch (term) {
-            .Exited => |code| @intCast(code),
-            .Signal => |sig| -@as(i32, @intCast(sig)),
-            .Stopped => |sig| -@as(i32, @intCast(sig)),
-            .Unknown => |code| @intCast(code),
-        };
-    };
-    return .{
-        .exit_code = exit_code,
-        .stdout = stdout_capture.data,
-        .stderr = stderr_capture.data,
-        .timed_out = timed_out or canceled,
-    };
-}
-
-fn captureOutputThread(capture: *CaptureOutput) void {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer {
-        if (capture.failed) out.deinit(capture.allocator);
-    }
-
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = capture.file.read(&buf) catch {
-            break;
-        };
-        if (n == 0) break;
-        if (out.items.len < capture.max_bytes) {
-            const remaining = capture.max_bytes - out.items.len;
-            const take = @min(remaining, n);
-            out.appendSlice(capture.allocator, buf[0..take]) catch {
-                capture.failed = true;
-                return;
-            };
-            if (take < n) capture.truncated = true;
-        } else {
-            capture.truncated = true;
-        }
-    }
-
-    if (capture.truncated) {
-        out.appendSlice(capture.allocator, "\n...[truncated]\n") catch {};
-    }
-    capture.data = out.toOwnedSlice(capture.allocator) catch blk: {
-        capture.failed = true;
-        break :blk &.{};
-    };
-}
-
-const UnixSessionKind = enum {
-    ssh,
-    wsl,
-
-    fn toolName(self: UnixSessionKind) []const u8 {
-        return switch (self) {
-            .ssh => "ssh_session_exec",
-            .wsl => "wsl_session_exec",
-        };
-    }
-
-    fn label(self: UnixSessionKind) []const u8 {
-        return switch (self) {
-            .ssh => "SSH",
-            .wsl => "WSL",
-        };
-    }
-
-    fn matches(self: UnixSessionKind, surface: ToolSurface) bool {
-        return switch (self) {
-            .ssh => surface.is_ssh,
-            .wsl => surface.is_wsl,
-        };
-    }
-};
-
-fn sshSessionExecTool(request: *ChatRequest, surface_id: []const u8, command: []const u8, timeout_ms: u32) ![]u8 {
-    return unixSessionExecTool(request, .ssh, surface_id, command, timeout_ms);
-}
-
-fn wslSessionExecTool(request: *ChatRequest, surface_id: []const u8, command: []const u8, timeout_ms: u32) ![]u8 {
-    return unixSessionExecTool(request, .wsl, surface_id, command, timeout_ms);
-}
-
-const ReplKind = enum {
-    r,
-    python,
-    codex,
-    claude_code,
-    plain,
-
-    fn parse(value: []const u8) ?ReplKind {
-        if (std.ascii.eqlIgnoreCase(value, "r") or std.ascii.eqlIgnoreCase(value, "R")) return .r;
-        if (std.ascii.eqlIgnoreCase(value, "python") or std.ascii.eqlIgnoreCase(value, "py")) return .python;
-        if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
-        if (std.ascii.eqlIgnoreCase(value, "claude") or
-            std.ascii.eqlIgnoreCase(value, "claude_code") or
-            std.ascii.eqlIgnoreCase(value, "claude-code"))
-        {
-            return .claude_code;
-        }
-        if (std.ascii.eqlIgnoreCase(value, "plain") or std.ascii.eqlIgnoreCase(value, "text")) return .plain;
-        return null;
-    }
-
-    fn label(self: ReplKind) []const u8 {
-        return switch (self) {
-            .r => "R",
-            .python => "Python",
-            .codex => "Codex",
-            .claude_code => "Claude Code",
-            .plain => "plain",
-        };
-    }
-};
-
-fn terminalReplExecTool(request: *ChatRequest, surface_id: []const u8, repl_name: []const u8, code: []const u8, timeout_ms: u32) ![]u8 {
-    const repl = ReplKind.parse(repl_name) orelse return std.fmt.allocPrint(request.allocator, "Unsupported repl \"{s}\". Use r, python, codex, claude_code, or plain.", .{repl_name});
-    const settings = currentAgentSettings();
-    if (requestCancelled(request)) return request.allocator.dupe(u8, "Canceled.");
-    const dangerous = isDangerousCommand(code);
-    if (settings.permission != .full or dangerous) {
-        var reason_buf: [96]u8 = undefined;
-        const reason = if (dangerous)
-            DANGEROUS_COMMAND_APPROVAL_REASON
-        else
-            std.fmt.bufPrint(&reason_buf, "Type input into opened {s} REPL/app terminal", .{repl.label()}) catch "Type input into terminal";
-        if (!request.session.requestApproval("terminal_repl_exec", code, reason)) {
-            return deniedResult(request.allocator, code, "operator rejected REPL terminal input");
-        }
-    }
-
-    const snapshot = collectToolSnapshot(request) catch return request.allocator.dupe(u8, "No terminal snapshot host is available.");
-    defer snapshot.deinit(request.allocator);
-    const host = request.tool_host orelse return request.allocator.dupe(u8, "No terminal tool host is available.");
-    const surface = findSurface(snapshot, surface_id) orelse return request.allocator.dupe(u8, "No matching terminal surface.");
-    if (try ensureWriteContext(request, surface)) |message| return message;
-
-    return switch (repl) {
-        .r => rSessionEvalTool(request, host, surface, code, timeout_ms),
-        .python => pythonSessionEvalTool(request, host, surface, code, timeout_ms),
-        .codex, .claude_code => plainReplInputTool(request, host, surface, repl, code, timeout_ms),
-        .plain => plainReplInputTool(request, host, surface, repl, code, timeout_ms),
-    };
-}
-
-fn plainReplSubmitKey(repl: ReplKind, surface: ToolSurface) []const u8 {
-    if (repl == .codex and surface.agent_state == .running) return "\t";
-    return "\r";
-}
-
-fn allocPlainReplInput(allocator: std.mem.Allocator, repl: ReplKind, surface: ToolSurface, text: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ text, plainReplSubmitKey(repl, surface) });
-}
-
-fn plainReplInputTool(request: *const ChatRequest, host: ToolHost, surface: ToolSurface, repl: ReplKind, text: []const u8, timeout_ms: u32) ![]u8 {
-    const input = try allocPlainReplInput(request.allocator, repl, surface, text);
-    defer request.allocator.free(input);
-
-    if (!host.writeSurface(host.ctx, surface.ptr, input)) {
-        return request.allocator.dupe(u8, "Failed to write to terminal surface.");
-    }
-
-    const wait_ms = @min(@max(timeout_ms, 500), 5000);
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(wait_ms));
-    while (std.time.milliTimestamp() < deadline) {
-        if (requestCancelled(request)) return request.allocator.dupe(u8, "Canceled.");
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-    }
-
-    const latest = host.surfaceSnapshot(host.ctx, request.allocator, surface.ptr) catch return request.allocator.dupe(u8, "Input sent; failed to read terminal snapshot.");
-    return truncateOwned(request.allocator, latest);
-}
-
-fn rSessionEvalTool(request: *const ChatRequest, host: ToolHost, surface: ToolSurface, code: []const u8, timeout_ms: u32) ![]u8 {
-    const nonce = std.time.milliTimestamp();
-    const code_literal = try rStringLiteral(request.allocator, code);
-    defer request.allocator.free(code_literal);
-
-    const wrapped = try std.fmt.allocPrint(
-        request.allocator,
-        "cat(\"\\n__WISPTERM_AGENT_START_{d}__\\n\", sep=\"\")\n.wispterm_agent_status <- 0L\n.wispterm_agent_code <- {s}\ntryCatch({{\n  eval(parse(text=.wispterm_agent_code), envir=.GlobalEnv)\n}}, error=function(e) {{\n  .wispterm_agent_status <<- 1L\n  message(\"Error: \", conditionMessage(e))\n}})\ncat(\"\\n__WISPTERM_AGENT_END_{d}__:\", .wispterm_agent_status, \"\\n\", sep=\"\")\nrm(.wispterm_agent_status, .wispterm_agent_code)\r",
-        .{ nonce, code_literal, nonce },
-    );
-    defer request.allocator.free(wrapped);
-
-    if (!host.writeSurface(host.ctx, surface.ptr, wrapped)) {
-        return request.allocator.dupe(u8, "Failed to write to R terminal surface.");
-    }
-
-    const start_marker = try std.fmt.allocPrint(request.allocator, "__WISPTERM_AGENT_START_{d}__", .{nonce});
-    defer request.allocator.free(start_marker);
-    const end_marker = try std.fmt.allocPrint(request.allocator, "__WISPTERM_AGENT_END_{d}__", .{nonce});
-    defer request.allocator.free(end_marker);
-    return waitForSentinelResult(request, host, surface, "R", start_marker, end_marker, timeout_ms);
-}
-
-fn pythonSessionEvalTool(request: *const ChatRequest, host: ToolHost, surface: ToolSurface, code: []const u8, timeout_ms: u32) ![]u8 {
-    const nonce = std.time.milliTimestamp();
-    const code_literal = try pythonStringLiteral(request.allocator, code);
-    defer request.allocator.free(code_literal);
-
-    const wrapper = try std.fmt.allocPrint(
-        request.allocator,
-        "print(\"\\\\n__WISPTERM_AGENT_START_{d}__\")\n__wispterm_agent_status = 0\n__wispterm_agent_code = {s}\ntry:\n    exec(__wispterm_agent_code, globals())\nexcept Exception:\n    __wispterm_agent_status = 1\n    import traceback\n    traceback.print_exc()\nprint(\"\\\\n__WISPTERM_AGENT_END_{d}__:%s\" % __wispterm_agent_status)\ndel __wispterm_agent_status, __wispterm_agent_code",
-        .{ nonce, code_literal, nonce },
-    );
-    defer request.allocator.free(wrapper);
-
-    const wrapper_literal = try pythonStringLiteral(request.allocator, wrapper);
-    defer request.allocator.free(wrapper_literal);
-    const wrapped = try std.fmt.allocPrint(request.allocator, "exec({s})\r", .{wrapper_literal});
-    defer request.allocator.free(wrapped);
-
-    if (!host.writeSurface(host.ctx, surface.ptr, wrapped)) {
-        return request.allocator.dupe(u8, "Failed to write to Python terminal surface.");
-    }
-
-    const start_marker = try std.fmt.allocPrint(request.allocator, "__WISPTERM_AGENT_START_{d}__", .{nonce});
-    defer request.allocator.free(start_marker);
-    const end_marker = try std.fmt.allocPrint(request.allocator, "__WISPTERM_AGENT_END_{d}__", .{nonce});
-    defer request.allocator.free(end_marker);
-    return waitForSentinelResult(request, host, surface, "Python", start_marker, end_marker, timeout_ms);
-}
-
-fn rStringLiteral(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    return doubleQuotedStringLiteral(allocator, text);
-}
-
-fn pythonStringLiteral(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    return doubleQuotedStringLiteral(allocator, text);
-}
-
-fn doubleQuotedStringLiteral(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    try out.append(allocator, '"');
-    for (text) |ch| {
-        switch (ch) {
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, ch),
-        }
-    }
-    try out.append(allocator, '"');
-    return out.toOwnedSlice(allocator);
-}
-
-fn unixSessionExecTool(request: *ChatRequest, kind: UnixSessionKind, surface_id: []const u8, command: []const u8, timeout_ms: u32) ![]u8 {
-    const settings = currentAgentSettings();
-    if (requestCancelled(request)) return request.allocator.dupe(u8, "Canceled.");
-    const dangerous = isDangerousCommand(command);
-    if (settings.permission != .full or dangerous) {
-        var reason_buf: [64]u8 = undefined;
-        const reason = if (dangerous)
-            DANGEROUS_COMMAND_APPROVAL_REASON
-        else
-            std.fmt.bufPrint(&reason_buf, "Type command into opened {s} terminal", .{kind.label()}) catch "Type command into terminal";
-        if (!request.session.requestApproval(kind.toolName(), command, reason)) {
-            return deniedResult(request.allocator, command, if (kind == .ssh) "operator rejected SSH PTY command" else "operator rejected WSL PTY command");
-        }
-    }
-    const snapshot = collectToolSnapshot(request) catch return request.allocator.dupe(u8, "No terminal snapshot host is available.");
-    defer snapshot.deinit(request.allocator);
-    const host = request.tool_host orelse return request.allocator.dupe(u8, "No terminal tool host is available.");
-    const surface = findSurface(snapshot, surface_id) orelse return request.allocator.dupe(u8, "No matching terminal surface.");
-    if (try ensureWriteContext(request, surface)) |message| return message;
-    if (!kind.matches(surface)) {
-        return std.fmt.allocPrint(request.allocator, "Target surface is not an opened {s} session.", .{kind.label()});
-    }
-
-    const nonce = std.time.milliTimestamp();
-    // Keep the agent's injected command out of the user's shell history. We
-    // enable ignore-space (zsh HIST_IGNORE_SPACE / bash HISTCONTROL=ignorespace)
-    // and prefix the whole line with a single leading space. An interactive
-    // shell decides whether to record a line at submit time, so the option must
-    // be on *before* the line is read: once the first agent command in a session
-    // has run, the option stays set and every subsequent space-prefixed line is
-    // dropped from history. At most the very first line can leak. The user's own
-    // typed commands are unaffected. (fish is not supported here, as it already
-    // isn't by the bash-syntax wrapper.)
-    const wrapped = try std.fmt.allocPrint(
-        request.allocator,
-        " setopt hist_ignore_space 2>/dev/null; HISTCONTROL=ignorespace; printf '\\n__WISPTERM_AGENT_START_{d}__\\n'; {{ {s}; }} 2>&1; __wispterm_agent_status=$?; printf '\\n__WISPTERM_AGENT_END_{d}__:%s\\n' \"$__wispterm_agent_status\"\r",
-        .{ nonce, command, nonce },
-    );
-    defer request.allocator.free(wrapped);
-
-    if (!host.writeSurface(host.ctx, surface.ptr, wrapped)) {
-        return std.fmt.allocPrint(request.allocator, "Failed to write to {s} terminal surface.", .{kind.label()});
-    }
-
-    const start_marker = try std.fmt.allocPrint(request.allocator, "__WISPTERM_AGENT_START_{d}__", .{nonce});
-    defer request.allocator.free(start_marker);
-    const end_marker = try std.fmt.allocPrint(request.allocator, "__WISPTERM_AGENT_END_{d}__", .{nonce});
-    defer request.allocator.free(end_marker);
-    return waitForSentinelResult(request, host, surface, kind.label(), start_marker, end_marker, timeout_ms);
-}
-
-fn waitForSentinelResult(
-    request: *const ChatRequest,
-    host: ToolHost,
-    surface: ToolSurface,
-    label: []const u8,
-    start_marker: []const u8,
-    end_marker: []const u8,
-    timeout_ms: u32,
-) ![]u8 {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(@max(timeout_ms, 1000)));
-    var last: ?[]u8 = null;
-    defer if (last) |text| request.allocator.free(text);
-
-    while (std.time.milliTimestamp() < deadline) {
-        if (requestCancelled(request)) return request.allocator.dupe(u8, "Canceled.");
-        if (last) |old| request.allocator.free(old);
-        last = host.surfaceSnapshot(host.ctx, request.allocator, surface.ptr) catch null;
-        if (last) |text| {
-            if (std.mem.indexOf(u8, text, end_marker) != null) {
-                return extractUnixCommandResult(request.allocator, text, start_marker, end_marker);
-            }
-        }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-    }
-
-    if (last) |text| {
-        return std.fmt.allocPrint(request.allocator, "Timed out waiting for {s} command sentinel.\nLatest snapshot:\n{s}", .{ label, text });
-    }
-    return std.fmt.allocPrint(request.allocator, "Timed out waiting for {s} command sentinel.", .{label});
-}
-
-fn sshProfileSaveApprovalText(allocator: std.mem.Allocator, args: SshProfileSaveArgs) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "name=\"{s}\" host=\"{s}\" user=\"{s}\" port=\"{s}\" proxy_jump=\"{s}\" password={s}",
-        .{
-            if (args.name.len > 0) args.name else "<default>",
-            args.host,
-            args.user,
-            if (args.port.len > 0) args.port else "22",
-            if (args.proxy_jump.len > 0) args.proxy_jump else "<none>",
-            if (args.password.len > 0) "<redacted>" else "<empty>",
-        },
-    );
-}
-
-fn sshProfileSaveTool(request: *ChatRequest, args: SshProfileSaveArgs) ![]u8 {
-    const settings = currentAgentSettings();
-    if (requestCancelled(request)) return request.allocator.dupe(u8, "Canceled.");
-
-    const approval_text = try sshProfileSaveApprovalText(request.allocator, args);
-    defer request.allocator.free(approval_text);
-    if (settings.permission != .full) {
-        if (!request.session.requestApproval("ssh_profile_save", approval_text, "Save SSH server profile")) {
-            return deniedResult(request.allocator, approval_text, "operator rejected saved SSH profile update");
-        }
-    }
-
-    const host = request.tool_host orelse return request.allocator.dupe(u8, "No terminal tool host is available.");
-    var saved = host.saveSshProfile(host.ctx, request.allocator, args) catch |err| switch (err) {
-        error.InvalidProfile => return request.allocator.dupe(u8, "Invalid SSH profile. Provide a non-empty safe host and user, and a numeric port."),
-        error.ProfileLimit => return request.allocator.dupe(u8, "Cannot save SSH profile: profile limit reached."),
-        else => return std.fmt.allocPrint(request.allocator, "Failed to save SSH profile: {}", .{err}),
-    };
-    defer saved.deinit(request.allocator);
-
-    const out = try std.fmt.allocPrint(
-        request.allocator,
-        "saved profile=\"{s}\" host=\"{s}\" user=\"{s}\" port=\"{s}\" updated_existing={} password_saved={}. Use ssh_profile_connect with profile_name=\"{s}\" to open it.",
-        .{
-            saved.name,
-            saved.host,
-            saved.user,
-            saved.port,
-            saved.updated_existing,
-            saved.password_saved,
-            saved.name,
-        },
-    );
-    return truncateOwned(request.allocator, out);
-}
-
-fn sshProfileConnectTool(request: *ChatRequest, profile_name: []const u8) ![]u8 {
-    const settings = currentAgentSettings();
-    if (requestCancelled(request)) return request.allocator.dupe(u8, "Canceled.");
-    if (settings.permission != .full) {
-        if (!request.session.requestApproval("ssh_profile_connect", profile_name, "Open saved SSH server in a new tab")) {
-            return deniedResult(request.allocator, profile_name, "operator rejected saved SSH profile connection");
-        }
-    }
-
-    const host = request.tool_host orelse return request.allocator.dupe(u8, "No terminal tool host is available.");
-    var surface = host.connectSshProfile(host.ctx, request.allocator, profile_name) catch |err| switch (err) {
-        error.ProfileNotFound => return std.fmt.allocPrint(request.allocator, "No saved SSH profile matched \"{s}\".", .{profile_name}),
-        else => return std.fmt.allocPrint(request.allocator, "Failed to connect saved SSH profile \"{s}\": {}", .{ profile_name, err }),
-    };
-    var surface_owned = true;
-    errdefer if (surface_owned) surface.deinit(request.allocator);
-
-    const out = try std.fmt.allocPrint(
-        request.allocator,
-        "connected profile=\"{s}\" surface_id={s} tab={d} focused={} kind={s} title=\"{s}\" cwd=\"{s}\"",
-        .{
-            profile_name,
-            surface.id,
-            surface.tab_index + 1,
-            surface.focused,
-            toolSurfaceKind(surface),
-            surface.title,
-            surface.cwd,
-        },
-    );
-    errdefer request.allocator.free(out);
-
-    try rememberConnectedSurface(request, surface);
-    surface_owned = false;
-    return truncateOwned(request.allocator, out);
-}
-
-fn tabNewTool(request: *ChatRequest, kind: []const u8, command: ?[]const u8) ![]u8 {
-    const settings = currentAgentSettings();
-    if (requestCancelled(request)) return request.allocator.dupe(u8, "Canceled.");
-
-    const trimmed_kind = std.mem.trim(u8, kind, " \t\r\n");
-    const command_for_approval = command orelse trimmed_kind;
-    if (settings.permission != .full) {
-        if (!request.session.requestApproval("tab_new", command_for_approval, "Open a new local terminal tab")) {
-            return deniedResult(request.allocator, command_for_approval, "operator rejected new tab creation");
-        }
-    }
-
-    const host = request.tool_host orelse return request.allocator.dupe(u8, "No terminal tool host is available.");
-    var surface = host.spawnTab(host.ctx, request.allocator, trimmed_kind, command) catch |err| switch (err) {
-        error.CommandRequired => return request.allocator.dupe(u8, "tab_new kind=command requires a non-empty command."),
-        error.InvalidTabKind => return std.fmt.allocPrint(request.allocator, "Unsupported tab kind \"{s}\". Use {s}.", .{ trimmed_kind, platform_pty_command.tabKindUsage() }),
-        else => return std.fmt.allocPrint(request.allocator, "Failed to create new tab: {}", .{err}),
-    };
-    var surface_owned = true;
-    errdefer if (surface_owned) surface.deinit(request.allocator);
-
-    const out = try std.fmt.allocPrint(
-        request.allocator,
-        "created tab kind={s} surface_id={s} tab={d} focused={} surface_kind={s} title=\"{s}\" cwd=\"{s}\"",
-        .{
-            if (trimmed_kind.len > 0) trimmed_kind else "default",
-            surface.id,
-            surface.tab_index + 1,
-            surface.focused,
-            toolSurfaceKind(surface),
-            surface.title,
-            surface.cwd,
-        },
-    );
-    errdefer request.allocator.free(out);
-
-    try rememberConnectedSurface(request, surface);
-    surface_owned = false;
-    return truncateOwned(request.allocator, out);
-}
-
-fn tabCloseTool(request: *ChatRequest, tab_index: ?usize, surface_id: ?[]const u8, title: ?[]const u8) ![]u8 {
-    const settings = currentAgentSettings();
-    if (requestCancelled(request)) return request.allocator.dupe(u8, "Canceled.");
-
-    var selector_buf: [256]u8 = undefined;
-    const selector = if (surface_id) |id|
-        std.fmt.bufPrint(&selector_buf, "surface_id={s}", .{id}) catch "surface_id"
-    else if (title) |text|
-        std.fmt.bufPrint(&selector_buf, "title={s}", .{text}) catch "title"
-    else if (tab_index) |idx|
-        std.fmt.bufPrint(&selector_buf, "tab={d}", .{idx + 1}) catch "tab"
-    else
-        "active terminal tab";
-
-    if (settings.permission != .full) {
-        if (!request.session.requestApproval("tab_close", selector, "Close a terminal tab")) {
-            return deniedResult(request.allocator, selector, "operator rejected tab close");
-        }
-    }
-
-    const host = request.tool_host orelse return request.allocator.dupe(u8, "No terminal tool host is available.");
-    var closed = host.closeTab(host.ctx, request.allocator, tab_index, surface_id, title) catch |err| switch (err) {
-        error.TabNotFound => return request.allocator.dupe(u8, "No matching terminal tab was found."),
-        error.CannotCloseAiChatTab => return request.allocator.dupe(u8, "Refusing to close an AI Chat tab from the agent."),
-        error.LastTab => return request.allocator.dupe(u8, "Refusing to close the last remaining tab."),
-        else => return std.fmt.allocPrint(request.allocator, "Failed to close tab: {}", .{err}),
-    };
-    defer closed.deinit(request.allocator);
-
-    try rememberClosedTab(request, closed);
-
-    const out = try std.fmt.allocPrint(
-        request.allocator,
-        "closed tab={d} title=\"{s}\" active_tab={d}",
-        .{ closed.tab_index + 1, closed.title, closed.active_tab + 1 },
-    );
-    return truncateOwned(request.allocator, out);
-}
-
-fn findSurface(snapshot: ToolSnapshot, surface_id: []const u8) ?ToolSurface {
-    for (snapshot.surfaces) |surface| {
-        if (std.mem.eql(u8, surface.id, surface_id)) return surface;
-    }
-    return null;
-}
-
-/// Build the per-message copilot context block from a full surface snapshot:
-/// the cwd plus the last COPILOT_CONTEXT_LINES lines of output. Owned result.
-fn buildCopilotContext(allocator: std.mem.Allocator, cwd: []const u8, snapshot: []const u8) ![]u8 {
-    const trimmed = std.mem.trimRight(u8, snapshot, "\n");
-    var start: usize = trimmed.len;
-    var newlines: usize = 0;
-    while (start > 0) {
-        const c = trimmed[start - 1];
-        if (c == '\n') {
-            newlines += 1;
-            if (newlines > COPILOT_CONTEXT_LINES) break;
-        }
-        start -= 1;
-    }
-    const tail = trimmed[start..];
-    return std.fmt.allocPrint(
-        allocator,
-        "[wispterm current terminal]\ncwd: {s}\nrecent output:\n{s}",
-        .{ cwd, tail },
-    );
-}
-
-test "buildCopilotContext keeps cwd and the last N lines" {
-    const snap = "l1\nl2\nl3\nl4\nl5\n";
-    const out = try buildCopilotContext(std.testing.allocator, "/home/u", snap);
-    defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "cwd: /home/u") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "l5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "l1") != null);
-}
-
-test "buildCopilotContext truncates to the last COPILOT_CONTEXT_LINES" {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(std.testing.allocator);
-    var i: usize = 0;
-    while (i < 100) : (i += 1) try buf.print(std.testing.allocator, "line{d}\n", .{i});
-    const out = try buildCopilotContext(std.testing.allocator, "/x", buf.items);
-    defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "line99") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "line0\n") == null);
-}
-
-fn selectedWriteContext(request: *const ChatRequest) ?[]const u8 {
-    if (request.write_context_surface_id_len == 0) return null;
-    return request.write_context_surface_id[0..request.write_context_surface_id_len];
-}
-
+// ---------------------------------------------------------------------------
+// Local helpers for tests that remain in ai_chat.zig and use ChatRequest.
+// ---------------------------------------------------------------------------
+
+// setWriteContext: operates on ChatRequest directly (field layout identical to ToolContext).
 fn setWriteContext(request: *ChatRequest, surface_id: []const u8) void {
     const len = @min(surface_id.len, request.write_context_surface_id.len);
     @memcpy(request.write_context_surface_id[0..len], surface_id[0..len]);
     request.write_context_surface_id_len = len;
 }
 
-/// Copilot fallback: when an exec tool omits surface_id, use the request's
-/// pre-seeded write-context (the bound/focused terminal). Non-copilot requests
-/// keep the original "Missing surface_id" behavior.
-fn defaultExecSurfaceId(request: *const ChatRequest) ?[]const u8 {
-    if (!request.copilot) return null;
-    if (request.write_context_surface_id_len == 0) return null;
-    return request.write_context_surface_id[0..request.write_context_surface_id_len];
-}
-
-fn ensureWriteContext(request: *ChatRequest, surface: ToolSurface) !?[]u8 {
-    const context = selectedWriteContext(request) orelse {
-        const message = try std.fmt.allocPrint(
-            request.allocator,
-            "Refusing to write to surface_id={s} tab={d} title=\"{s}\" because no agent terminal context is selected. Call terminal_select with the intended surface_id before writing.",
-            .{ surface.id, surface.tab_index + 1, surface.title },
-        );
-        return message;
-    };
-    if (std.mem.eql(u8, context, surface.id)) return null;
-
-    const message = try std.fmt.allocPrint(
+// wslSessionExecTool: the "wsl_session_exec refuses..." test in ai_chat.zig
+// constructs a ChatRequest + calls wslSessionExecTool directly.  Delegates to
+// ai_chat_request.executeToolCall so the write-back is handled there.
+fn wslSessionExecTool(request: *ChatRequest, surface_id: []const u8, command: []const u8, timeout_ms: u32) ![]u8 {
+    _ = surface_id;
+    const args_json = try std.fmt.allocPrint(
         request.allocator,
-        "Refusing to write to surface_id={s} tab={d} title=\"{s}\" because selected agent terminal context is surface_id={s}. Call terminal_select with the intended surface_id before writing to another panel.",
-        .{
-            surface.id,
-            surface.tab_index + 1,
-            surface.title,
-            context,
-        },
+        "{{\"surface_id\":\"{s}\",\"command\":\"{s}\",\"timeout_ms\":{d}}}",
+        .{ request.write_context_surface_id[0..request.write_context_surface_id_len], command, timeout_ms },
     );
-    return message;
+    defer request.allocator.free(args_json);
+    return ai_chat_request.executeToolCall(request, .{
+        .id = @constCast(""),
+        .name = @constCast("wsl_session_exec"),
+        .arguments = args_json,
+    });
 }
 
-fn extractUnixCommandResult(allocator: std.mem.Allocator, text: []const u8, start_marker: []const u8, end_marker: []const u8) ![]u8 {
-    const start = std.mem.indexOf(u8, text, start_marker) orelse return allocator.dupe(u8, text);
-    const body_start = start + start_marker.len;
-    const end = std.mem.indexOfPos(u8, text, body_start, end_marker) orelse return allocator.dupe(u8, text[body_start..]);
-    return allocator.dupe(u8, std.mem.trim(u8, text[body_start..end], " \t\r\n"));
-}
-
-fn deniedResult(allocator: std.mem.Allocator, command: []const u8, reason: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "DENIED by operator (reason: {s})\ncommand: {s}", .{ reason, command });
-}
-
-fn truncateOwned(allocator: std.mem.Allocator, text: []u8) ![]u8 {
-    const limit = currentAgentSettings().output_limit;
-    if (text.len <= limit) return text;
-    const truncated = try std.fmt.allocPrint(allocator, "{s}\n...[truncated to {d} bytes]", .{ text[0..limit], limit });
-    allocator.free(text);
-    return truncated;
-}
-
-const DANGEROUS_COMMAND_APPROVAL_REASON = "Destructive command (delete/rename/format) - confirm to run";
-
-/// Whether a command is destructive enough to always require operator approval,
-/// even under full-permission mode: deletes, renames/moves, disk formatting,
-/// and a few other irreversible operations.
-fn isDangerousCommand(command: []const u8) bool {
-    // Distinctive multi-token / punctuated patterns: a plain substring scan is
-    // safe here (these cannot collide with ordinary words).
-    const patterns = [_][]const u8{
-        "Remove-Item",
-        "Format-Volume",
-        "Stop-Computer",
-        "Restart-Computer",
-        "git push --force",
-        "git push -f",
-        "git reset --hard",
-        "git clean -f",
-        "git clean -d",
-        ":(){",
-        "dd if=",
-        "of=/dev/",
-        "> /dev/sd",
-        "mkswap",
-    };
-    for (patterns) |needle| {
-        if (std.ascii.indexOfIgnoreCase(command, needle) != null) return true;
-    }
-    // Bare destructive verbs, matched as whole words so "rm file", "mv a b"
-    // (rename) and "format c:" trigger while "confirm", "perform", "arm" and
-    // option flags like "--format"/"--force" do not (we treat '-' as part of a
-    // word). Safety-biased: a false positive only adds an extra confirm prompt.
-    const verbs = [_][]const u8{
-        // delete
-        "rm",       "rmdir",  "unlink", "shred",  "trash", "del", "rd",
-        // rename / move
-        "mv",       "move",   "rename", "ren",
-        // format / wipe disk
-        "format",   "mkfs",   "fdisk",  "diskpart",
-        // power
-        "shutdown", "reboot", "halt",   "poweroff",
-    };
-    for (verbs) |verb| {
-        if (containsWord(command, verb)) return true;
-    }
-    return false;
-}
-
-/// True if `word` appears in `haystack` as a whole token (case-insensitive):
-/// not flanked by other word characters. '-' counts as a word character so
-/// option flags such as "--format" are not mistaken for the bare "format" verb.
-fn containsWord(haystack: []const u8, word: []const u8) bool {
-    if (word.len == 0 or word.len > haystack.len) return false;
-    const last = haystack.len - word.len;
-    var pos: usize = 0;
-    while (pos <= last) : (pos += 1) {
-        if (!std.ascii.eqlIgnoreCase(haystack[pos .. pos + word.len], word)) continue;
-        const before_ok = pos == 0 or !isWordChar(haystack[pos - 1]);
-        const after = pos + word.len;
-        const after_ok = after == haystack.len or !isWordChar(haystack[after]);
-        if (before_ok and after_ok) return true;
-    }
-    return false;
-}
-
-fn isWordChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
-}
+// All tool implementations are in ai_chat_tools.zig.
+// The block that was here (executeToolCall body, parseArgs, jsonStringArg, ... isWordChar)
+// has been removed and lives in src/ai_chat_tools.zig instead.
 
 // Response parsing delegates to ai_chat_protocol
 const parseApiResponse = ai_chat_protocol.parseApiResponse;
 const parseApiErrorResult = ai_chat_protocol.parseApiErrorResult;
 const parseApiUsage = ai_chat_protocol.parseApiUsage;
 const jsonStringValue = ai_chat_protocol.jsonStringValue;
-const appendResponsesOutputText = ai_chat_protocol.appendResponsesOutputText;
-const appendResponsesReasoningText = ai_chat_protocol.appendResponsesReasoningText;
-
-fn parseApiStreamResponse(allocator: std.mem.Allocator, body: []const u8) !ApiResult {
-    var content: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer content.deinit(allocator);
-    var reasoning: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer reasoning.deinit(allocator);
-    var usage: ?ApiUsage = null;
-
-    var lines = std.mem.splitScalar(u8, body, '\n');
-    while (lines.next()) |line_raw| {
-        const line = std.mem.trim(u8, line_raw, " \t\r");
-        if (!std.mem.startsWith(u8, line, "data:")) continue;
-
-        const data = std.mem.trim(u8, line["data:".len..], " \t");
-        if (data.len == 0) continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch continue;
-        defer parsed.deinit();
-
-        const root = parsed.value;
-        if (root != .object) continue;
-        const obj = root.object;
-        if (parseApiUsage(root)) |u| usage = u;
-
-        if (try parseApiErrorResult(allocator, root)) |result| return result;
-
-        if (jsonStringValue(obj.get("type"))) |event_type| {
-            if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
-                if (jsonStringValue(obj.get("delta"))) |delta| {
-                    if (delta.len > 0) try content.appendSlice(allocator, delta);
-                }
-                continue;
-            }
-            if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta") or
-                std.mem.eql(u8, event_type, "response.reasoning_text.delta"))
-            {
-                if (jsonStringValue(obj.get("delta"))) |delta| {
-                    if (delta.len > 0) try reasoning.appendSlice(allocator, delta);
-                }
-                continue;
-            }
-            if (std.mem.eql(u8, event_type, "response.completed")) {
-                if (obj.get("response")) |response_value| {
-                    if (parseApiUsage(response_value)) |u| usage = u;
-                    if (content.items.len == 0) try appendResponsesOutputText(allocator, &content, response_value);
-                    if (reasoning.items.len == 0) try appendResponsesReasoningText(allocator, &reasoning, response_value);
-                }
-                break;
-            }
-            if (std.mem.eql(u8, event_type, "response.failed")) {
-                if (obj.get("response")) |response_value| {
-                    if (response_value == .object) {
-                        if (try parseApiErrorResult(allocator, response_value)) |result| return result;
-                    }
-                }
-                return ApiResult{ .content = try allocator.dupe(u8, "API returned an error") };
-            }
-        }
-
-        const choices_value = obj.get("choices") orelse continue;
-        if (choices_value != .array or choices_value.array.items.len == 0) continue;
-        const choice = choices_value.array.items[0];
-        if (choice != .object) continue;
-        const delta_value = choice.object.get("delta") orelse continue;
-        if (delta_value != .object) continue;
-
-        if (delta_value.object.get("content")) |content_value| {
-            if (content_value == .string and content_value.string.len > 0) {
-                try content.appendSlice(allocator, content_value.string);
-            }
-        }
-        if (delta_value.object.get("reasoning_content")) |reasoning_value| {
-            if (reasoning_value == .string and reasoning_value.string.len > 0) {
-                try reasoning.appendSlice(allocator, reasoning_value.string);
-            }
-        }
-    }
-
-    if (content.items.len == 0 and reasoning.items.len == 0) {
-        const trimmed = std.mem.trim(u8, body, " \t\r\n");
-        if (trimmed.len == 0) return error.EmptyResponse;
-        return ApiResult{ .content = try allocator.dupe(u8, trimmed) };
-    }
-
-    return .{
-        .content = try content.toOwnedSlice(allocator),
-        .reasoning = if (reasoning.items.len > 0) try reasoning.toOwnedSlice(allocator) else null,
-        .usage = usage,
-    };
-}
-
-fn applyApiStreamLineToSession(
+pub fn applyApiStreamLineToSession(
     allocator: std.mem.Allocator,
     session: *Session,
     message_idx: usize,
@@ -5341,29 +3195,6 @@ test "/export via submit fires the export trigger with parsed mode" {
     try std.testing.expectEqual(MarkdownExportMode.clean, test_export_mode.?);
 }
 
-test "session loads custom commands from a commands directory" {
-    const a = std.testing.allocator;
-    const root = ".zig-cache/tmp/cmdtest";
-    std.fs.cwd().deleteTree(root) catch {};
-    try std.fs.cwd().makePath(root ++ "/commands");
-    defer std.fs.cwd().deleteTree(root) catch {};
-    try std.fs.cwd().writeFile(.{ .sub_path = root ++ "/commands/review.md", .data = "---\nname: review\ndescription: review diff\n---\nReview the diff." });
-
-    var dir = try std.fs.cwd().openDir(root, .{});
-    defer dir.close();
-    const cmds = try command_registry.listCommands(a, dir, "commands");
-    defer command_registry.freeCommandList(a, cmds);
-    try std.testing.expectEqual(@as(usize, 1), cmds.len);
-    try std.testing.expectEqualStrings("review", cmds[0].name);
-}
-
-test "isBuiltinCommandName recognizes built-in slash commands only" {
-    try std.testing.expect(isBuiltinCommandName("clear"));
-    try std.testing.expect(isBuiltinCommandName("commands"));
-    try std.testing.expect(!isBuiltinCommandName("review"));
-    try std.testing.expect(!isBuiltinCommandName(""));
-}
-
 test "ai chat dollar skill suggestions filter and enter completes with trailing space" {
     const allocator = std.testing.allocator;
     const root = ".zig-cache/skill-suggestion-test";
@@ -5405,50 +3236,8 @@ test "ai chat dollar skill suggestions filter and enter completes with trailing 
     try std.testing.expectEqual(@as(usize, 0), session.messages.items.len);
 }
 
-test "ai chat lists skills from explicit root paths" {
-    const allocator = std.testing.allocator;
-    const root = ".zig-cache/skill-root-list-test";
-    std.fs.cwd().deleteTree(root) catch {};
-    defer std.fs.cwd().deleteTree(root) catch {};
 
-    try std.fs.cwd().makePath(root ++ "/exe/skills/pdf");
-    try std.fs.cwd().writeFile(.{
-        .sub_path = root ++ "/exe/skills/pdf/SKILL.md",
-        .data = "---\nname: pdf\ndescription: Work with PDF files.\n---\n# PDF\n",
-    });
 
-    const roots = [_][]const u8{
-        root ++ "/missing/skills",
-        root ++ "/exe/skills",
-    };
-    const output = try listSkillsForDisplayFromRoots(allocator, roots[0..]);
-    defer allocator.free(output);
-
-    try std.testing.expect(std.mem.indexOf(u8, output, "- $pdf: Work with PDF files.") != null);
-}
-
-test "wispterm_docs tool lists topics when no topic is given" {
-    const a = std.testing.allocator;
-    const text = try wisptermDocsTool(a, null);
-    defer a.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "faq") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "configuration") != null);
-}
-
-test "wispterm_docs tool returns content for a known topic" {
-    const a = std.testing.allocator;
-    const text = try wisptermDocsTool(a, "faq");
-    defer a.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "FAQ") != null);
-}
-
-test "wispterm_docs tool reports unknown topic with the topic list" {
-    const a = std.testing.allocator;
-    const text = try wisptermDocsTool(a, "does-not-exist");
-    defer a.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Unknown topic") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "faq") != null);
-}
 
 const WeixinAttachmentCapture = struct {
     called: bool = false,
@@ -5531,7 +3320,7 @@ test "weixin_send_attachment without reply context returns a clear tool result" 
     };
     defer call.deinit(std.testing.allocator);
 
-    const result = try executeToolCall(request, call);
+    const result = try ai_chat_request.executeToolCall(request, call);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("No active Weixin reply context; cannot send attachment.", result);
 }
@@ -5583,7 +3372,7 @@ test "weixin_send_attachment calls the active Weixin sender" {
     };
     defer call.deinit(std.testing.allocator);
 
-    const result = try executeToolCall(request, call);
+    const result = try ai_chat_request.executeToolCall(request, call);
     defer std.testing.allocator.free(result);
 
     try std.testing.expect(capture.called);
@@ -5595,43 +3384,6 @@ test "weixin_send_attachment calls the active Weixin sender" {
     try std.testing.expectEqualStrings("Sent file to Weixin: report.pdf", result);
 }
 
-test "ai chat skill_info loads from explicit root paths" {
-    const allocator = std.testing.allocator;
-    const root = ".zig-cache/skill-root-load-test";
-    std.fs.cwd().deleteTree(root) catch {};
-    defer std.fs.cwd().deleteTree(root) catch {};
-
-    try std.fs.cwd().makePath(root ++ "/bin/skills/web");
-    try std.fs.cwd().writeFile(.{
-        .sub_path = root ++ "/bin/skills/web/SKILL.md",
-        .data = "---\nname: web\ndescription: Browse pages.\n---\n# Web Skill\n",
-    });
-
-    const roots = [_][]const u8{
-        root ++ "/cwd/skills",
-        root ++ "/bin/skills",
-    };
-    const output = try skillInfoToolFromRoots(allocator, "web", roots[0..]);
-    defer allocator.free(output);
-
-    try std.testing.expect(std.mem.indexOf(u8, output, "# Skill: web") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "# Web Skill") != null);
-}
-
-test "ai chat default skill roots include plugin skills directory" {
-    const roots = try defaultSkillRootPaths(std.testing.allocator);
-    defer freeSkillRootPaths(std.testing.allocator, roots);
-
-    var found_plugins_skills = false;
-    for (roots) |root| {
-        if (std.mem.eql(u8, root, "plugins/skills")) {
-            found_plugins_skills = true;
-            break;
-        }
-    }
-
-    try std.testing.expect(found_plugins_skills);
-}
 
 test "ai_chat: session serializes to history record" {
     const allocator = std.testing.allocator;
@@ -6153,467 +3905,14 @@ test "ai chat empty profile system prompt uses full embedded default" {
     try std.testing.expectEqualStrings(DEFAULT_SYSTEM_PROMPT, session.systemPrompt());
 }
 
-test "ai chat request json includes deepseek thinking mode" {
-    const allocator = std.testing.allocator;
-    var messages = [_]RequestMessage{.{
-        .role = .user,
-        .content = @constCast("Hello"),
-    }};
-    const request = ChatRequest{
-        .allocator = allocator,
-        .session = undefined,
-        .base_url = @constCast("https://api.deepseek.com"),
-        .api_key = @constCast("key"),
-        .model = @constCast(DEFAULT_MODEL),
-        .system_prompt = @constCast(DEFAULT_SYSTEM_PROMPT),
-        .messages = messages[0..],
-        .thinking_enabled = true,
-        .reasoning_effort = @constCast("high"),
-        .stream = false,
-        .agent_enabled = false,
-        .tool_host = null,
-        .tool_snapshot = null,
-        .started_ms = 0,
-    };
-    const json = try buildRequestJson(allocator, &request);
-    defer allocator.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"thinking\":{\"type\":\"enabled\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"reasoning_effort\":\"high\"") != null);
-}
-
-test "ai chat agent request json includes tool schemas" {
-    const allocator = std.testing.allocator;
-    var messages = [_]RequestMessage{.{
-        .role = .user,
-        .content = @constCast("List terminals"),
-    }};
-    const request = ChatRequest{
-        .allocator = allocator,
-        .session = undefined,
-        .base_url = @constCast("https://api.deepseek.com"),
-        .api_key = @constCast("key"),
-        .model = @constCast(DEFAULT_MODEL),
-        .system_prompt = @constCast(DEFAULT_SYSTEM_PROMPT),
-        .messages = messages[0..],
-        .thinking_enabled = true,
-        .reasoning_effort = @constCast("high"),
-        .stream = false,
-        .agent_enabled = true,
-        .tool_host = null,
-        .tool_snapshot = null,
-        .started_ms = 0,
-    };
-    const json = try buildRequestJson(allocator, &request);
-    defer allocator.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"tools\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_choice\":\"auto\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"terminal_list\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"terminal_select\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"ssh_session_exec\"") != null);
-    if (platform_pty_command.wslSessionToolsEnabled()) {
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"wsl_session_exec\"") != null);
-    } else {
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"wsl_session_exec\"") == null);
-    }
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"terminal_repl_exec\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"ssh_profile_save\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"proxy_jump\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"ssh_profile_connect\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"tab_new\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, platform_pty_command.tabNewToolPropertiesJson()) != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, platform_pty_command.tabKindUsage()) != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"tab_close\"") != null);
-}
-
-test "ai chat responses request json uses input and response tool schemas" {
-    const allocator = std.testing.allocator;
-    var calls = [_]ToolCall{.{
-        .id = @constCast("call_1"),
-        .name = @constCast("terminal_list"),
-        .arguments = @constCast("{}"),
-    }};
-    var messages = [_]RequestMessage{
-        .{
-            .role = .user,
-            .content = @constCast("List terminals"),
-        },
-        .{
-            .role = .assistant,
-            .content = @constCast(""),
-            .tool_calls = calls[0..],
-        },
-        .{
-            .role = .tool,
-            .content = @constCast("surface=1"),
-            .tool_call_id = @constCast("call_1"),
-        },
-    };
-    const request = ChatRequest{
-        .allocator = allocator,
-        .session = undefined,
-        .base_url = @constCast("https://api.openai.com/v1"),
-        .api_key = @constCast("key"),
-        .model = @constCast("gpt-5"),
-        .protocol = .responses,
-        .system_prompt = @constCast("system"),
-        .messages = messages[0..],
-        .thinking_enabled = true,
-        .reasoning_effort = @constCast("high"),
-        .stream = false,
-        .agent_enabled = true,
-        .tool_host = null,
-        .tool_snapshot = null,
-        .started_ms = 0,
-    };
-    const json = try buildRequestJsonForMessages(allocator, &request, messages[0..], true);
-    defer allocator.free(json);
-
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"instructions\":\"system\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"input\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"messages\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function\",\"name\":\"terminal_list\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function_call\",\"call_id\":\"call_1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"surface=1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"reasoning\":{\"effort\":\"high\"}") != null);
-}
-
-test "ai chat agent request json includes stable skill_info tool schema" {
-    const allocator = std.testing.allocator;
-    const session = try Session.init(
-        allocator,
-        "Test",
-        DEFAULT_BASE_URL,
-        "test-key",
-        DEFAULT_MODEL,
-        DEFAULT_SYSTEM_PROMPT,
-        "enabled",
-        "high",
-        "false",
-        "true",
-    );
-    defer session.deinit();
-
-    session.mutex.lock();
-    try session.messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "hello") });
-    const request = try session.buildRequestLocked();
-    session.mutex.unlock();
-    defer request.deinit();
-
-    const json = try buildRequestJson(allocator, request);
-    defer allocator.free(json);
-
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"skill_info\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "skill_name") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "pdf") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\\u0070df") == null);
-}
-
-const CopilotTestHost = struct {
-    fn collectSnapshot(_: *anyopaque, allocator: std.mem.Allocator) anyerror!ToolSnapshot {
-        const surfaces = try allocator.alloc(ToolSurface, 1);
-        errdefer allocator.free(surfaces);
-        surfaces[0] = .{
-            .id = try allocator.dupe(u8, "surface-1"),
-            .title = try allocator.dupe(u8, "shell"),
-            .cwd = try allocator.dupe(u8, "/home/tester/work"),
-            .snapshot = try allocator.dupe(u8, "$ ls\nalpha.txt\nbeta.txt\n$ cat beta.txt\nUNIQUE_OUTPUT_LINE\n"),
-            .tab_index = 0,
-            .focused = true,
-            .is_ssh = false,
-            .is_wsl = false,
-            .ptr = undefined,
-        };
-        return .{ .surfaces = surfaces, .active_tab = 0 };
-    }
-    fn unsupportedSurfaceSnapshot(_: *anyopaque, _: std.mem.Allocator, _: *anyopaque) anyerror![]u8 {
-        return error.Unsupported;
-    }
-    fn unsupportedWrite(_: *anyopaque, _: *anyopaque, _: []const u8) bool {
-        return false;
-    }
-    fn unsupportedSpawn(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8) anyerror!ToolSurface {
-        return error.Unsupported;
-    }
-    fn unsupportedClose(_: *anyopaque, _: std.mem.Allocator, _: ?usize, _: ?[]const u8, _: ?[]const u8) anyerror!ToolClosedTab {
-        return error.Unsupported;
-    }
-    fn unsupportedSaveSsh(_: *anyopaque, _: std.mem.Allocator, _: SshProfileSaveArgs) anyerror!SavedSshProfile {
-        return error.Unsupported;
-    }
-    fn unsupportedConnectSsh(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!ToolSurface {
-        return error.Unsupported;
-    }
-
-    var ctx_sentinel: u8 = 0;
-
-    fn host() ToolHost {
-        return .{
-            .ctx = @ptrCast(&ctx_sentinel),
-            .collectSnapshot = collectSnapshot,
-            .surfaceSnapshot = unsupportedSurfaceSnapshot,
-            .writeSurface = unsupportedWrite,
-            .spawnTab = unsupportedSpawn,
-            .closeTab = unsupportedClose,
-            .saveSshProfile = unsupportedSaveSsh,
-            .connectSshProfile = unsupportedConnectSsh,
-        };
-    }
-};
-
-test "copilot request appends bound-terminal snapshot to latest user message" {
-    const allocator = std.testing.allocator;
-    const session = try Session.init(
-        allocator,
-        "Test",
-        DEFAULT_BASE_URL,
-        "test-key",
-        DEFAULT_MODEL,
-        DEFAULT_SYSTEM_PROMPT,
-        "enabled",
-        "high",
-        "false",
-        "true",
-    );
-    defer session.deinit();
-
-    session.copilot = true;
-    session.setBoundSurface("surface-1");
-
-    setToolHost(CopilotTestHost.host());
-    defer setToolHost(null);
-
-    session.mutex.lock();
-    try session.messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "what files are here?") });
-    const request = try session.buildRequestLocked();
-    session.mutex.unlock();
-    defer request.deinit();
-
-    try std.testing.expect(request.messages.len == 1);
-    const user_content = request.messages[0].content;
-    // Original user text is preserved.
-    try std.testing.expect(std.mem.indexOf(u8, user_content, "what files are here?") != null);
-    // Snapshot block is appended: cwd + recent output line.
-    try std.testing.expect(std.mem.indexOf(u8, user_content, "cwd: /home/tester/work") != null);
-    try std.testing.expect(std.mem.indexOf(u8, user_content, "UNIQUE_OUTPUT_LINE") != null);
-}
-
-test "ai chat ssh profile save approval text redacts password" {
-    const allocator = std.testing.allocator;
-    const args = SshProfileSaveArgs{
-        .name = "lab",
-        .host = "192.0.2.10",
-        .user = "alice",
-        .password = "super-secret",
-        .port = "2222",
-        .proxy_jump = "admin@bastion.example.com:22",
-    };
-    const text = try sshProfileSaveApprovalText(allocator, args);
-    defer allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "lab") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "192.0.2.10") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "alice") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "2222") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "admin@bastion.example.com:22") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "super-secret") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "<redacted>") != null);
-}
-
-test "ai chat request json replays durable tool messages and skips progress tools" {
-    const allocator = std.testing.allocator;
-    const session = try Session.init(
-        allocator,
-        "Test",
-        DEFAULT_BASE_URL,
-        "test-key",
-        DEFAULT_MODEL,
-        DEFAULT_SYSTEM_PROMPT,
-        "enabled",
-        "high",
-        "false",
-        "true",
-    );
-    defer session.deinit();
-
-    session.mutex.lock();
-    try session.messages.append(allocator, .{
-        .role = .user,
-        .content = try allocator.dupe(u8, "Use the skill."),
-    });
-    try session.messages.append(allocator, .{
-        .role = .tool,
-        .content = try allocator.dupe(u8, "# Skill: pdf"),
-        .tool_call_id = try allocator.dupe(u8, "skill-preload-pdf"),
-        .tool_name = try allocator.dupe(u8, "skill_info"),
-        .replay_to_model = true,
-    });
-    try session.messages.append(allocator, .{
-        .role = .tool,
-        .content = try allocator.dupe(u8, "running terminal_list {}"),
-        .replay_to_model = false,
-    });
-    const request = try session.buildRequestLocked();
-    session.mutex.unlock();
-    defer request.deinit();
-
-    const json = try buildRequestJsonForMessages(allocator, request, request.messages, true);
-    defer allocator.free(json);
-
-    const assistant_tool_call =
-        \\{"role":"assistant","content":"","tool_calls":[{"id":"skill-preload-pdf","type":"function","function":{"name":"skill_info","arguments":"{}"}}],"reasoning_content":"Tool call is required before answering."}
-    ;
-    const tool_result =
-        \\{"role":"tool","content":"# Skill: pdf","tool_call_id":"skill-preload-pdf"}
-    ;
-    const assistant_index = std.mem.indexOf(u8, json, assistant_tool_call) orelse return error.MissingAssistantToolCall;
-    const tool_index = std.mem.indexOf(u8, json, tool_result) orelse return error.MissingToolResult;
-    try std.testing.expect(assistant_index < tool_index);
-    try std.testing.expect(std.mem.indexOf(u8, json, "running terminal_list") == null);
-}
-
-test "ai chat request skips replayable tool messages missing identity" {
-    const allocator = std.testing.allocator;
-    const session = try Session.init(
-        allocator,
-        "Test",
-        DEFAULT_BASE_URL,
-        "test-key",
-        DEFAULT_MODEL,
-        DEFAULT_SYSTEM_PROMPT,
-        "enabled",
-        "high",
-        "false",
-        "true",
-    );
-    defer session.deinit();
-
-    session.mutex.lock();
-    try session.messages.append(allocator, .{
-        .role = .user,
-        .content = try allocator.dupe(u8, "Use the skill."),
-    });
-    try session.messages.append(allocator, .{
-        .role = .tool,
-        .content = try allocator.dupe(u8, "# Skill without metadata"),
-        .replay_to_model = true,
-    });
-    const request = try session.buildRequestLocked();
-    session.mutex.unlock();
-    defer request.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), request.messages.len);
-
-    const json = try buildRequestJsonForMessages(allocator, request, request.messages, true);
-    defer allocator.free(json);
-
-    try std.testing.expect(std.mem.indexOf(u8, json, "# Skill without metadata") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"role\":\"tool\"") == null);
-}
-
-test "ai chat request setup cleans scalar fields on allocation failure" {
-    const allocator = std.testing.allocator;
-
-    var saw_oom = false;
-    var fail_index: usize = 0;
-    while (fail_index < 32) : (fail_index += 1) {
-        var failing_allocator = std.testing.FailingAllocator.init(allocator, .{
-            .fail_index = fail_index,
-        });
-
-        var session = Session{ .allocator = failing_allocator.allocator() };
-        session.assignSessionId();
-        session.copyTitle("Test");
-        session.copyBaseUrl(DEFAULT_BASE_URL);
-        session.copyApiKey("test-key");
-        session.copyModel(DEFAULT_MODEL);
-        session.copySystemPrompt(DEFAULT_SYSTEM_PROMPT);
-        session.copyReasoningEffort(DEFAULT_REASONING_EFFORT);
-
-        const result = session.buildRequestLocked();
-        if (result) |request| {
-            request.deinit();
-            if (!failing_allocator.has_induced_failure) break;
-        } else |err| switch (err) {
-            error.OutOfMemory => saw_oom = true,
-            else => return err,
-        }
-    }
-
-    try std.testing.expect(saw_oom);
-}
-
-test "ai chat request json replays assistant reasoning content" {
-    const allocator = std.testing.allocator;
-    var messages = [_]RequestMessage{.{
-        .role = .assistant,
-        .content = @constCast("I will inspect the system."),
-        .reasoning = @constCast("Need system info before answering."),
-    }};
-    const request = ChatRequest{
-        .allocator = allocator,
-        .session = undefined,
-        .base_url = @constCast("https://api.deepseek.com"),
-        .api_key = @constCast("key"),
-        .model = @constCast(DEFAULT_MODEL),
-        .system_prompt = @constCast(DEFAULT_SYSTEM_PROMPT),
-        .messages = messages[0..],
-        .thinking_enabled = true,
-        .reasoning_effort = @constCast("high"),
-        .stream = false,
-        .agent_enabled = true,
-        .tool_host = null,
-        .tool_snapshot = null,
-        .started_ms = 0,
-    };
-    const json = try buildRequestJson(allocator, &request);
-    defer allocator.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"reasoning_content\":\"Need system info before answering.\"") != null);
-}
-
-test "ai chat request json adds thinking fallback for assistant tool calls without reasoning" {
-    const allocator = std.testing.allocator;
-    var calls = [_]ToolCall{.{
-        .id = @constCast("call-1"),
-        .name = @constCast("skill_info"),
-        .arguments = @constCast("{}"),
-    }};
-    var messages = [_]RequestMessage{.{
-        .role = .assistant,
-        .content = @constCast(""),
-        .tool_calls = calls[0..],
-    }};
-    const request = ChatRequest{
-        .allocator = allocator,
-        .session = undefined,
-        .base_url = @constCast("https://api.deepseek.com"),
-        .api_key = @constCast("key"),
-        .model = @constCast(DEFAULT_MODEL),
-        .system_prompt = @constCast(DEFAULT_SYSTEM_PROMPT),
-        .messages = messages[0..],
-        .thinking_enabled = true,
-        .reasoning_effort = @constCast("high"),
-        .stream = false,
-        .agent_enabled = true,
-        .tool_host = null,
-        .tool_snapshot = null,
-        .started_ms = 0,
-    };
-
-    const json = try buildRequestJson(allocator, &request);
-    defer allocator.free(json);
-
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"reasoning_content\":\"Tool call is required before answering.\"") != null);
-}
-
-test "ai chat request json replaces invalid utf8 bytes" {
-    const allocator = std.testing.allocator;
-    const bad = [_]u8{ 'o', 'k', ' ', 0xff, ' ', 0xc3 };
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(allocator);
-
-    try appendJsonString(allocator, &out, bad[0..]);
-    try std.testing.expectEqualStrings("\"ok \\ufffd \\ufffd\"", out.items);
-}
+// The following tests live in ai_chat_request.zig (no Session private calls):
+//   "ai chat request json includes deepseek thinking mode"
+//   "ai chat agent request json includes tool schemas"
+//   "ai chat responses request json uses input and response tool schemas"
+//   "ai chat request json replays assistant reasoning content"
+//   "ai chat request json adds thinking fallback for assistant tool calls without reasoning"
+//   "ai chat request json replaces invalid utf8 bytes"
+//   "ai chat streaming request asks provider to include usage"
 
 test "ai chat parses OpenAI tool calls" {
     const allocator = std.testing.allocator;
@@ -6721,290 +4020,120 @@ test "ai chat appends usage footer to completed assistant message" {
     try std.testing.expect(std.mem.indexOf(u8, footer, "cache 5/7") != null);
 }
 
-test "ai chat streaming request asks provider to include usage" {
-    const allocator = std.testing.allocator;
-    var content = [_]u8{ 'h', 'i' };
-    var model = [_]u8{ 'd', 'e', 'e', 'p', 's', 'e', 'e', 'k', '-', 'v', '4', '-', 'p', 'r', 'o' };
-    var reasoning = [_]u8{ 'h', 'i', 'g', 'h' };
-    var msg = [_]RequestMessage{.{ .role = .user, .content = content[0..] }};
-    var request = ChatRequest{
-        .allocator = allocator,
-        .session = undefined,
-        .base_url = &.{},
-        .api_key = &.{},
-        .model = model[0..],
-        .system_prompt = &.{},
-        .messages = msg[0..],
-        .stream = true,
-        .agent_enabled = false,
-        .tool_host = null,
-        .tool_snapshot = null,
-        .thinking_enabled = true,
-        .reasoning_effort = reasoning[0..],
-        .started_ms = 0,
-    };
-    const body = try buildRequestJsonForMessages(allocator, &request, msg[0..], false);
-    defer allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream_options\":{\"include_usage\":true}") != null);
-}
+// "ai chat streaming request asks provider to include usage" and
+// "copilot session pre-targets the bound surface in its request" have moved
+// to ai_chat_request.zig.
 
-test "ai chat tools prefer request-local terminal snapshot" {
+// Local test stub host for the wsl_session_exec test below.
+const CopilotTestHost = struct {
+    fn collectSnapshot(_: *anyopaque, allocator: std.mem.Allocator) anyerror!ToolSnapshot {
+        const surfaces = try allocator.alloc(ToolSurface, 1);
+        errdefer allocator.free(surfaces);
+        surfaces[0] = .{
+            .id = try allocator.dupe(u8, "surface-1"),
+            .title = try allocator.dupe(u8, "shell"),
+            .cwd = try allocator.dupe(u8, "/home/tester/work"),
+            .snapshot = try allocator.dupe(u8, "$ ls\n"),
+            .tab_index = 0,
+            .focused = true,
+            .is_ssh = false,
+            .is_wsl = false,
+            .ptr = undefined,
+        };
+        return .{ .surfaces = surfaces, .active_tab = 0 };
+    }
+    fn unsupportedSurfaceSnapshot(_: *anyopaque, _: std.mem.Allocator, _: *anyopaque) anyerror![]u8 {
+        return error.Unsupported;
+    }
+    fn unsupportedWrite(_: *anyopaque, _: *anyopaque, _: []const u8) bool {
+        return false;
+    }
+    fn unsupportedSpawn(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8) anyerror!ToolSurface {
+        return error.Unsupported;
+    }
+    fn unsupportedClose(_: *anyopaque, _: std.mem.Allocator, _: ?usize, _: ?[]const u8, _: ?[]const u8) anyerror!ToolClosedTab {
+        return error.Unsupported;
+    }
+    fn unsupportedSaveSsh(_: *anyopaque, _: std.mem.Allocator, _: SshProfileSaveArgs) anyerror!SavedSshProfile {
+        return error.Unsupported;
+    }
+    fn unsupportedConnectSsh(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!ToolSurface {
+        return error.Unsupported;
+    }
+
+    var ctx_sentinel: u8 = 0;
+
+    fn host() ToolHost {
+        return .{
+            .ctx = @ptrCast(&ctx_sentinel),
+            .collectSnapshot = collectSnapshot,
+            .surfaceSnapshot = unsupportedSurfaceSnapshot,
+            .writeSurface = unsupportedWrite,
+            .spawnTab = unsupportedSpawn,
+            .closeTab = unsupportedClose,
+            .saveSshProfile = unsupportedSaveSsh,
+            .connectSshProfile = unsupportedConnectSsh,
+        };
+    }
+};
+
+test "wsl_session_exec refuses to paste shell wrapper into Claude Code" {
     const allocator = std.testing.allocator;
+    const saved_settings = currentAgentSettings();
+    defer configureAgent(saved_settings);
+    configureAgent(.{ .enabled = true, .permission = .full });
+    const session = try Session.init(allocator, "test", "", "", "", "", "", "", "", "");
+    defer session.deinit();
+
     var surfaces = try allocator.alloc(ToolSurface, 1);
     surfaces[0] = .{
-        .id = try allocator.dupe(u8, "surface-1"),
-        .title = try allocator.dupe(u8, "Local Shell"),
-        .cwd = try allocator.dupe(u8, "/home/user"),
-        .snapshot = try allocator.dupe(u8, "$ "),
-        .tab_index = 1,
+        .id = try allocator.dupe(u8, "surface-claude"),
+        .title = try allocator.dupe(u8, "\xe2\x9c\xbb Claude Code"),
+        .cwd = try allocator.dupe(u8, "/home/xzg"),
+        .snapshot = try allocator.dupe(u8, "Claude Code v2.1.159\n> "),
+        .tab_index = 2,
         .focused = true,
         .is_ssh = false,
-        .is_wsl = false,
-        .agent_app = .none,
-        .agent_state = .none,
-        .agent_confidence = 0,
-        .ptr = @ptrFromInt(1),
-    };
-    const cached_snapshot = ToolSnapshot{
-        .surfaces = surfaces,
-        .active_tab = 1,
-    };
-    defer cached_snapshot.deinit(allocator);
-
-    var messages = [_]RequestMessage{.{
-        .role = .user,
-        .content = @constCast("list terminals"),
-    }};
-    const request = ChatRequest{
-        .allocator = allocator,
-        .session = undefined,
-        .base_url = @constCast(""),
-        .api_key = @constCast(""),
-        .model = @constCast(""),
-        .system_prompt = @constCast(""),
-        .messages = messages[0..],
-        .thinking_enabled = true,
-        .reasoning_effort = @constCast(""),
-        .stream = false,
-        .agent_enabled = true,
-        .tool_host = null,
-        .tool_snapshot = cached_snapshot,
-        .started_ms = 0,
-    };
-
-    const snapshot = try collectToolSnapshot(&request);
-    defer snapshot.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.active_tab);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.surfaces.len);
-    try std.testing.expectEqualStrings("surface-1", snapshot.surfaces[0].id);
-    try std.testing.expect(snapshot.surfaces[0].id.ptr != cached_snapshot.surfaces[0].id.ptr);
-}
-
-test "ai chat write context requires explicit selection and can switch surfaces" {
-    const allocator = std.testing.allocator;
-    var surfaces = try allocator.alloc(ToolSurface, 2);
-    surfaces[0] = .{
-        .id = try allocator.dupe(u8, "surface-a"),
-        .title = try allocator.dupe(u8, "panel1"),
-        .cwd = try allocator.dupe(u8, ""),
-        .snapshot = try allocator.dupe(u8, ""),
-        .tab_index = 0,
-        .focused = false,
-        .is_ssh = false,
-        .is_wsl = false,
-        .agent_app = .none,
-        .agent_state = .none,
-        .agent_confidence = 0,
-        .ptr = @ptrFromInt(1),
-    };
-    surfaces[1] = .{
-        .id = try allocator.dupe(u8, "surface-b"),
-        .title = try allocator.dupe(u8, "panel2"),
-        .cwd = try allocator.dupe(u8, ""),
-        .snapshot = try allocator.dupe(u8, ""),
-        .tab_index = 0,
-        .focused = false,
-        .is_ssh = false,
-        .is_wsl = false,
-        .agent_app = .none,
-        .agent_state = .none,
-        .agent_confidence = 0,
-        .ptr = @ptrFromInt(2),
-    };
-    const snapshot = ToolSnapshot{
-        .surfaces = surfaces,
-        .active_tab = 0,
-    };
-    defer snapshot.deinit(allocator);
-
-    var messages = [_]RequestMessage{};
-    var request = ChatRequest{
-        .allocator = allocator,
-        .session = undefined,
-        .base_url = @constCast(""),
-        .api_key = @constCast(""),
-        .model = @constCast(""),
-        .system_prompt = @constCast(""),
-        .messages = messages[0..],
-        .thinking_enabled = true,
-        .reasoning_effort = @constCast(""),
-        .stream = false,
-        .agent_enabled = true,
-        .tool_host = null,
-        .tool_snapshot = null,
-        .started_ms = 0,
-    };
-
-    const missing = (try ensureWriteContext(&request, snapshot.surfaces[1])).?;
-    defer allocator.free(missing);
-    try std.testing.expect(std.mem.indexOf(u8, missing, "no agent terminal context is selected") != null);
-
-    setWriteContext(&request, snapshot.surfaces[1].id);
-    try std.testing.expectEqualStrings("surface-b", request.write_context_surface_id[0..request.write_context_surface_id_len]);
-    try std.testing.expect(try ensureWriteContext(&request, snapshot.surfaces[1]) == null);
-
-    const message = (try ensureWriteContext(&request, snapshot.surfaces[0])).?;
-    defer allocator.free(message);
-    try std.testing.expect(std.mem.indexOf(u8, message, "selected agent terminal context is surface_id=surface-b") != null);
-
-    setWriteContext(&request, snapshot.surfaces[0].id);
-    try std.testing.expectEqualStrings("surface-a", request.write_context_surface_id[0..request.write_context_surface_id_len]);
-    try std.testing.expect(try ensureWriteContext(&request, snapshot.surfaces[0]) == null);
-    const switched = (try ensureWriteContext(&request, snapshot.surfaces[1])).?;
-    defer allocator.free(switched);
-    try std.testing.expect(std.mem.indexOf(u8, switched, "selected agent terminal context is surface_id=surface-a") != null);
-}
-
-test "terminal_list shows one-based tab numbers matching the UI" {
-    const allocator = std.testing.allocator;
-    var surfaces = try allocator.alloc(ToolSurface, 2);
-    surfaces[0] = .{
-        .id = try allocator.dupe(u8, "surface-a"),
-        .title = try allocator.dupe(u8, "panel1"),
-        .cwd = try allocator.dupe(u8, "/tmp"),
-        .snapshot = try allocator.dupe(u8, ""),
-        .tab_index = 0,
-        .focused = true,
-        .is_ssh = false,
-        .is_wsl = false,
-        .agent_app = .none,
-        .agent_state = .none,
-        .agent_confidence = 0,
-        .ptr = @ptrFromInt(1),
-    };
-    surfaces[1] = .{
-        .id = try allocator.dupe(u8, "surface-b"),
-        .title = try allocator.dupe(u8, "panel2"),
-        .cwd = try allocator.dupe(u8, "/tmp"),
-        .snapshot = try allocator.dupe(u8, ""),
-        .tab_index = 1,
-        .focused = false,
-        .is_ssh = false,
-        .is_wsl = false,
-        .agent_app = .none,
-        .agent_state = .none,
-        .agent_confidence = 0,
-        .ptr = @ptrFromInt(2),
-    };
-    const snapshot = ToolSnapshot{ .surfaces = surfaces, .active_tab = 0 };
-    defer snapshot.deinit(allocator);
-
-    var messages = [_]RequestMessage{};
-    const request = ChatRequest{
-        .allocator = allocator,
-        .session = undefined,
-        .base_url = @constCast(""),
-        .api_key = @constCast(""),
-        .model = @constCast(""),
-        .system_prompt = @constCast(""),
-        .messages = messages[0..],
-        .thinking_enabled = true,
-        .reasoning_effort = @constCast(""),
-        .stream = false,
-        .agent_enabled = true,
-        .tool_host = null,
-        .tool_snapshot = snapshot,
-        .started_ms = 0,
-    };
-
-    const out = try terminalListTool(&request);
-    defer allocator.free(out);
-
-    // The first tab is shown as 1 and the second as 2, even though they are
-    // internally zero-based (tab_index 0 and 1) — matching the UI tab numbers.
-    try std.testing.expect(std.mem.indexOf(u8, out, "active_tab=1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "id=surface-a tab=1 ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "id=surface-b tab=2 ") != null);
-    // The zero-based index must never leak into the user-facing listing.
-    try std.testing.expect(std.mem.indexOf(u8, out, "tab=0") == null);
-}
-
-test "copilot session pre-targets the bound surface in its request" {
-    const session = try Session.init(
-        std.testing.allocator,
-        "copilot", "", "", "", "", "", "", "", "",
-    );
-    defer session.deinit();
-    session.copilot = true;
-    session.setBoundSurface("abc123");
-
-    const req = try session.buildRequestLocked();
-    defer req.deinit();
-
-    try std.testing.expectEqualStrings("abc123", req.write_context_surface_id[0..req.write_context_surface_id_len]);
-}
-
-test "ai chat R string literal escapes code for REPL eval" {
-    const allocator = std.testing.allocator;
-    const literal = try rStringLiteral(allocator, "print(\"hello\")\npath <- \"C:\\\\tmp\"");
-    defer allocator.free(literal);
-
-    try std.testing.expectEqualStrings("\"print(\\\"hello\\\")\\npath <- \\\"C:\\\\\\\\tmp\\\"\"", literal);
-}
-
-test "ai chat REPL kind parses Python Codex and Claude Code aliases" {
-    try std.testing.expectEqual(ReplKind.python, ReplKind.parse("python").?);
-    try std.testing.expectEqual(ReplKind.python, ReplKind.parse("py").?);
-    try std.testing.expectEqual(ReplKind.codex, ReplKind.parse("codex").?);
-    try std.testing.expectEqual(ReplKind.claude_code, ReplKind.parse("claude").?);
-    try std.testing.expectEqual(ReplKind.claude_code, ReplKind.parse("claude-code").?);
-}
-
-test "ai chat Codex running REPL input queues with tab instead of enter" {
-    const allocator = std.testing.allocator;
-    const surface = ToolSurface{
-        .id = @constCast("surface-1"),
-        .title = @constCast("codex"),
-        .cwd = @constCast(""),
-        .snapshot = @constCast("Working (5m 16s - esc to interrupt)\ntab to queue message"),
-        .tab_index = 0,
-        .focused = true,
-        .is_ssh = false,
-        .is_wsl = false,
-        .agent_app = .codex,
+        .is_wsl = true,
+        .agent_app = .claude_code,
         .agent_state = .running,
         .agent_confidence = 82,
         .ptr = @ptrFromInt(1),
     };
+    const snapshot = ToolSnapshot{ .surfaces = surfaces, .active_tab = 2 };
+    defer snapshot.deinit(allocator);
 
-    const input = try allocPlainReplInput(allocator, .codex, surface, "/status");
-    defer allocator.free(input);
-    try std.testing.expectEqualStrings("/status\t", input);
+    var messages = [_]RequestMessage{};
+    var request = ChatRequest{
+        .allocator = allocator,
+        .session = session,
+        .base_url = @constCast(""),
+        .api_key = @constCast(""),
+        .model = @constCast(""),
+        .system_prompt = @constCast(""),
+        .messages = messages[0..],
+        .thinking_enabled = false,
+        .reasoning_effort = @constCast(""),
+        .stream = false,
+        .agent_enabled = true,
+        .tool_host = CopilotTestHost.host(),
+        .tool_snapshot = snapshot,
+        .started_ms = 0,
+    };
+    setWriteContext(&request, "surface-claude");
 
-    var idle_surface = surface;
-    idle_surface.agent_state = .done;
-    const idle_input = try allocPlainReplInput(allocator, .codex, idle_surface, "/status");
-    defer allocator.free(idle_input);
-    try std.testing.expectEqualStrings("/status\r", idle_input);
+    const result = try wslSessionExecTool(&request, "surface-claude", "which claude", 1000);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Refusing to run WSL shell command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "terminal_repl_exec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "repl=claude_code") != null);
 }
 
-test "ai chat Python string literal escapes code for REPL eval" {
-    const allocator = std.testing.allocator;
-    const literal = try pythonStringLiteral(allocator, "print(\"hello\")\npath = \"C:\\\\tmp\"");
-    defer allocator.free(literal);
 
-    try std.testing.expectEqualStrings("\"print(\\\"hello\\\")\\npath = \\\"C:\\\\\\\\tmp\\\"\"", literal);
-}
+
+
+
+
 
 test "ai chat ctrl a selects input and replacement clears selection" {
     const allocator = std.testing.allocator;
@@ -7606,70 +4735,6 @@ test "ai chat request state exposes in-flight stop status for remote layout" {
     try std.testing.expect(state.stopping);
 }
 
-test "ai chat detects dangerous shell commands" {
-    // delete
-    try std.testing.expect(isDangerousCommand("rm -rf /tmp/demo"));
-    try std.testing.expect(isDangerousCommand("rm report.csv"));
-    try std.testing.expect(isDangerousCommand("find . -name '*.tmp' -exec rm {} \\;"));
-    try std.testing.expect(isDangerousCommand("rmdir build"));
-    try std.testing.expect(isDangerousCommand("del C:\\temp\\old.log"));
-    // rename / move
-    try std.testing.expect(isDangerousCommand("mv old.txt new.txt"));
-    try std.testing.expect(isDangerousCommand("rename a.txt b.txt"));
-    // format / disk
-    try std.testing.expect(isDangerousCommand("format C:"));
-    try std.testing.expect(isDangerousCommand("mkfs.ext4 /dev/sdb1"));
-    try std.testing.expect(isDangerousCommand("dd if=/dev/zero of=/dev/sda"));
-    // power + git
-    try std.testing.expect(isDangerousCommand("git push --force origin main"));
-    try std.testing.expect(isDangerousCommand("git reset --hard HEAD~3"));
-    try std.testing.expect(isDangerousCommand("shutdown -h now"));
-    // must NOT false-positive on look-alikes
-    try std.testing.expect(!isDangerousCommand("Get-ComputerInfo | Select-Object OsName"));
-    try std.testing.expect(!isDangerousCommand("ls -la"));
-    try std.testing.expect(!isDangerousCommand("git commit -m 'confirm the fix'"));
-    try std.testing.expect(!isDangerousCommand("git log --format=oneline"));
-    try std.testing.expect(!isDangerousCommand("echo perform a dry run"));
-}
-
-test "ai chat stream response aggregates content and reasoning chunks" {
-    const allocator = std.testing.allocator;
-    const body =
-        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Think\"}}]}\n\n" ++
-        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"ing\",\"content\":null}}]}\n\n" ++
-        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" ++
-        "data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n" ++
-        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":34,\"prompt_cache_hit_tokens\":5,\"prompt_cache_miss_tokens\":7,\"total_tokens\":46}}\n\n" ++
-        "data: [DONE]\n\n";
-
-    const result = try parseApiStreamResponse(allocator, body);
-    defer result.deinit(allocator);
-    try std.testing.expectEqualStrings("Hello!", result.content);
-    try std.testing.expect(result.reasoning != null);
-    try std.testing.expectEqualStrings("Thinking", result.reasoning.?);
-    try std.testing.expect(result.usage != null);
-    try std.testing.expectEqual(@as(u64, 46), result.usage.?.total_tokens);
-    try std.testing.expectEqual(@as(u64, 5), result.usage.?.prompt_cache_hit_tokens);
-    try std.testing.expectEqual(@as(u64, 7), result.usage.?.prompt_cache_miss_tokens);
-}
-
-test "ai chat Responses API stream aggregates output text and usage" {
-    const allocator = std.testing.allocator;
-    const body =
-        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n" ++
-        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n" ++
-        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checked\"}\n\n" ++
-        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":3,\"total_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":2}},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}]}}\n\n";
-    const result = try parseApiStreamResponse(allocator, body);
-    defer result.deinit(allocator);
-    try std.testing.expectEqualStrings("Hello", result.content);
-    try std.testing.expect(result.reasoning != null);
-    try std.testing.expectEqualStrings("Checked", result.reasoning.?);
-    try std.testing.expect(result.usage != null);
-    try std.testing.expectEqual(@as(u64, 12), result.usage.?.total_tokens);
-    try std.testing.expectEqual(@as(u64, 2), result.usage.?.prompt_cache_hit_tokens);
-    try std.testing.expectEqual(@as(u64, 7), result.usage.?.prompt_cache_miss_tokens);
-}
 
 test "ai chat collapse helper only closes auto-expanded details" {
     const allocator = std.testing.allocator;
@@ -7891,4 +4956,270 @@ test "ai chat double esc after stop opens rewind picker" {
     session.now_ms_override = 1200;
     session.handleKey(.{ .key = input_key.Key.escape }); // 窗口内 → 打开
     try std.testing.expect(session.rewind_open);
+}
+
+// ---------------------------------------------------------------------------
+// Request-layer tests that need private Session methods (buildRequestLocked,
+// assignSessionId, copyTitle, copyBaseUrl, copyApiKey, copyModel,
+// copySystemPrompt, copyReasoningEffort).  They are co-located here so those
+// methods can remain private.  The request-serialization helpers they exercise
+// (buildRequestJson / buildRequestJsonForMessages) are pub on ai_chat_request.
+// ---------------------------------------------------------------------------
+
+test "ai chat agent request json includes stable skill_info tool schema" {
+    const allocator = std.testing.allocator;
+    const session = try Session.init(
+        allocator,
+        "Test",
+        DEFAULT_BASE_URL,
+        "test-key",
+        DEFAULT_MODEL,
+        DEFAULT_SYSTEM_PROMPT,
+        "enabled",
+        "high",
+        "false",
+        "true",
+    );
+    defer session.deinit();
+
+    session.mutex.lock();
+    try session.messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "hello") });
+    const request = try session.buildRequestLocked();
+    session.mutex.unlock();
+    defer request.deinit();
+
+    const json = try ai_chat_request.buildRequestJson(allocator, request);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"skill_info\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "skill_name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "pdf") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\u0070df") == null);
+}
+
+const CopilotBoundSnapshotTestHost = struct {
+    fn collectSnapshot(_: *anyopaque, allocator: std.mem.Allocator) anyerror!ai_chat_types.ToolSnapshot {
+        const surfaces = try allocator.alloc(ai_chat_types.ToolSurface, 1);
+        errdefer allocator.free(surfaces);
+        surfaces[0] = .{
+            .id = try allocator.dupe(u8, "surface-1"),
+            .title = try allocator.dupe(u8, "shell"),
+            .cwd = try allocator.dupe(u8, "/home/tester/work"),
+            .snapshot = try allocator.dupe(u8, "$ ls\nalpha.txt\nbeta.txt\n$ cat beta.txt\nUNIQUE_OUTPUT_LINE\n"),
+            .tab_index = 0,
+            .focused = true,
+            .is_ssh = false,
+            .is_wsl = false,
+            .ptr = undefined,
+        };
+        return .{ .surfaces = surfaces, .active_tab = 0 };
+    }
+    fn unsupportedSurfaceSnapshot(_: *anyopaque, _: std.mem.Allocator, _: *anyopaque) anyerror![]u8 {
+        return error.Unsupported;
+    }
+    fn unsupportedWrite(_: *anyopaque, _: *anyopaque, _: []const u8) bool {
+        return false;
+    }
+    fn unsupportedSpawn(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8) anyerror!ai_chat_types.ToolSurface {
+        return error.Unsupported;
+    }
+    fn unsupportedClose(_: *anyopaque, _: std.mem.Allocator, _: ?usize, _: ?[]const u8, _: ?[]const u8) anyerror!ai_chat_types.ToolClosedTab {
+        return error.Unsupported;
+    }
+    fn unsupportedSaveSsh(_: *anyopaque, _: std.mem.Allocator, _: ai_chat_types.SshProfileSaveArgs) anyerror!ai_chat_types.SavedSshProfile {
+        return error.Unsupported;
+    }
+    fn unsupportedConnectSsh(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!ai_chat_types.ToolSurface {
+        return error.Unsupported;
+    }
+
+    var ctx_sentinel: u8 = 0;
+
+    fn host() ai_chat_types.ToolHost {
+        return .{
+            .ctx = @ptrCast(&ctx_sentinel),
+            .collectSnapshot = collectSnapshot,
+            .surfaceSnapshot = unsupportedSurfaceSnapshot,
+            .writeSurface = unsupportedWrite,
+            .spawnTab = unsupportedSpawn,
+            .closeTab = unsupportedClose,
+            .saveSshProfile = unsupportedSaveSsh,
+            .connectSshProfile = unsupportedConnectSsh,
+        };
+    }
+};
+
+test "copilot request appends bound-terminal snapshot to latest user message" {
+    const allocator = std.testing.allocator;
+    const session = try Session.init(
+        allocator,
+        "Test",
+        DEFAULT_BASE_URL,
+        "test-key",
+        DEFAULT_MODEL,
+        DEFAULT_SYSTEM_PROMPT,
+        "enabled",
+        "high",
+        "false",
+        "true",
+    );
+    defer session.deinit();
+
+    session.copilot = true;
+    session.setBoundSurface("surface-1");
+
+    setToolHost(CopilotBoundSnapshotTestHost.host());
+    defer setToolHost(null);
+
+    session.mutex.lock();
+    try session.messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "what files are here?") });
+    const request = try session.buildRequestLocked();
+    session.mutex.unlock();
+    defer request.deinit();
+
+    try std.testing.expect(request.messages.len == 1);
+    const user_content = request.messages[0].content;
+    // Original user text is preserved.
+    try std.testing.expect(std.mem.indexOf(u8, user_content, "what files are here?") != null);
+    // Snapshot block is appended: cwd + recent output line.
+    try std.testing.expect(std.mem.indexOf(u8, user_content, "cwd: /home/tester/work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_content, "UNIQUE_OUTPUT_LINE") != null);
+}
+
+test "ai chat request json replays durable tool messages and skips progress tools" {
+    const allocator = std.testing.allocator;
+    const session = try Session.init(
+        allocator,
+        "Test",
+        DEFAULT_BASE_URL,
+        "test-key",
+        DEFAULT_MODEL,
+        DEFAULT_SYSTEM_PROMPT,
+        "enabled",
+        "high",
+        "false",
+        "true",
+    );
+    defer session.deinit();
+
+    session.mutex.lock();
+    try session.messages.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "Use the skill."),
+    });
+    try session.messages.append(allocator, .{
+        .role = .tool,
+        .content = try allocator.dupe(u8, "# Skill: pdf"),
+        .tool_call_id = try allocator.dupe(u8, "skill-preload-pdf"),
+        .tool_name = try allocator.dupe(u8, "skill_info"),
+        .replay_to_model = true,
+    });
+    try session.messages.append(allocator, .{
+        .role = .tool,
+        .content = try allocator.dupe(u8, "running terminal_list {}"),
+        .replay_to_model = false,
+    });
+    const request = try session.buildRequestLocked();
+    session.mutex.unlock();
+    defer request.deinit();
+
+    const json = try ai_chat_request.buildRequestJsonForMessages(allocator, request, request.messages, true);
+    defer allocator.free(json);
+
+    const assistant_tool_call =
+        \\{"role":"assistant","content":"","tool_calls":[{"id":"skill-preload-pdf","type":"function","function":{"name":"skill_info","arguments":"{}"}}],"reasoning_content":"Tool call is required before answering."}
+    ;
+    const tool_result =
+        \\{"role":"tool","content":"# Skill: pdf","tool_call_id":"skill-preload-pdf"}
+    ;
+    const assistant_index = std.mem.indexOf(u8, json, assistant_tool_call) orelse return error.MissingAssistantToolCall;
+    const tool_index = std.mem.indexOf(u8, json, tool_result) orelse return error.MissingToolResult;
+    try std.testing.expect(assistant_index < tool_index);
+    try std.testing.expect(std.mem.indexOf(u8, json, "running terminal_list") == null);
+}
+
+test "ai chat request skips replayable tool messages missing identity" {
+    const allocator = std.testing.allocator;
+    const session = try Session.init(
+        allocator,
+        "Test",
+        DEFAULT_BASE_URL,
+        "test-key",
+        DEFAULT_MODEL,
+        DEFAULT_SYSTEM_PROMPT,
+        "enabled",
+        "high",
+        "false",
+        "true",
+    );
+    defer session.deinit();
+
+    session.mutex.lock();
+    try session.messages.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "Use the skill."),
+    });
+    try session.messages.append(allocator, .{
+        .role = .tool,
+        .content = try allocator.dupe(u8, "# Skill without metadata"),
+        .replay_to_model = true,
+    });
+    const request = try session.buildRequestLocked();
+    session.mutex.unlock();
+    defer request.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), request.messages.len);
+
+    const json = try ai_chat_request.buildRequestJsonForMessages(allocator, request, request.messages, true);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "# Skill without metadata") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"role\":\"tool\"") == null);
+}
+
+test "ai chat request setup cleans scalar fields on allocation failure" {
+    const allocator = std.testing.allocator;
+
+    var saw_oom = false;
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing_allocator = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+
+        var session = Session{ .allocator = failing_allocator.allocator() };
+        session.assignSessionId();
+        session.copyTitle("Test");
+        session.copyBaseUrl(DEFAULT_BASE_URL);
+        session.copyApiKey("test-key");
+        session.copyModel(DEFAULT_MODEL);
+        session.copySystemPrompt(DEFAULT_SYSTEM_PROMPT);
+        session.copyReasoningEffort(DEFAULT_REASONING_EFFORT);
+
+        const result = session.buildRequestLocked();
+        if (result) |request| {
+            request.deinit();
+            if (!failing_allocator.has_induced_failure) break;
+        } else |err| switch (err) {
+            error.OutOfMemory => saw_oom = true,
+            else => return err,
+        }
+    }
+
+    try std.testing.expect(saw_oom);
+}
+
+test "copilot session pre-targets the bound surface in its request" {
+    const session = try Session.init(
+        std.testing.allocator,
+        "copilot", "", "", "", "", "", "", "", "",
+    );
+    defer session.deinit();
+    session.copilot = true;
+    session.setBoundSurface("abc123");
+
+    const req = try session.buildRequestLocked();
+    defer req.deinit();
+
+    try std.testing.expectEqualStrings("abc123", req.write_context_surface_id[0..req.write_context_surface_id_len]);
 }

@@ -19,13 +19,14 @@ const Config = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const ai_chat = @import("ai_chat.zig");
+const ai_agent_config = @import("ai_agent_config.zig");
 const keybind = @import("keybind.zig");
 const link_open = @import("link_open.zig");
 const platform_dirs = @import("platform/dirs.zig");
 const platform_editor = @import("platform/editor.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
 const themes = @import("themes.zig");
+const i18n = @import("i18n.zig");
 
 const log = std.log.scoped(.config);
 
@@ -289,7 +290,7 @@ theme: ?[]const u8 = null,
 @"desktop-notifications": bool = true,
 
 /// Agent command permission mode: confirm (deny until approved UI exists) or full.
-@"ai-agent-permission": ai_chat.AgentPermission = .confirm,
+@"ai-agent-permission": ai_agent_config.AgentPermission = .confirm,
 
 /// Timeout budget for agent shell/SSH commands.
 @"ai-agent-command-timeout-ms": u32 = 60_000,
@@ -305,6 +306,9 @@ shell: []const u8 = platform_pty_command.default_shell_name,
 /// remote auto-open, and the "New Agent" command. Empty falls back to the
 /// first saved profile.
 @"ai-default-profile": []const u8 = "",
+
+/// UI language. auto follows the system locale. Restart required.
+language: i18n.LanguageSetting = .auto,
 
 // ============================================================================
 // Remote Access (opt-in foundations)
@@ -750,6 +754,12 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
         } else {
             log.warn("invalid right-click-action: {s}", .{value});
         }
+    } else if (std.mem.eql(u8, key, "language")) {
+        if (i18n.LanguageSetting.parse(value)) |setting| {
+            self.language = setting;
+        } else {
+            log.warn("invalid language: {s}", .{value});
+        }
     } else if (std.mem.eql(u8, key, "url-open-mode")) {
         if (UrlOpenMode.parse(value)) |mode| {
             self.@"url-open-mode" = mode;
@@ -773,7 +783,7 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
             log.warn("invalid ai-agent-enabled: {s}", .{value});
         }
     } else if (std.mem.eql(u8, key, "ai-agent-permission")) {
-        if (ai_chat.AgentPermission.parse(value)) |permission| {
+        if (ai_agent_config.AgentPermission.parse(value)) |permission| {
             self.@"ai-agent-permission" = permission;
         } else {
             log.warn("invalid ai-agent-permission: {s}", .{value});
@@ -1232,6 +1242,7 @@ pub fn writeHelp(writer: anytype) !void {
         \\  --copy-on-select <bool>      Copy terminal selection when mouse selection completes
         \\  --right-click-action <mode>  ignore | copy | paste | copy-or-paste
         \\  --url-open-mode <mode>       embedded | system-browser
+        \\  --language <lang>            UI language: auto | en | zh-CN (default: auto)
         \\  --ssh-legacy-algorithms <bool> Enable legacy ssh-rsa/ssh-dss OpenSSH options
         \\  --ai-agent-enabled <bool>    Enable AI Chat agent tools by default
         \\  --ai-agent-permission <mode> Agent tool permission: confirm | full
@@ -1521,6 +1532,10 @@ const default_config_template =
     \\# fullscreen = false
     \\# quake-mode = true   # toggle_quake controls the top drop-down window
     \\
+    \\# Restore the previous tab/split layout (and working dirs) on next launch.
+    \\# Saved to session.json on close; off by default (file neither read nor written).
+    \\# restore-tabs-on-startup = false
+    \\
     \\# Keyboard shortcuts
     \\# Syntax: keybind = [global:]modifier+key=action
     \\# keybind = ctrl+shift+p=toggle_command_palette
@@ -1549,6 +1564,9 @@ const default_config_template =
     \\# copy-on-select = false
     \\# right-click-action = copy   # ignore | copy | paste | copy-or-paste
     \\# url-open-mode = embedded    # embedded | system-browser
+    \\
+    \\# UI language (auto follows the system locale; restart required)
+    \\# language = auto             # auto | en | zh-CN
     \\
     \\# SSH compatibility for older bastions/servers.
     \\# Adds ssh-rsa/ssh-dss and legacy KEX/cipher options to profile/helper SSH.
@@ -1828,7 +1846,7 @@ test "config: ai agent options parse" {
     var cfg: Config = .{};
 
     try std.testing.expectEqual(false, cfg.@"ai-agent-enabled");
-    try std.testing.expectEqual(ai_chat.AgentPermission.confirm, cfg.@"ai-agent-permission");
+    try std.testing.expectEqual(ai_agent_config.AgentPermission.confirm, cfg.@"ai-agent-permission");
 
     cfg.applyKeyValue(allocator, "ai-agent-enabled", "true", ".");
     cfg.applyKeyValue(allocator, "ai-agent-permission", "full", ".");
@@ -1836,7 +1854,7 @@ test "config: ai agent options parse" {
     cfg.applyKeyValue(allocator, "ai-agent-output-limit", "4096", ".");
 
     try std.testing.expectEqual(true, cfg.@"ai-agent-enabled");
-    try std.testing.expectEqual(ai_chat.AgentPermission.full, cfg.@"ai-agent-permission");
+    try std.testing.expectEqual(ai_agent_config.AgentPermission.full, cfg.@"ai-agent-permission");
     try std.testing.expectEqual(@as(u32, 120000), cfg.@"ai-agent-command-timeout-ms");
     try std.testing.expectEqual(@as(u32, 4096), cfg.@"ai-agent-output-limit");
 }
@@ -1896,4 +1914,26 @@ test "config: ai-default-profile parses" {
     try std.testing.expectEqualStrings("", cfg.@"ai-default-profile");
     cfg.applyKeyValue(allocator, "ai-default-profile", "GPT-4o", ".");
     try std.testing.expectEqualStrings("GPT-4o", cfg.@"ai-default-profile");
+}
+
+test "config: language parses auto/en/zh-CN and rejects invalid" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{};
+    defer cfg.deinit(allocator);
+
+    // 默认应为 auto
+    try std.testing.expect(cfg.language == .auto);
+
+    cfg.applyKeyValue(allocator, "language", "zh-CN", ".");
+    try std.testing.expect(cfg.language == .zh_CN);
+
+    cfg.applyKeyValue(allocator, "language", "en", ".");
+    try std.testing.expect(cfg.language == .en);
+
+    // 非法值保持上一次有效值（en），仅告警
+    cfg.applyKeyValue(allocator, "language", "klingon", ".");
+    try std.testing.expect(cfg.language == .en);
+
+    cfg.applyKeyValue(allocator, "language", "auto", ".");
+    try std.testing.expect(cfg.language == .auto);
 }

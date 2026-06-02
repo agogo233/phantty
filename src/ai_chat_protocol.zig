@@ -7,6 +7,11 @@ const platform_process = @import("platform/process.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
 
 pub const DEFAULT_PROTOCOL = "chat_completions";
+pub const DEFAULT_THINKING = "enabled";
+pub const DEFAULT_REASONING_EFFORT = "high";
+pub const DEFAULT_STREAM = "false";
+pub const DEFAULT_AGENT = "true";
+pub const DEFAULT_MAX_TOKENS = "8192";
 pub const TOOL_CALL_REASONING_FALLBACK = "Tool call is required before answering.";
 
 // ---------------------------------------------------------------------------
@@ -543,11 +548,11 @@ fn forEachToolSpec(
     try emit(ctx, "terminal_snapshot", "Read a bounded text snapshot from one terminal surface or all surfaces.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Optional surface id from terminal_list.\"}}");
     try emit(ctx, "terminal_select", platform_pty_command.terminalSelectToolDescription(), "{\"surface_id\":{\"type\":\"string\",\"description\":\"Surface id from terminal_list to make the current agent write context.\"}}");
     try emit(ctx, platform_process.localCommandToolName(), platform_process.localCommandToolDescription(), "{\"command\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}");
-    try emit(ctx, "ssh_session_exec", "Run a POSIX shell command in the selected already-open SSH terminal surface. The surface_id must match the current terminal_select context. Use only when the surface is at a shell prompt; for R, Python, Codex, Claude Code, or other REPLs use terminal_repl_exec.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Selected surface id from terminal_select.\"},\"command\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}");
+    try emit(ctx, "ssh_session_exec", "Run a POSIX shell command in the selected already-open SSH terminal surface. The surface_id must match the current terminal_select context. Use only when the surface is at a shell prompt and the command returns; for R, Python, Codex, Claude Code, other REPLs, or launching full-screen agent apps, use terminal_repl_exec.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Selected surface id from terminal_select.\"},\"command\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}");
     if (platform_pty_command.wslSessionToolsEnabled()) {
         try emit(ctx, platform_pty_command.wslSessionToolName(), platform_pty_command.wslSessionToolDescription(), platform_pty_command.wslSessionToolPropertiesJson());
     }
-    try emit(ctx, "terminal_repl_exec", "Send code or text to the selected already-open interactive REPL/app terminal without shell syntax. The surface_id must match the current terminal_select context. Use repl=r for R, repl=python for Python, repl=codex for Codex, repl=claude_code for Claude Code, or repl=plain for raw text input.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Selected surface id from terminal_select.\"},\"repl\":{\"type\":\"string\",\"description\":\"r, python, codex, claude_code, or plain\"},\"code\":{\"type\":\"string\",\"description\":\"Code or plain text to submit.\"},\"timeout_ms\":{\"type\":\"integer\"}}");
+    try emit(ctx, "terminal_repl_exec", "Send code or text to the selected already-open interactive REPL/app terminal without shell syntax. The surface_id must match the current terminal_select context. Use repl=r for R, repl=python for Python, repl=codex for Codex, repl=claude_code for Claude Code, or repl=plain for raw text input. For Codex and Claude Code, this waits until the app settles, requests approval/input, reports completion/failure, or reaches timeout_ms.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Selected surface id from terminal_select.\"},\"repl\":{\"type\":\"string\",\"description\":\"r, python, codex, claude_code, or plain\"},\"code\":{\"type\":\"string\",\"description\":\"Code or plain text to submit.\"},\"timeout_ms\":{\"type\":\"integer\"}}");
     try emit(ctx, "ssh_profile_save", "Create or update a saved WispTerm SSH server profile. Use before ssh_profile_connect when the user provides SSH host, user, port, or password details.", "{\"name\":{\"type\":\"string\",\"description\":\"Optional profile name; defaults to host for new profiles.\"},\"host\":{\"type\":\"string\",\"description\":\"SSH host name or IP address.\"},\"user\":{\"type\":\"string\",\"description\":\"SSH username.\"},\"password\":{\"type\":\"string\",\"description\":\"Optional SSH password; omit when using keys.\"},\"port\":{\"type\":\"string\",\"description\":\"Optional SSH port; defaults to 22 for new profiles.\"},\"proxy_jump\":{\"type\":\"string\",\"description\":\"Optional OpenSSH ProxyJump/jump host: [user@]host[:port], comma-separated for multi-hop. Omit for a direct connection.\"}}");
     try emit(ctx, "ssh_profile_connect", "Create a new tab connected to a saved WispTerm SSH server profile by its profile name or host.", "{\"profile_name\":{\"type\":\"string\",\"description\":\"Saved SSH profile name or host to open in a new tab.\"}}");
     try emit(ctx, "tab_new", platform_pty_command.tabNewToolDescription(), platform_pty_command.tabNewToolPropertiesJson());
@@ -1188,4 +1193,142 @@ test "anthropic maps tool_calls to tool_use and tool results to grouped tool_res
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"tool_result\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_use_id\":\"call_1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"input_schema\"") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Stream-response parser
+// ---------------------------------------------------------------------------
+
+/// Parse an SSE/streaming response body into an ApiResult.
+/// Handles both OpenAI chat-completions streaming (choices[].delta) and the
+/// Responses API event stream (response.output_text.delta, response.completed,
+/// etc.).  Pure w.r.t. Session — only touches ApiResult/ApiUsage/std.
+pub fn parseApiStreamResponse(allocator: std.mem.Allocator, body: []const u8) !ApiResult {
+    var content: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer content.deinit(allocator);
+    var reasoning: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer reasoning.deinit(allocator);
+    var usage: ?ApiUsage = null;
+
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, "data:")) continue;
+
+        const data = std.mem.trim(u8, line["data:".len..], " \t");
+        if (data.len == 0) continue;
+        if (std.mem.eql(u8, data, "[DONE]")) break;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch continue;
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) continue;
+        const obj = root.object;
+        if (parseApiUsage(root)) |u| usage = u;
+
+        if (try parseApiErrorResult(allocator, root)) |result| return result;
+
+        if (jsonStringValue(obj.get("type"))) |event_type| {
+            if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
+                if (jsonStringValue(obj.get("delta"))) |delta| {
+                    if (delta.len > 0) try content.appendSlice(allocator, delta);
+                }
+                continue;
+            }
+            if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta") or
+                std.mem.eql(u8, event_type, "response.reasoning_text.delta"))
+            {
+                if (jsonStringValue(obj.get("delta"))) |delta| {
+                    if (delta.len > 0) try reasoning.appendSlice(allocator, delta);
+                }
+                continue;
+            }
+            if (std.mem.eql(u8, event_type, "response.completed")) {
+                if (obj.get("response")) |response_value| {
+                    if (parseApiUsage(response_value)) |u| usage = u;
+                    if (content.items.len == 0) try appendResponsesOutputText(allocator, &content, response_value);
+                    if (reasoning.items.len == 0) try appendResponsesReasoningText(allocator, &reasoning, response_value);
+                }
+                break;
+            }
+            if (std.mem.eql(u8, event_type, "response.failed")) {
+                if (obj.get("response")) |response_value| {
+                    if (response_value == .object) {
+                        if (try parseApiErrorResult(allocator, response_value)) |result| return result;
+                    }
+                }
+                return ApiResult{ .content = try allocator.dupe(u8, "API returned an error") };
+            }
+        }
+
+        const choices_value = obj.get("choices") orelse continue;
+        if (choices_value != .array or choices_value.array.items.len == 0) continue;
+        const choice = choices_value.array.items[0];
+        if (choice != .object) continue;
+        const delta_value = choice.object.get("delta") orelse continue;
+        if (delta_value != .object) continue;
+
+        if (delta_value.object.get("content")) |content_value| {
+            if (content_value == .string and content_value.string.len > 0) {
+                try content.appendSlice(allocator, content_value.string);
+            }
+        }
+        if (delta_value.object.get("reasoning_content")) |reasoning_value| {
+            if (reasoning_value == .string and reasoning_value.string.len > 0) {
+                try reasoning.appendSlice(allocator, reasoning_value.string);
+            }
+        }
+    }
+
+    if (content.items.len == 0 and reasoning.items.len == 0) {
+        const trimmed = std.mem.trim(u8, body, " \t\r\n");
+        if (trimmed.len == 0) return error.EmptyResponse;
+        return ApiResult{ .content = try allocator.dupe(u8, trimmed) };
+    }
+
+    return .{
+        .content = try content.toOwnedSlice(allocator),
+        .reasoning = if (reasoning.items.len > 0) try reasoning.toOwnedSlice(allocator) else null,
+        .usage = usage,
+    };
+}
+
+test "ai chat stream response aggregates content and reasoning chunks" {
+    const allocator = std.testing.allocator;
+    const body =
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Think\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"ing\",\"content\":null}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n" ++
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":34,\"prompt_cache_hit_tokens\":5,\"prompt_cache_miss_tokens\":7,\"total_tokens\":46}}\n\n" ++
+        "data: [DONE]\n\n";
+
+    const result = try parseApiStreamResponse(allocator, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("Hello!", result.content);
+    try std.testing.expect(result.reasoning != null);
+    try std.testing.expectEqualStrings("Thinking", result.reasoning.?);
+    try std.testing.expect(result.usage != null);
+    try std.testing.expectEqual(@as(u64, 46), result.usage.?.total_tokens);
+    try std.testing.expectEqual(@as(u64, 5), result.usage.?.prompt_cache_hit_tokens);
+    try std.testing.expectEqual(@as(u64, 7), result.usage.?.prompt_cache_miss_tokens);
+}
+
+test "ai chat Responses API stream aggregates output text and usage" {
+    const allocator = std.testing.allocator;
+    const body =
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n" ++
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checked\"}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":3,\"total_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":2}},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}]}}\n\n";
+    const result = try parseApiStreamResponse(allocator, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("Hello", result.content);
+    try std.testing.expect(result.reasoning != null);
+    try std.testing.expectEqualStrings("Checked", result.reasoning.?);
+    try std.testing.expect(result.usage != null);
+    try std.testing.expectEqual(@as(u64, 12), result.usage.?.total_tokens);
+    try std.testing.expectEqual(@as(u64, 2), result.usage.?.prompt_cache_hit_tokens);
+    try std.testing.expectEqual(@as(u64, 7), result.usage.?.prompt_cache_miss_tokens);
 }
