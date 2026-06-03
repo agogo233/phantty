@@ -1389,6 +1389,43 @@ pub fn activeCopilotSessionForInput() ?*ai_chat.Session {
     return t.copilot_session;
 }
 
+/// Inserts `text` into a visible AI chat composer when a file is dropped at
+/// framebuffer-pixel `(x, y)`. Returns true if the point landed over a chat
+/// surface and the text was inserted. Checks the dedicated AI-chat tab first
+/// (its whole content area is the drop target), then the right-docked copilot
+/// panel. Called by the file-drop pipeline (input/clipboard.zig). Coordinates
+/// are framebuffer px, matching the OS drop events and clientSize.
+pub fn appendDroppedPathToChatAtPoint(text: []const u8, x: i32, y: i32) bool {
+    const win = g_window orelse return false;
+    const size = window_backend.clientSize(win);
+
+    if (activeAiChat()) |session| {
+        const px: f32 = @floatFromInt(x);
+        const py: f32 = @floatFromInt(y);
+        const left = leftPanelsWidth();
+        const top = currentTitlebarHeight();
+        const right = @as(f32, @floatFromInt(size.width)) - rightPanelsWidthForWindow(size.width);
+        const bottom: f32 = @floatFromInt(size.height);
+        if (px >= left and px < right and py >= top and py < bottom) {
+            session.appendInputText(text);
+            return true;
+        }
+        return false;
+    }
+
+    if (aiCopilotVisible()) {
+        const bounds = ai_sidebar.boundsForWindow(size.width, size.height, currentTitlebarHeight(), leftPanelsWidth(), 0);
+        if (x >= bounds.left and x < bounds.right and y >= bounds.top and y < bounds.bottom) {
+            const session = activeCopilotSessionForInput() orelse return false;
+            session.appendInputText(text);
+            input.focusAiCopilot();
+            return true;
+        }
+    }
+
+    return false;
+}
+
 pub fn toggleAiCopilot() void {
     if (!isActiveTabTerminal()) return; // copilot is terminal-only
     if (ai_sidebar.g_visible) {
@@ -1811,9 +1848,10 @@ pub fn spawnAiChatTab(
     stream_val: []const u8,
     agent_val: []const u8,
     max_tokens: u32,
+    vision_val: []const u8,
 ) bool {
     const allocator = g_allocator orelse return false;
-    if (!tab.spawnAiChatTab(allocator, name, base_url, api_key, model, protocol, system_prompt, thinking, reasoning_effort, stream_val, agent_val, max_tokens)) return false;
+    if (!tab.spawnAiChatTab(allocator, name, base_url, api_key, model, protocol, system_prompt, thinking, reasoning_effort, stream_val, agent_val, max_tokens, vision_val)) return false;
     clearUiStateOnTabChange();
     return true;
 }
@@ -2084,6 +2122,19 @@ pub fn equalizeSplits() void {
         g_force_rebuild = true;
         g_cells_valid = false;
     }
+}
+
+/// Swap the contents of two panels (drag source `a`, drop target `b`) within
+/// the active tab. Returns whether a swap happened so the input layer can avoid
+/// redundant work on a no-op. Topology is unchanged, so cached rects only need
+/// to be re-pointed at their (swapped) surfaces — invalidate and rebuild.
+pub fn swapPanels(a: SplitTree.Node.Handle, b: SplitTree.Node.Handle) bool {
+    if (!tab.swapPanels(a, b)) return false;
+    split_layout.invalidateCachedRects();
+    handleActiveSurfaceChangeWithinTab();
+    g_force_rebuild = true;
+    g_cells_valid = false;
+    return true;
 }
 
 // Embed the font
@@ -5105,8 +5156,17 @@ fn runMainLoop(self: *AppWindow) !void {
                         // Render scrollbar for this surface within its viewport
                         overlays.renderScrollbarForSurface(rect.surface, @floatFromInt(rect.width), @floatFromInt(rect.height), @floatFromInt(pad.top));
 
-                        // Draw unfocused overlay if not focused
-                        if (!is_focused) {
+                        // Alt-drag panel swap feedback: highlight the drop target,
+                        // dim the grabbed source. Otherwise dim any unfocused panel.
+                        const is_swap_target = input.g_panel_swap_active and
+                            input.g_panel_swap_target != null and
+                            rect.handle == input.g_panel_swap_target.?;
+                        const is_swap_source = input.g_panel_swap_active and
+                            input.g_panel_swap_source != null and
+                            rect.handle == input.g_panel_swap_source.?;
+                        if (is_swap_target) {
+                            overlays.renderSwapTargetHighlight(@floatFromInt(rect.width), @floatFromInt(rect.height));
+                        } else if (is_swap_source or !is_focused) {
                             overlays.renderUnfocusedOverlaySimple(@floatFromInt(rect.width), @floatFromInt(rect.height));
                         }
 

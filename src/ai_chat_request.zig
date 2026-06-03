@@ -13,6 +13,7 @@ const ai_chat_types = @import("ai_chat_types.zig");
 // Type aliases from ai_chat_protocol
 const RequestMessage = ai_chat_protocol.RequestMessage;
 const ToolCall = ai_chat_protocol.ToolCall;
+const ImageBlock = ai_chat_protocol.ImageBlock;
 const ApiResult = ai_chat_protocol.ApiResult;
 const ApiUsage = ai_chat_protocol.ApiUsage;
 const Role = ai_chat_protocol.Role;
@@ -156,7 +157,7 @@ fn runAgentRequest(request: *ChatRequest) !ApiResult {
                 ai_chat.appendReplayableToolMessage(request.session, call.id, call.name, tool_result) catch {};
             }
 
-            var tool_msg = try requestMessageWithClonedFields(request.allocator, .tool, tool_result, null, call.id, null);
+            var tool_msg = try requestMessageWithClonedFields(request.allocator, .tool, tool_result, null, call.id, null, null);
             var tool_msg_owned = true;
             errdefer if (tool_msg_owned) tool_msg.deinit(request.allocator);
             try transcript.append(request.allocator, tool_msg);
@@ -210,7 +211,7 @@ fn runChatRequestForMessages(request: *const ChatRequest, messages: []const Requ
         },
         .extra_headers = if (is_anthropic) &anthropic_headers else &.{},
         .response_writer = &resp_buf.writer,
-    }) catch return error.RequestFailed;
+    }) catch |err| return networkFailureResult(allocator, endpoint, err);
     if (ai_chat.requestCancelled(request)) return error.Canceled;
 
     var resp_list = resp_buf.toArrayList();
@@ -252,20 +253,29 @@ fn runChatRequestStreaming(request: *const ChatRequest) !void {
         .{ .name = "anthropic-version", .value = "2023-06-01" },
     };
     const uri = try std.Uri.parse(endpoint);
-    var req = try client.request(.POST, uri, .{
+    var req = client.request(.POST, uri, .{
         .headers = .{
             .content_type = .{ .override = "application/json" },
             .authorization = if (is_anthropic) .omit else .{ .override = bearer },
         },
         .extra_headers = if (is_anthropic) &anthropic_headers else &.{},
         .keep_alive = false,
-    });
+    }) catch |err| {
+        try failStreamNetworkRequest(request, endpoint, "open request", err);
+        return;
+    };
     defer req.deinit();
 
-    try req.sendBodyComplete(body);
+    req.sendBodyComplete(body) catch |err| {
+        try failStreamNetworkRequest(request, endpoint, "send request", err);
+        return;
+    };
 
     var redirect_buffer: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buffer);
+    var response = req.receiveHead(&redirect_buffer) catch |err| {
+        try failStreamNetworkRequest(request, endpoint, "receive response", err);
+        return;
+    };
     if (ai_chat.requestCancelled(request)) return error.Canceled;
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
@@ -305,6 +315,26 @@ fn runChatRequestStreaming(request: *const ChatRequest) !void {
     ai_chat.finishAssistantStream(request.session, message_idx, request.started_ms, usage);
 }
 
+fn networkFailureResult(allocator: std.mem.Allocator, endpoint: []const u8, err: anyerror) !ApiResult {
+    return .{
+        .content = try std.fmt.allocPrint(
+            allocator,
+            "HTTP request failed before response: {s} ({s})",
+            .{ @errorName(err), endpoint },
+        ),
+    };
+}
+
+fn failStreamNetworkRequest(request: *const ChatRequest, endpoint: []const u8, stage: []const u8, err: anyerror) !void {
+    const msg = try std.fmt.allocPrint(
+        request.allocator,
+        "HTTP stream {s} failed before response: {s} ({s})",
+        .{ stage, @errorName(err), endpoint },
+    );
+    defer request.allocator.free(msg);
+    ai_chat.failAssistantStream(request.session, null, msg);
+}
+
 // ---------------------------------------------------------------------------
 // MOVE: request-JSON serialization
 // ---------------------------------------------------------------------------
@@ -322,7 +352,7 @@ pub fn buildRequestJsonForMessages(allocator: std.mem.Allocator, request: *const
 // ---------------------------------------------------------------------------
 
 fn cloneRequestMessage(allocator: std.mem.Allocator, msg: RequestMessage) !RequestMessage {
-    return requestMessageWithClonedFields(allocator, msg.role, msg.content, msg.reasoning, msg.tool_call_id, msg.tool_calls);
+    return requestMessageWithClonedFields(allocator, msg.role, msg.content, msg.reasoning, msg.tool_call_id, msg.tool_calls, msg.images);
 }
 
 fn cloneToolCalls(allocator: std.mem.Allocator, calls: []const ToolCall) ![]ToolCall {
@@ -352,7 +382,7 @@ fn cloneToolCalls(allocator: std.mem.Allocator, calls: []const ToolCall) ![]Tool
 }
 
 fn assistantToolCallMessage(allocator: std.mem.Allocator, content: []const u8, reasoning: ?[]const u8, calls: []const ToolCall) !RequestMessage {
-    return requestMessageWithClonedFields(allocator, .assistant, content, reasoning, null, calls);
+    return requestMessageWithClonedFields(allocator, .assistant, content, reasoning, null, calls, null);
 }
 
 pub fn requestMessageWithClonedFields(
@@ -362,6 +392,7 @@ pub fn requestMessageWithClonedFields(
     reasoning: ?[]const u8,
     tool_call_id: ?[]const u8,
     tool_calls: ?[]const ToolCall,
+    images: ?[]const ImageBlock,
 ) !RequestMessage {
     const content_copy = try allocator.dupe(u8, content);
     errdefer allocator.free(content_copy);
@@ -381,12 +412,19 @@ pub fn requestMessageWithClonedFields(
     };
     if (tool_calls) |calls| tool_calls_copy = try cloneToolCalls(allocator, calls);
 
+    const images_copy = try ai_chat_protocol.cloneImageBlocks(allocator, images);
+    errdefer if (images_copy) |imgs| {
+        for (imgs) |img| img.deinit(allocator);
+        allocator.free(imgs);
+    };
+
     return .{
         .role = role,
         .content = content_copy,
         .reasoning = reasoning_copy,
         .tool_call_id = tool_call_id_copy,
         .tool_calls = tool_calls_copy,
+        .images = images_copy,
     };
 }
 
@@ -463,6 +501,16 @@ pub fn executeToolCall(request: *ChatRequest, call: ToolCall) ![]u8 {
 // ---------------------------------------------------------------------------
 // Tests for request JSON serialization (moved from ai_chat.zig)
 // ---------------------------------------------------------------------------
+
+test "ai chat network failure result includes endpoint and underlying error" {
+    const allocator = std.testing.allocator;
+    var result = try networkFailureResult(allocator, "https://api.example.test/v1/responses", error.UnknownHostName);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "HTTP request failed before response: UnknownHostName (https://api.example.test/v1/responses)",
+        result.content,
+    );
+}
 
 test "ai chat request json includes deepseek thinking mode" {
     const allocator = std.testing.allocator;

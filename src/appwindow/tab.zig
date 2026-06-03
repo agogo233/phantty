@@ -368,10 +368,11 @@ pub fn spawnAiChatTab(
     stream_val: []const u8,
     agent_val: []const u8,
     max_tokens: u32,
+    vision_val: []const u8,
 ) bool {
     if (g_tab_count >= MAX_TABS) return false;
 
-    const session = ai_chat.Session.initWithProtocol(
+    const session = ai_chat.Session.initWithVision(
         allocator,
         name,
         base_url,
@@ -383,6 +384,7 @@ pub fn spawnAiChatTab(
         reasoning_effort,
         stream_val,
         agent_val,
+        vision_val,
     ) catch {
         std.debug.print("Failed to create AI Chat session\n", .{});
         return false;
@@ -832,6 +834,27 @@ pub fn equalizeSplits(allocator: std.mem.Allocator) bool {
     t.tree.deinit();
     t.tree = new_tree;
 
+    return true;
+}
+
+/// Swap the panels at handles `a` (drag source) and `b` (drop target). The two
+/// leaves exchange their surfaces; the split-tree topology and ratios are
+/// unchanged. Focus follows the dragged surface to the target slot.
+///
+/// Returns false (no-op) if there is no terminal tab, either handle is out of
+/// range, either node is not a leaf, or `a == b`. The leaf/range checks are
+/// defensive: a shell may have exited mid-drag and reshaped the tree, leaving
+/// the caller holding stale handles.
+pub fn swapPanels(a: SplitTree.Node.Handle, b: SplitTree.Node.Handle) bool {
+    const t = activeTab() orelse return false;
+    if (t.kind != .terminal) return false;
+    if (a == b) return false;
+    if (a.idx() >= t.tree.nodes.len or b.idx() >= t.tree.nodes.len) return false;
+    if (t.tree.nodes[a.idx()] != .leaf or t.tree.nodes[b.idx()] != .leaf) return false;
+
+    t.tree.swapLeaves(a, b);
+    // The dragged surface (was at `a`) now lives at `b`; keep it focused.
+    t.focused = b;
     return true;
 }
 
