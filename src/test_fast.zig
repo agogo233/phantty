@@ -29,6 +29,7 @@ test {
     _ = @import("renderer/overlays/profile_codec.zig");
     _ = @import("renderer/overlays/transfer_toast_model.zig");
     _ = @import("renderer/overlays/update_prompt_model.zig");
+    _ = @import("close_confirm.zig");
     _ = @import("command_palette_model.zig");
     _ = @import("command_center_state.zig");
     _ = @import("platform/window_state_codec.zig");
@@ -69,6 +70,7 @@ test {
     _ = @import("ai_chat_layout.zig");
     _ = @import("ai_sidebar.zig");
     _ = @import("appwindow/flush_scheduler.zig");
+    _ = @import("appwindow/resize_throttle.zig");
     _ = @import("ai_chat_protocol.zig");
     _ = @import("weixin/types.zig");
     _ = @import("weixin/ilink_codec.zig");

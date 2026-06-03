@@ -48,6 +48,7 @@ const hit_test = @import("input/hit_test.zig");
 const preview_source = @import("input/preview_source.zig");
 const terminal_link_action = @import("input/terminal_link_action.zig");
 const mouse_report = @import("input/mouse_report.zig");
+const close_confirm = @import("close_confirm.zig");
 const writeToPty = clipboard.writeToPty;
 pub const copyTextToClipboard = clipboard.copyTextToClipboard;
 const activeTerminalSelectionExists = clipboard.activeTerminalSelectionExists;
@@ -417,6 +418,16 @@ pub fn toggleFileExplorer() void {
     AppWindow.g_cells_valid = false;
 }
 
+fn closeFileExplorerPanel() void {
+    file_explorer.close();
+    blurBrowserUrlBarIfFocused();
+    if (AppWindow.g_window) |win| {
+        syncPanelGridFromWindow(win);
+    }
+    AppWindow.g_force_rebuild = true;
+    AppWindow.g_cells_valid = false;
+}
+
 pub fn toggleBrowserPanel() void {
     const perf = ui_perf.begin("input.toggle_browser_panel");
     defer perf.end();
@@ -439,19 +450,47 @@ pub fn toggleBrowserPanel() void {
     AppWindow.g_cells_valid = false;
 }
 
+fn closeBrowserPanel() void {
+    g_close_shortcut_confirm_until_ms = 0;
+    browser_panel.close();
+    if (AppWindow.g_window) |win| {
+        syncPanelGridFromWindow(win);
+    }
+    AppWindow.g_force_rebuild = true;
+    AppWindow.g_cells_valid = false;
+}
+
+fn closeMarkdownPreviewPanel() void {
+    g_close_shortcut_confirm_until_ms = 0;
+    markdown_preview_panel.close();
+    if (AppWindow.g_window) |win| {
+        syncPanelGridFromWindow(win);
+    }
+    AppWindow.g_force_rebuild = true;
+    AppWindow.g_cells_valid = false;
+}
+
+fn closeAiCopilotPanel() void {
+    AppWindow.hideAiCopilot();
+    if (AppWindow.g_window) |win| {
+        syncPanelGridFromWindow(win);
+    }
+    AppWindow.g_force_rebuild = true;
+    AppWindow.g_cells_valid = false;
+}
+
 pub fn closePanelOrTab() void {
     if (markdown_preview_panel.isVisibleForActiveTab()) {
-        g_close_shortcut_confirm_until_ms = 0;
-        markdown_preview_panel.close();
-        if (AppWindow.g_window) |win| syncPanelGridFromWindow(win);
-        AppWindow.g_force_rebuild = true;
-        AppWindow.g_cells_valid = false;
+        closeMarkdownPreviewPanel();
         return;
     }
     if (browser_panel.isVisibleForActiveTab()) {
+        closeBrowserPanel();
+        return;
+    }
+    if (close_confirm.shouldConfirm(AppWindow.g_confirm_close_running_program, AppWindow.activeSurfaceHasRunningProgram())) {
         g_close_shortcut_confirm_until_ms = 0;
-        browser_panel.close();
-        if (AppWindow.g_window) |win| syncPanelGridFromWindow(win);
+        overlays.closeConfirmOpen(.focused_split, .running_program);
         AppWindow.g_force_rebuild = true;
         AppWindow.g_cells_valid = false;
         return;
@@ -471,6 +510,24 @@ pub fn closePanelOrTab() void {
     }
     g_close_shortcut_confirm_until_ms = 0;
     AppWindow.closeFocusedSplit();
+}
+
+/// Close a tab via a pointer gesture (middle-click or the × button), honoring
+/// the running-program confirmation. `tab_idx` is the tab to close.
+fn requestCloseTabGesture(tab_idx: usize) void {
+    const closes_window = tab.g_tab_count <= 1;
+    if (close_confirm.shouldConfirm(AppWindow.g_confirm_close_running_program, AppWindow.tabHasRunningProgram(tab_idx))) {
+        const action: close_confirm.PendingClose = if (closes_window) .window else .{ .tab = tab_idx };
+        overlays.closeConfirmOpen(action, .running_program);
+        AppWindow.g_force_rebuild = true;
+        AppWindow.g_cells_valid = false;
+        return;
+    }
+    if (closes_window) {
+        AppWindow.g_should_close = true;
+    } else {
+        AppWindow.closeTab(tab_idx);
+    }
 }
 
 pub fn adjustFontSize(delta: i32) void {
@@ -1157,19 +1214,19 @@ fn handleKey(ev: platform_input.KeyEvent) void {
                 return;
             },
             platform_input.key_up => {
-                _ = AppWindow.aiHistoryMoveSelection(-1);
+                _ = AppWindow.aiHistoryNav(-1);
                 return;
             },
             platform_input.key_down => {
-                _ = AppWindow.aiHistoryMoveSelection(1);
+                _ = AppWindow.aiHistoryNav(1);
                 return;
             },
             platform_input.key_left => {
-                _ = AppWindow.aiHistoryCycleCategory(-1);
+                _ = AppWindow.aiHistoryFocusMove(-1);
                 return;
             },
             platform_input.key_right => {
-                _ = AppWindow.aiHistoryCycleCategory(1);
+                _ = AppWindow.aiHistoryFocusMove(1);
                 return;
             },
             platform_input.key_enter => {
@@ -1497,6 +1554,23 @@ fn hitTestFileExplorer(xpos: f64, ypos: f64) bool {
     return xpos >= panel_x and xpos < panel_right;
 }
 
+fn fileExplorerHeaderLayout() ?hit_test.PanelHeaderLayout {
+    if (!file_explorer.isVisibleForActiveTab()) return null;
+    const panel_x: f64 = @floatCast(titlebar.sidebarWidth());
+    const panel_right = panel_x + @as(f64, @floatCast(file_explorer.width()));
+    return .{
+        .visible = true,
+        .left = panel_x,
+        .right = panel_right,
+        .top = titlebarHeight(),
+        .height = @floatCast(file_explorer.headerHeight()),
+    };
+}
+
+fn hitTestFileExplorerCloseButton(xpos: f64, ypos: f64) bool {
+    return hit_test.panelHeaderCloseButton(fileExplorerHeaderLayout() orelse return false, xpos, ypos);
+}
+
 fn hitTestMarkdownPreviewPanel(xpos: f64, ypos: f64) bool {
     if (!markdown_preview_panel.isVisibleForActiveTab()) return false;
     if (ypos < titlebarHeight()) return false;
@@ -1505,6 +1579,31 @@ fn hitTestMarkdownPreviewPanel(xpos: f64, ypos: f64) bool {
     const preview_w: f64 = @floatCast(markdown_preview_panel.width());
     const panel_x: f64 = @as(f64, @floatFromInt(size.width)) - preview_w;
     return xpos >= panel_x and xpos < panel_x + preview_w;
+}
+
+fn markdownPreviewHeaderLayout() ?hit_test.PanelHeaderLayout {
+    if (!markdown_preview_panel.isVisibleForActiveTab()) return null;
+    const win = AppWindow.g_window orelse return null;
+    const size = clientSize(win);
+    const preview_w: f64 = @floatCast(markdown_preview_panel.width());
+    const panel_x: f64 = @as(f64, @floatFromInt(size.width)) - preview_w;
+    return .{
+        .visible = true,
+        .left = panel_x,
+        .right = panel_x + preview_w,
+        .top = titlebarHeight(),
+        .height = @floatCast(AppWindow.markdown_preview_renderer.HEADER_HEIGHT),
+    };
+}
+
+fn hitTestMarkdownPreviewCloseButton(xpos: f64, ypos: f64) bool {
+    return hit_test.panelHeaderCloseButton(markdownPreviewHeaderLayout() orelse return false, xpos, ypos);
+}
+
+fn hitTestMarkdownPreviewHeader(xpos: f64, ypos: f64) bool {
+    const layout = markdownPreviewHeaderLayout() orelse return false;
+    return xpos >= layout.left and xpos < layout.right and
+        ypos >= layout.top and ypos < layout.top + layout.height;
 }
 
 fn browserPanelBounds() ?browser_panel.Bounds {
@@ -1535,6 +1634,46 @@ fn hitTestBrowserUrlBar(xpos: f64, ypos: f64) bool {
         xpos < @as(f64, @floatFromInt(url_bar.right)) and
         ypos >= @as(f64, @floatFromInt(url_bar.top)) and
         ypos < @as(f64, @floatFromInt(url_bar.bottom));
+}
+
+fn browserHeaderLayout() ?hit_test.PanelHeaderLayout {
+    const bounds = browserPanelBounds() orelse return null;
+    const url_bar = browser_panel.urlBarBounds(bounds) orelse return null;
+    return .{
+        .visible = true,
+        .left = @floatFromInt(url_bar.left),
+        .right = @floatFromInt(url_bar.right),
+        .top = @floatFromInt(url_bar.top),
+        .height = @floatFromInt(url_bar.bottom - url_bar.top),
+    };
+}
+
+fn hitTestBrowserCloseButton(xpos: f64, ypos: f64) bool {
+    return hit_test.panelHeaderCloseButton(browserHeaderLayout() orelse return false, xpos, ypos);
+}
+
+fn aiCopilotHeaderLayout() ?hit_test.PanelHeaderLayout {
+    if (!AppWindow.aiCopilotVisible()) return null;
+    const win = AppWindow.g_window orelse return null;
+    const fb = window_backend.framebufferSize(win);
+    const bounds = ai_sidebar.boundsForWindow(
+        @intCast(fb.width),
+        @intCast(fb.height),
+        @floatCast(titlebarHeight()),
+        AppWindow.leftPanelsWidth(),
+        0,
+    );
+    return .{
+        .visible = true,
+        .left = @floatFromInt(bounds.left),
+        .right = @floatFromInt(bounds.right),
+        .top = @floatFromInt(bounds.top),
+        .height = @floatCast(AppWindow.ai_chat_renderer.HEADER_H),
+    };
+}
+
+fn hitTestAiCopilotCloseButton(xpos: f64, ypos: f64) bool {
+    return hit_test.panelHeaderCloseButton(aiCopilotHeaderLayout() orelse return false, xpos, ypos);
 }
 
 fn hitTestBrowserResizeHandle(xpos: f64, ypos: f64) bool {
@@ -2610,11 +2749,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
         const xpos: f64 = @floatFromInt(ev.x);
         const ypos: f64 = @floatFromInt(ev.y);
         if (hitTestSidebarTab(xpos, ypos)) |tab_idx| {
-            if (tab.g_tab_count <= 1) {
-                AppWindow.g_should_close = true;
-            } else {
-                AppWindow.closeTab(tab_idx);
-            }
+            requestCloseTabGesture(tab_idx);
             return;
         }
         if (AppWindow.activeAiChat()) |chat| {
@@ -2657,6 +2792,22 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             if (ypos < titlebar_h) {
                 blurBrowserUrlBarIfFocused();
                 handleTopbarPress(xpos);
+                return;
+            }
+            if (hitTestFileExplorerCloseButton(xpos, ypos)) {
+                closeFileExplorerPanel();
+                return;
+            }
+            if (hitTestBrowserCloseButton(xpos, ypos)) {
+                closeBrowserPanel();
+                return;
+            }
+            if (hitTestMarkdownPreviewCloseButton(xpos, ypos)) {
+                closeMarkdownPreviewPanel();
+                return;
+            }
+            if (hitTestAiCopilotCloseButton(xpos, ypos)) {
+                closeAiCopilotPanel();
                 return;
             }
             const over_browser_url_bar = hitTestBrowserUrlBar(xpos, ypos);
@@ -2723,6 +2874,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             if (hitTestMarkdownPreviewPanel(xpos, ypos)) {
                 file_explorer.g_focused = false;
                 if (file_explorer.g_op_mode != .none) file_explorer.cancelOp();
+                if (hitTestMarkdownPreviewHeader(xpos, ypos)) return;
                 if (markdown_preview_panel.g_kind == .image and markdown_preview_panel.g_load_status == .ready) {
                     g_markdown_preview_image_dragging = true;
                     g_markdown_preview_image_hover = true;
@@ -3171,11 +3323,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             if (tab.g_tab_close_pressed) |pressed_idx| {
                 tab.g_tab_close_pressed = null;
                 if (pressed_idx < tab.g_tab_count and hitTestSidebarTabCloseButton(xpos, ypos, pressed_idx)) {
-                    if (tab.g_tab_count <= 1) {
-                        AppWindow.g_should_close = true;
-                    } else {
-                        AppWindow.closeTab(pressed_idx);
-                    }
+                    requestCloseTabGesture(pressed_idx);
                 }
                 return;
             }
@@ -3492,6 +3640,13 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
         return;
     }
     if (!g_selecting and !overlays.scrollbar.g_scrollbar_dragging) {
+        if (hitTestMarkdownPreviewHeader(xpos, ypos) or hitTestAiCopilotCloseButton(xpos, ypos)) {
+            if (g_markdown_preview_image_hover) {
+                g_markdown_preview_image_hover = false;
+            }
+            platform_cursor.set(.arrow);
+            return;
+        }
         const over_sidebar_resize = hitTestSidebarResizeHandle(xpos, ypos);
         if (over_sidebar_resize) {
             platform_cursor.set(.size_we);

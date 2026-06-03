@@ -22,6 +22,7 @@ const weixin_types = @import("weixin/types.zig");
 const memory_debug = @import("memory_debug.zig");
 const agent_detector = @import("agent_detector.zig");
 const agent_history = @import("agent_history.zig");
+const close_confirm = @import("close_confirm.zig");
 const font_backend = @import("platform/font_backend.zig");
 const platform_display = @import("platform/display.zig");
 const platform_dirs = @import("platform/dirs.zig");
@@ -40,6 +41,7 @@ const keybind = @import("keybind.zig");
 const thread_message = @import("appwindow/thread_message.zig");
 const render_diagnostics = @import("render_diagnostics.zig");
 const ime_caret = @import("ime_caret.zig");
+const hit_test = @import("input/hit_test.zig");
 pub const ai_chat = @import("ai_chat.zig");
 const ai_history_cache = @import("ai_history_cache.zig");
 const ai_history_resume = @import("ai_history_resume.zig");
@@ -60,6 +62,7 @@ pub const post_process = @import("renderer/post_process.zig");
 pub const gpu = @import("renderer/gpu/gpu.zig");
 pub const split_layout = @import("appwindow/split_layout.zig");
 const flush_scheduler = @import("appwindow/flush_scheduler.zig");
+const resize_throttle = @import("appwindow/resize_throttle.zig");
 pub const fbo = @import("renderer/fbo.zig");
 pub const background_image = @import("renderer/background_image.zig");
 pub const file_explorer = @import("file_explorer.zig");
@@ -535,6 +538,28 @@ fn clearWithBackground(fb_w: c_int, fb_h: c_int) void {
     background_image.drawFullscreen(@floatFromInt(fb_w), @floatFromInt(fb_h));
 }
 
+/// Force the whole backbuffer opaque (alpha = 1) just before present.
+///
+/// We extend the DWM frame into the entire client area (`cyTopHeight = -1`, for
+/// the custom titlebar + window shadow), so DWM composites the window using the
+/// GL backbuffer's alpha channel. UI chrome drawn in the `.alpha` blend mode
+/// (caption-button icons, overlays) drives dst-alpha below 1 where it touches,
+/// which DWM then renders translucent: the top-right caption icons "ghost" when
+/// the window is dragged across monitors, and the surface darkens to black in
+/// borderless fullscreen (nothing is behind the window). Masking RGB and clearing
+/// alpha to 1 makes composition solid regardless of per-draw alpha, without
+/// disturbing the rendered colors. OpenGL backend only — the Metal backend
+/// composites opaquely on its own, and its clear would wipe the frame here.
+fn forceOpaqueBackbufferForPresent() void {
+    if (comptime gpu.active == .opengl) {
+        // glClear honors the scissor box; drop it so the whole surface is covered.
+        gpu.state.disableScissor();
+        gpu.state.setColorMask(false, false, false, true);
+        gpu.state.clear(0, 0, 0, 1.0);
+        gpu.state.setColorMask(true, true, true, true);
+    }
+}
+
 threadlocal var g_diag_last_fb_w: c_int = -1;
 threadlocal var g_diag_last_fb_h: c_int = -1;
 threadlocal var g_diag_last_client_w: i32 = -1;
@@ -742,6 +767,44 @@ fn renderAiCopilotPanel(fb_width: c_int, fb_height: c_int, titlebar_offset: f32)
     const chat_x: f32 = @floatFromInt(bounds.left);
     const chat_w: f32 = @floatFromInt(bounds.right - bounds.left);
     ai_chat_renderer.render(session, @floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset, chat_x, chat_w);
+    renderAiCopilotCloseButton(bounds, @floatFromInt(fb_height));
+}
+
+fn renderAiCopilotCloseButton(bounds: ai_sidebar.Bounds, window_height: f32) void {
+    const layout: hit_test.PanelHeaderLayout = .{
+        .visible = true,
+        .left = @floatFromInt(bounds.left),
+        .right = @floatFromInt(bounds.right),
+        .top = @floatFromInt(bounds.top),
+        .height = ai_chat_renderer.HEADER_H,
+    };
+    const close = hit_test.panelCloseButtonRect(layout) orelse return;
+    const close_x: f32 = @floatCast(close.left);
+    const close_w: f32 = @floatCast(close.width);
+    const close_h: f32 = @floatCast(close.height);
+    const close_y = window_height - @as(f32, @floatCast(close.top + close.height));
+
+    const bg = g_theme.background;
+    const fg = g_theme.foreground;
+    const hovered = blk: {
+        const win = g_window orelse break :blk false;
+        const mouse = window_backend.mousePosition(win);
+        if (mouse.x < 0 or mouse.y < 0) break :blk false;
+        break :blk hit_test.panelHeaderCloseButton(layout, @floatFromInt(mouse.x), @floatFromInt(mouse.y));
+    };
+    if (hovered) {
+        ui_pipeline.fillQuadAlpha(close_x + 6, close_y + @round((close_h - 20) / 2), 20, 20, mixColor(bg, fg, 0.14), 0.95);
+    }
+    titlebar.renderCloseIcon(close_x, close_y, close_w, close_h, if (hovered) fg else mixColor(bg, fg, 0.68));
+}
+
+fn mixColor(a: [3]f32, b: [3]f32, t: f32) [3]f32 {
+    const clamped = @max(0.0, @min(1.0, t));
+    return .{
+        a[0] + (b[0] - a[0]) * clamped,
+        a[1] + (b[1] - a[1]) * clamped,
+        a[2] + (b[2] - a[2]) * clamped,
+    };
 }
 
 pub fn activeTab() ?*TabState {
@@ -750,6 +813,41 @@ pub fn activeTab() ?*TabState {
 
 pub fn activeSurface() ?*Surface {
     return tab.activeSurface();
+}
+
+fn surfaceOnAltScreen(s: *const Surface) bool {
+    return s.terminal.screens.active_key == .alternate;
+}
+
+/// True if the focused surface is running a full-screen program (alt-screen).
+pub fn activeSurfaceHasRunningProgram() bool {
+    const s = activeSurface() orelse return false;
+    return surfaceOnAltScreen(s);
+}
+
+fn tabStateHasRunningProgram(t: *const TabState) bool {
+    if (t.kind != .terminal) return false;
+    var it = t.tree.iterator();
+    while (it.next()) |entry| {
+        if (surfaceOnAltScreen(entry.surface)) return true;
+    }
+    return false;
+}
+
+/// True if any surface in the given tab is running a full-screen program.
+pub fn tabHasRunningProgram(idx: usize) bool {
+    if (idx >= tab.g_tab_count) return false;
+    const t = tab.g_tabs[idx] orelse return false;
+    return tabStateHasRunningProgram(t);
+}
+
+/// True if any surface in any tab in the window is running a full-screen program.
+pub fn anyTabHasRunningProgram() bool {
+    for (0..tab.g_tab_count) |ti| {
+        const t = tab.g_tabs[ti] orelse continue;
+        if (tabStateHasRunningProgram(t)) return true;
+    }
+    return false;
 }
 
 pub fn activeAiChat() ?*ai_chat.Session {
@@ -794,13 +892,39 @@ pub fn aiHistoryMoveSelection(delta: isize) bool {
     return true;
 }
 
-pub fn aiHistoryCycleCategory(delta: isize) bool {
+/// ←/→ move keyboard focus between the Filters, Sessions, and Transcript panels.
+pub fn aiHistoryFocusMove(delta: isize) bool {
     const session = activeAiHistory() orelse return false;
-    session.cycleCategory(delta);
-    session.ensureSelectionVisible(aiHistoryListVisibleRowsForWindow());
+    session.mutex.lock();
+    session.focusMove(delta);
+    session.mutex.unlock();
     markUiDirty();
     return true;
 }
+
+/// ↑/↓ act within the focused panel: walk the combined CATEGORY+DATE filter
+/// list, change the selected session, or scroll the transcript preview.
+pub fn aiHistoryNav(delta: isize) bool {
+    const session = activeAiHistory() orelse return false;
+    session.mutex.lock();
+    switch (session.focus) {
+        .filters => {
+            session.moveFilterCursor(delta);
+            session.ensureFilterCursorVisible(aiHistoryDateDaySlotsForWindow());
+            session.ensureSelectionVisible(aiHistoryListVisibleRowsForWindow());
+        },
+        .sessions => {
+            session.moveSelection(delta);
+            session.ensureSelectionVisible(aiHistoryListVisibleRowsForWindow());
+        },
+        .transcript => session.scrollTranscriptBy(delta * AI_HISTORY_TRANSCRIPT_KEY_STEP),
+    }
+    session.mutex.unlock();
+    markUiDirty();
+    return true;
+}
+
+const AI_HISTORY_TRANSCRIPT_KEY_STEP: isize = 3;
 
 pub fn aiHistoryPreviewSelectedTranscript() bool {
     const session = activeAiHistory() orelse return false;
@@ -867,7 +991,7 @@ pub fn spawnResumeTerminal(target: ai_history_source.Target, meta: ai_history_ty
         return failAiHistoryResumePathUnavailable();
     };
 
-    var command_buf: [4096]u8 = undefined;
+    var command_buf: [8192]u8 = undefined;
     switch (target) {
         .local => {
             var native_checked_buf: [2048]u8 = undefined;
@@ -884,13 +1008,23 @@ pub fn spawnResumeTerminal(target: ai_history_source.Target, meta: ai_history_ty
             return false;
         },
         .wsl => {
-            const command = platform_pty_command.wslShellCommand(command_buf[0..], checked_cmd) orelse return failAiHistoryResumePathUnavailable();
+            var user_shell_buf: [4096]u8 = undefined;
+            const user_shell_cmd = ai_history_resume.posixUserShellCommand(checked_cmd, &user_shell_buf) catch |err| {
+                log.warn("failed to build AI History WSL user-shell resume command for {s}: {}", .{ meta.session_id, err });
+                return failAiHistoryResumePathUnavailable();
+            };
+            const command = platform_pty_command.wslShellCommand(command_buf[0..], user_shell_cmd) orelse return failAiHistoryResumePathUnavailable();
             if (spawnTabWithCommandUtf8(command)) return true;
             overlays.showStatusToast("AI History resume failed");
             return false;
         },
         .ssh => |ssh| {
-            return switch (overlays.aiHistoryConnectSshProfile(ssh.profile_name, checked_cmd)) {
+            var user_shell_buf: [4096]u8 = undefined;
+            const user_shell_cmd = ai_history_resume.posixUserShellCommand(checked_cmd, &user_shell_buf) catch |err| {
+                log.warn("failed to build AI History SSH user-shell resume command for {s}: {}", .{ meta.session_id, err });
+                return failAiHistoryResumePathUnavailable();
+            };
+            return switch (overlays.aiHistoryConnectSshProfile(ssh.profile_name, user_shell_cmd)) {
                 .connected => true,
                 .not_found => {
                     overlays.showStatusToast("AI History resume failed: SSH profile unavailable");
@@ -1147,6 +1281,17 @@ fn aiHistoryListVisibleRowsForWindow() usize {
     const win = g_window orelse return 1;
     const fb = window_backend.framebufferSize(win);
     return ai_history_renderer.listVisibleCapacity(@floatFromInt(fb.height), currentTitlebarHeight(), font.g_titlebar_cell_height);
+}
+
+/// Number of day rows (excluding the pinned "All dates") visible in the DATE
+/// navigator, used to keep the Filters cursor's day in view.
+fn aiHistoryDateDaySlotsForWindow() usize {
+    const win = g_window orelse return 0;
+    const fb = window_backend.framebufferSize(win);
+    const cell_h = font.g_titlebar_cell_height;
+    const lc = ai_history_renderer.leftColumnLayout(currentTitlebarHeight(), cell_h);
+    const cap = ai_history_renderer.dateVisibleCapacity(@floatFromInt(fb.height), lc.date_rows_top, cell_h);
+    return if (cap > 1) cap - 1 else 0;
 }
 
 fn localHomeForAiHistory(allocator: std.mem.Allocator) ![]u8 {
@@ -2003,6 +2148,7 @@ pub threadlocal var g_copy_on_select: bool = false;
 pub threadlocal var g_right_click_action: Config.RightClickAction = .copy;
 pub threadlocal var g_ssh_legacy_algorithms: bool = false;
 pub threadlocal var g_desktop_notifications: bool = true;
+pub threadlocal var g_confirm_close_running_program: bool = true;
 pub threadlocal var g_weixin_notify_forward: bool = false;
 threadlocal var g_notif_auth_requested: bool = false;
 
@@ -2039,7 +2185,22 @@ fn updateCursorBlinkForRenderer(rend: *Renderer) void {
 /// Performs a full render cycle: resize terminal → snapshot → rebuild → draw.
 /// This runs synchronously on the main thread (which owns the GL context)
 /// while the backend's modal drag loop is active.
+/// Registered as the platform `on_resize` callback. The platform's modal resize
+/// loop delivers resize events far faster than a full frame renders, so throttle
+/// the heavy paint to ~60Hz here (that loop blocks our main loop, so an
+/// un-throttled paint per event stutters the drag). One-shot resizes (DPI change,
+/// font reload) call `renderResizeFrame` directly so they always paint immediately.
+threadlocal var g_resize_throttle: resize_throttle.ResizeThrottle = .{};
+
 fn onPlatformResize(width: i32, height: i32) void {
+    if (width <= 0 or height <= 0) return;
+    const now = std.time.milliTimestamp();
+    if (!g_resize_throttle.shouldRender(now)) return;
+    g_resize_throttle.noteRendered(now);
+    renderResizeFrame(width, height);
+}
+
+fn renderResizeFrame(width: i32, height: i32) void {
     if (width <= 0 or height <= 0) return;
     if (g_allocator == null) return;
     const resize_perf = ui_perf.begin("appwindow.on_platform_resize");
@@ -2255,6 +2416,7 @@ fn onPlatformResize(width: i32, height: i32) void {
         "platform-resize swap fb={}x{} term={}x{} draw_calls={}",
         .{ fb_width, fb_height, term_cols, term_rows, gpu.gl_init.g_draw_call_count },
     );
+    forceOpaqueBackbufferForPresent();
     if (g_window) |w| window_backend.swapBuffers(w);
 }
 
@@ -2351,6 +2513,7 @@ fn applyReloadedConfig(allocator: std.mem.Allocator, cfg: *const Config) void {
     input.g_url_open_mode = cfg.@"url-open-mode";
     g_ssh_legacy_algorithms = cfg.@"ssh-legacy-algorithms";
     g_desktop_notifications = cfg.@"desktop-notifications";
+    g_confirm_close_running_program = cfg.@"confirm-close-running-program";
     g_weixin_notify_forward = cfg.@"weixin-notify-forward";
     tab.g_ssh_legacy_algorithms = cfg.@"ssh-legacy-algorithms";
     overlays.g_split_divider_color = cfg.@"split-divider-color";
@@ -2402,7 +2565,7 @@ fn applyReloadedConfig(allocator: std.mem.Allocator, cfg: *const Config) void {
                 const is_os_sized = window_backend.isFullscreen(w) or window_backend.isMaximized(w);
                 if (is_os_sized) {
                     const size = window_backend.clientSize(w);
-                    onPlatformResize(size.width, size.height);
+                    renderResizeFrame(size.width, size.height);
                 } else {
                     if (cfg.@"window-width" > 0) term_cols = cfg.@"window-width";
                     if (cfg.@"window-height" > 0) term_rows = cfg.@"window-height";
@@ -3813,7 +3976,7 @@ fn handleWindowDpiChanged(
             "dpi-change same-dpi render-refresh client={}x{} font_dpi={} cell={d:.2}x{d:.2}",
             .{ size.width, size.height, font.g_dpi, font.cell_width, font.cell_height },
         );
-        onPlatformResize(size.width, size.height);
+        renderResizeFrame(size.width, size.height);
         return;
     }
 
@@ -3827,7 +3990,7 @@ fn handleWindowDpiChanged(
             "dpi-change font-reloaded client={}x{} fb={}x{} font_dpi={} cell={d:.2}x{d:.2} term={}x{}",
             .{ size.width, size.height, fb_after.width, fb_after.height, font.g_dpi, font.cell_width, font.cell_height, term_cols, term_rows },
         );
-        onPlatformResize(size.width, size.height);
+        renderResizeFrame(size.width, size.height);
     } else {
         font.g_dpi = old_font_dpi;
         const size = window_backend.clientSize(win);
@@ -3836,7 +3999,7 @@ fn handleWindowDpiChanged(
             .{ new_dpi, old_font_dpi, font.cell_width, font.cell_height },
         );
         std.debug.print("DPI font reload failed, keeping previous font\n", .{});
-        onPlatformResize(size.width, size.height);
+        renderResizeFrame(size.width, size.height);
     }
 }
 
@@ -4736,7 +4899,10 @@ fn runMainLoop(self: *AppWindow) !void {
         }
         if (window_backend.closeRequested(win)) {
             window_backend.clearCloseRequested(win);
-            if (!window_backend.closeRequestPromptsConfirmation()) {
+            const running_program = anyTabHasRunningProgram();
+            const confirm_for_program = close_confirm.shouldConfirm(g_confirm_close_running_program, running_program);
+            const want_confirm = window_backend.closeRequestPromptsConfirmation() or confirm_for_program;
+            if (!want_confirm) {
                 // Backend tears the window down immediately with no in-app
                 // prompt; closing this window does not necessarily end the app
                 // session (the backend owns process lifecycle).
@@ -4744,7 +4910,8 @@ fn runMainLoop(self: *AppWindow) !void {
                 running = false;
                 continue;
             }
-            overlays.windowCloseConfirmOpen();
+            const variant: overlays.CloseConfirmVariant = if (confirm_for_program) .running_program else .window_generic;
+            overlays.closeConfirmOpen(.window, variant);
             g_force_rebuild = true;
             g_cells_valid = false;
         }
@@ -4997,6 +5164,7 @@ fn runMainLoop(self: *AppWindow) !void {
         renderImePreedit(win, fb_width, fb_height);
 
         logSwapDiagnosticsIfChanged(win, fb_width, fb_height);
+        forceOpaqueBackbufferForPresent();
         gpu.state.endFrame();
         window_backend.swapBuffers(win);
     }

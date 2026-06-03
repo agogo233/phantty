@@ -17,6 +17,7 @@ const SplitTree = @import("../split_tree.zig");
 const Config = @import("../config.zig");
 const themes_embed = @import("../themes.zig");
 const input_key = @import("../input/key.zig");
+const hit_test = @import("../input/hit_test.zig");
 const ssh_prompt = @import("../ssh_prompt.zig");
 const ssh_connection = @import("../ssh_connection.zig");
 const app_metadata = @import("../app_metadata.zig");
@@ -29,6 +30,7 @@ const platform_pty_command = @import("../platform/pty_command.zig");
 const update_check = @import("../update_check.zig");
 const keybind = @import("../keybind.zig");
 const overlay_keys = @import("overlay_keys.zig");
+const close_confirm = @import("../close_confirm.zig");
 const weixin_qr_panel = @import("../weixin/qr_panel.zig");
 const weixin_types = @import("../weixin/types.zig");
 const i18n = @import("../i18n.zig");
@@ -130,7 +132,10 @@ threadlocal var g_update_prompt_rect: ?DebugLineRect = null;
 
 threadlocal var g_close_shortcut_confirm_until_ms: i64 = 0;
 
+pub const CloseConfirmVariant = enum { running_program, window_generic };
 threadlocal var g_window_close_confirm_visible: bool = false;
+threadlocal var g_close_confirm_pending: close_confirm.PendingClose = .window;
+threadlocal var g_close_confirm_variant: CloseConfirmVariant = .window_generic;
 
 // "Restore default settings" confirmation, shown on top of the settings page.
 threadlocal var g_restore_defaults_confirm_visible: bool = false;
@@ -366,12 +371,23 @@ pub fn commandPaletteContainsPoint(xpos: f64, ypos: f64, window_width: f32, wind
         y >= layout.box_top_px and y <= layout.box_top_px + layout.box_h;
 }
 
-pub fn windowCloseConfirmOpen() void {
+pub fn closeConfirmOpen(action: close_confirm.PendingClose, variant: CloseConfirmVariant) void {
+    g_close_confirm_pending = action;
+    g_close_confirm_variant = variant;
     g_window_close_confirm_visible = true;
 }
 
 pub fn windowCloseConfirmClose() void {
     g_window_close_confirm_visible = false;
+}
+
+fn closeConfirmConfirm() void {
+    g_window_close_confirm_visible = false;
+    switch (g_close_confirm_pending) {
+        .window => AppWindow.g_should_close = true,
+        .focused_split => AppWindow.closeFocusedSplit(),
+        .tab => |idx| AppWindow.closeTab(idx),
+    }
 }
 
 pub fn windowCloseConfirmVisible() bool {
@@ -380,15 +396,18 @@ pub fn windowCloseConfirmVisible() bool {
 
 pub fn windowCloseConfirmHandleKey(ev: input_key.KeyEvent) void {
     if (!g_window_close_confirm_visible) return;
-    if (overlay_keys.windowCloseConfirmDismisses(ev)) windowCloseConfirmClose();
+    switch (close_confirm.keyOutcome(ev)) {
+        .confirm => closeConfirmConfirm(),
+        .cancel => windowCloseConfirmClose(),
+        .none => {},
+    }
 }
 
 pub fn windowCloseConfirmExecuteAt(xpos: f64, ypos: f64, window_width: f32, window_height: f32) bool {
     if (!g_window_close_confirm_visible) return false;
     const layout = windowCloseConfirmLayout(window_width, window_height);
     if (pointInTopRect(xpos, ypos, layout.close_x, layout.close_top_px, layout.close_w, layout.close_h)) {
-        g_window_close_confirm_visible = false;
-        AppWindow.g_should_close = true;
+        closeConfirmConfirm();
         return true;
     }
     if (pointInTopRect(xpos, ypos, layout.cancel_x, layout.cancel_top_px, layout.cancel_w, layout.cancel_h)) {
@@ -1283,8 +1302,18 @@ pub fn renderBrowserUrlBar(window_width: f32, window_height: f32, top_offset: f3
     ui_pipeline.fillQuadAlpha(panel_x, bar_y, panel_w, bar_h, panel_bg, 0.98);
 
     const margin = browser_panel.URL_BAR_MARGIN;
+    const close_layout: hit_test.PanelHeaderLayout = .{
+        .visible = true,
+        .left = @floatFromInt(url_bar.left),
+        .right = @floatFromInt(url_bar.right),
+        .top = @floatFromInt(url_bar.top),
+        .height = @floatFromInt(url_bar.bottom - url_bar.top),
+    };
+    const close = hit_test.panelCloseButtonRect(close_layout) orelse return;
+    const close_btn_w: f32 = @floatCast(close.width);
+    const close_x = @round(@as(f32, @floatCast(close.left)));
     const input_x = @round(@as(f32, @floatFromInt(url_bar.left)) + margin);
-    const input_w = @max(1.0, @as(f32, @floatFromInt(url_bar.right - url_bar.left)) - margin * 2);
+    const input_w = @max(1.0, close_x - input_x - margin);
     const input_h = @max(24.0, bar_h - margin * 2);
     const input_y = @round(bar_y + margin);
     renderRoundedQuadAlpha(input_x - 1, input_y - 1, input_w + 2, input_h + 2, 6, field_border, if (browser_panel.urlBarFocused()) 0.70 else 0.34);
@@ -1306,6 +1335,16 @@ pub fn renderBrowserUrlBar(window_width: f32, window_height: f32, top_offset: f3
         const cursor_x = @min(input_x + input_w - 10, @max(text_x, text_end + 1));
         ui_pipeline.fillQuadAlpha(cursor_x, input_y + 6, 1.5, @max(8.0, input_h - 12), accent, 0.90);
     }
+
+    const close_hovered = blk: {
+        const win = AppWindow.g_window orelse break :blk false;
+        if (win.mouse_x < 0 or win.mouse_y < 0) break :blk false;
+        break :blk hit_test.panelHeaderCloseButton(close_layout, @floatFromInt(win.mouse_x), @floatFromInt(win.mouse_y));
+    };
+    if (close_hovered) {
+        ui_pipeline.fillQuadAlpha(close_x + 6, bar_y + @round((bar_h - 20) / 2), 20, 20, mixColor(bg, fg, 0.14), 0.95);
+    }
+    titlebar.renderCloseIcon(close_x, bar_y, close_btn_w, bar_h, if (close_hovered) fg else mixColor(bg, fg, 0.68));
 
     ui_pipeline.fillQuadAlpha(panel_x, bar_y, panel_w, 1, mixColor(bg, fg, 0.18), 0.55);
 }
@@ -2393,7 +2432,7 @@ fn connectSshProfileReturningSurfaceWithCommand(idx: usize, remote_command: []co
     if (port.len > 0 and !isPortTokenSafe(port)) return null;
     if (!command_palette_model.isProxyJumpSafe(proxy_jump)) return null;
 
-    var command_buf: [4096]u8 = undefined;
+    var command_buf: [8192]u8 = undefined;
     const command = platform_pty_command.sshInteractiveCommand(command_buf[0..], .{
         .user = user,
         .host = ip,
@@ -4652,13 +4691,22 @@ pub fn renderWindowCloseConfirm(window_width: f32, window_height: f32) void {
 
     const text_x = icon_x + icon_size + 18;
     const text_right = layout.panel_x + layout.panel_w - pad;
-    renderTitlebarTextStrongLimited("Close WispTerm?", text_x, title_y, fg, text_right - text_x);
+    const title_text = switch (g_close_confirm_variant) {
+        .running_program => "A program is still running",
+        .window_generic => "Close WispTerm?",
+    };
+    const body_text = switch (g_close_confirm_variant) {
+        .running_program => "Closing now will end it.",
+        .window_generic => "Running panels in this window will be terminated.",
+    };
+    const hint_text = "Press Enter or Close to proceed, Esc to cancel.";
+    renderTitlebarTextStrongLimited(title_text, text_x, title_y, fg, text_right - text_x);
 
     const body_y = title_y - overlayTextHeight() - 16;
-    renderTitlebarTextLimited("Running panels in this window will be terminated.", text_x, body_y, body, text_right - text_x);
+    renderTitlebarTextLimited(body_text, text_x, body_y, body, text_right - text_x);
 
     const hint_y = body_y - overlayTextHeight() - 8;
-    renderTitlebarTextLimited("Press Esc or Cancel to keep working.", text_x, hint_y, muted, text_right - text_x);
+    renderTitlebarTextLimited(hint_text, text_x, hint_y, muted, text_right - text_x);
 
     const footer_y = close_y + layout.close_h + 20;
     ui_pipeline.fillQuadAlpha(layout.panel_x + 5, footer_y, layout.panel_w - 5, 1, quiet_border, 0.46);
