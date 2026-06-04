@@ -37,6 +37,7 @@ pub const CommandAction = enum {
     check_for_updates,
     download_update,
     open_latest_release,
+    show_whats_new,
     update_skills,
 };
 
@@ -49,9 +50,9 @@ pub const CommandEntry = struct {
 
 pub const command_entries = [_]CommandEntry{
     .{ .title = "New Session", .detail = platform_pty_command.session_launcher_detail, .shortcut = "", .action = .new_tab },
-    .{ .title = "New Agent", .detail = "Open a new Agent tab with the default AI config", .shortcut = "", .action = .new_agent },
+    .{ .title = "New Copilot", .detail = "Open a new Copilot tab with the default AI config", .shortcut = "", .action = .new_agent },
     .{ .title = "Manage AI Profiles", .detail = "Create, edit, or delete saved AI profiles", .shortcut = "", .action = .manage_ai_profiles },
-    .{ .title = "Select Agent History", .detail = "Open the command-center agent history picker", .shortcut = "", .action = .select_agent_history },
+    .{ .title = "Select Copilot History", .detail = "Open the command-center Copilot history picker", .shortcut = "", .action = .select_agent_history },
     .{ .title = "Split Right", .detail = "Create a panel to the right", .shortcut = "", .action = .split_right },
     .{ .title = "Split Down", .detail = "Create a panel below", .shortcut = "", .action = .split_down },
     .{ .title = "Split Left", .detail = "Create a panel to the left", .shortcut = "", .action = .split_left },
@@ -76,12 +77,13 @@ pub const command_entries = [_]CommandEntry{
     .{ .title = "WeChat: Stop", .detail = "Stop polling and keep the saved WeChat binding", .shortcut = "", .action = .stop_wechat },
     .{ .title = "WeChat: Status", .detail = "Show the WeChat direct connection state", .shortcut = "", .action = .wechat_status },
     .{ .title = "WeChat: Unbind", .detail = "Clear the stored WeChat direct binding", .shortcut = "", .action = .unbind_wechat },
-    .{ .title = "Export AI Chat Markdown", .detail = "Save the active AI Chat transcript as Markdown", .shortcut = "", .action = .export_ai_chat_markdown },
-    .{ .title = "Export AI Chat Markdown Clean", .detail = "Save user prompts and the final AI result without thinking", .shortcut = "", .action = .export_ai_chat_markdown_clean },
+    .{ .title = "Export Copilot Markdown", .detail = "Save the active Copilot transcript as Markdown", .shortcut = "", .action = .export_ai_chat_markdown },
+    .{ .title = "Export Copilot Markdown Clean", .detail = "Save user prompts and the final AI result without thinking", .shortcut = "", .action = .export_ai_chat_markdown_clean },
     .{ .title = "Version", .detail = "Show WispTerm version", .shortcut = app_metadata.version, .action = .show_version },
     .{ .title = "Check for Updates", .detail = "Check GitHub Releases for a newer WispTerm version", .shortcut = "", .action = .check_for_updates },
     .{ .title = "Download Update", .detail = "Download the latest update to your Downloads folder", .shortcut = "", .action = .download_update },
     .{ .title = "Open Latest Release", .detail = "Open the latest WispTerm GitHub Release", .shortcut = "", .action = .open_latest_release },
+    .{ .title = "What's New", .detail = "Show what changed in this version of WispTerm", .shortcut = app_metadata.version, .action = .show_whats_new },
     .{ .title = "Update Skills", .detail = "Download the latest skills from GitHub", .shortcut = "", .action = .update_skills },
 };
 
@@ -252,16 +254,16 @@ pub fn resolveNewAgentLaunch(has_profiles: bool) NewAgentLaunchAction {
     return if (has_profiles) .connect_default_profile_as_agent else .open_form;
 }
 
-test "command center includes New Agent action" {
-    try std.testing.expectEqual(CommandAction.new_agent, findCommandAction("New Agent"));
+test "command center includes New Copilot action" {
+    try std.testing.expectEqual(CommandAction.new_agent, findCommandAction("New Copilot"));
 }
 
 test "command center includes Manage AI Profiles action" {
     try std.testing.expectEqual(CommandAction.manage_ai_profiles, findCommandAction("Manage AI Profiles"));
 }
 
-test "command center includes Select Agent History action" {
-    try std.testing.expectEqual(CommandAction.select_agent_history, findCommandAction("Select Agent History"));
+test "command center includes Select Copilot History action" {
+    try std.testing.expectEqual(CommandAction.select_agent_history, findCommandAction("Select Copilot History"));
 }
 
 test "command center includes update check actions" {
@@ -270,9 +272,13 @@ test "command center includes update check actions" {
     try std.testing.expectEqual(CommandAction.open_latest_release, findCommandAction("Open Latest Release"));
 }
 
-test "command center includes AI Markdown export actions" {
-    try std.testing.expectEqual(CommandAction.export_ai_chat_markdown, findCommandAction("Export AI Chat Markdown"));
-    try std.testing.expectEqual(CommandAction.export_ai_chat_markdown_clean, findCommandAction("Export AI Chat Markdown Clean"));
+test "findCommandAction resolves What's New" {
+    try std.testing.expectEqual(CommandAction.show_whats_new, findCommandAction("What's New"));
+}
+
+test "command center includes Copilot Markdown export actions" {
+    try std.testing.expectEqual(CommandAction.export_ai_chat_markdown, findCommandAction("Export Copilot Markdown"));
+    try std.testing.expectEqual(CommandAction.export_ai_chat_markdown_clean, findCommandAction("Export Copilot Markdown Clean"));
 }
 
 test "command center includes WeChat direct actions" {

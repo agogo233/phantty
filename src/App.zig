@@ -25,6 +25,8 @@ const platform_open_url = @import("platform/open_url.zig");
 const update_check = @import("update_check.zig");
 const update_install = @import("update_install.zig");
 const skill_update = @import("skill_update.zig");
+const whats_new_gate = @import("whats_new_gate.zig");
+const platform_window_state = @import("platform/window_state.zig");
 
 const App = @This();
 
@@ -100,12 +102,14 @@ ai_agent_enabled: bool,
 ai_agent_permission: ai_chat.AgentPermission,
 ai_agent_command_timeout_ms: u32,
 ai_agent_output_limit: u32,
+ai_agent_working_dir: []const u8,
 
 // Session persistence
 restore_tabs_on_startup: bool,
 
 // Update check state
 auto_update_check: bool,
+whats_new_on_update: bool,
 update_mutex: std.Thread.Mutex,
 update_result: update_check.CheckResult,
 update_latest_version_buf: [32]u8,
@@ -187,6 +191,8 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !App {
     errdefer if (remote_client_ptr) |client| client.destroy();
     const background_image = try dupeOptStr(allocator, cfg.@"background-image");
     errdefer freeOptStr(allocator, background_image);
+    const ai_agent_working_dir = try dupeStr(allocator, cfg.@"ai-agent-working-dir");
+    errdefer allocator.free(ai_agent_working_dir);
 
     var app = App{
         .allocator = allocator,
@@ -236,8 +242,10 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !App {
         .ai_agent_permission = cfg.@"ai-agent-permission",
         .ai_agent_command_timeout_ms = cfg.@"ai-agent-command-timeout-ms",
         .ai_agent_output_limit = cfg.@"ai-agent-output-limit",
+        .ai_agent_working_dir = ai_agent_working_dir,
         .restore_tabs_on_startup = cfg.@"restore-tabs-on-startup",
         .auto_update_check = cfg.@"auto-update-check",
+        .whats_new_on_update = cfg.@"whats-new-on-update",
         .update_mutex = .{},
         .update_result = .{ .state = .idle },
         .update_latest_version_buf = undefined,
@@ -403,14 +411,31 @@ pub fn updateConfig(self: *App, cfg: *const Config) void {
     self.ai_agent_permission = cfg.@"ai-agent-permission";
     self.ai_agent_command_timeout_ms = cfg.@"ai-agent-command-timeout-ms";
     self.ai_agent_output_limit = cfg.@"ai-agent-output-limit";
+    self.replaceStr(&self.ai_agent_working_dir, cfg.@"ai-agent-working-dir");
     self.restore_tabs_on_startup = cfg.@"restore-tabs-on-startup";
     self.auto_update_check = cfg.@"auto-update-check";
+    self.whats_new_on_update = cfg.@"whats-new-on-update";
     self.shell_cmd_len = resolveShellCommandLine(&self.shell_cmd_buf, cfg.shell);
 }
 
 // ============================================================================
 // Update checks
 // ============================================================================
+
+/// Decide whether to auto-show the "What's New" modal on launch, and record the
+/// current build as last-seen unconditionally (so the popup shows at most once
+/// per upgrade, and toggling the option off never resurfaces a stale popup).
+/// Returns true when the caller should open the modal.
+pub fn shouldShowWhatsNewOnStartup(self: *App, allocator: std.mem.Allocator) bool {
+    const current = app_metadata.version;
+    var seen_buf: [32]u8 = undefined;
+    const last_seen = platform_window_state.lastSeenVersion(allocator, &seen_buf);
+    const notes_present = app_metadata.release_notes.len > 0;
+    const show = self.whats_new_on_update and
+        whats_new_gate.whatsNewDecision(last_seen, current, notes_present) == .show;
+    platform_window_state.recordSeenVersion(allocator, current);
+    return show;
+}
 
 pub fn maybeStartStartupUpdateCheck(self: *App) void {
     var should_start = false;
@@ -1024,6 +1049,7 @@ pub fn deinit(self: *App) void {
     self.allocator.free(self.font_family);
     freeOptStr(self.allocator, self.font_family_cjk);
     freeOptStr(self.allocator, self.font_family_fallback);
+    self.allocator.free(self.ai_agent_working_dir);
     freeOptStr(self.allocator, self.shader_path);
     freeOptStr(self.allocator, self.title);
     freeOptStr(self.allocator, self.remote_server_url);

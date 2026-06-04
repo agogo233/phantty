@@ -15,6 +15,7 @@ const ToolClosedTab = types.ToolClosedTab;
 const SshProfileSaveArgs = types.SshProfileSaveArgs;
 const SavedSshProfile = types.SavedSshProfile;
 const AgentSettings = types.AgentSettings;
+const AgentPermission = types.AgentPermission;
 const agent_detector = @import("agent_detector.zig");
 const skill_registry = @import("skill_registry.zig");
 const wispterm_docs = @import("wispterm_docs.zig");
@@ -231,15 +232,19 @@ fn weixinSendAttachmentTool(
         return ctx.allocator.dupe(u8, "No active Weixin reply context; cannot send attachment.");
     };
     // Sending an attachment reads the file off disk and uploads it to a remote
-    // user, so a protected path here is an exfiltration risk. Force approval for
-    // a denied path even in full-permission mode (deny list always wins).
+    // user, so a protected path here is an exfiltration risk. In auto mode,
+    // protected paths still require approval; full mode intentionally bypasses
+    // this guard.
     if (ctx.settings.access_rules) |rules| {
         if (ai_agent_access.isPathDenied(ctx.allocator, rules, path, null)) {
-            const bl_reason = allocBlacklistReason(ctx.allocator, path);
-            defer if (bl_reason) |r| ctx.allocator.free(r);
-            const reason = bl_reason orelse "Sends a protected file — confirm to allow";
-            if (!ctx.requestApproval("weixin_send_attachment", path, reason)) {
-                return deniedResult(ctx.allocator, path, "operator rejected sending a protected file");
+            const gate = AccessGate{ .dangerous = false, .blacklisted = true, .force = true, .skip = false, .matched = path };
+            if (approvalRequiredForGate(ctx.settings.permission, gate)) {
+                const bl_reason = allocBlacklistReason(ctx.allocator, path);
+                defer if (bl_reason) |r| ctx.allocator.free(r);
+                const reason = bl_reason orelse "Sends a protected file — confirm to allow";
+                if (!ctx.requestApproval("weixin_send_attachment", path, reason)) {
+                    return deniedResult(ctx.allocator, path, "operator rejected sending a protected file");
+                }
             }
         }
     }
@@ -447,8 +452,8 @@ const AccessGate = struct {
 };
 
 /// Combine the destructive-command check with the private file-access guard.
-/// `force` => must prompt even in full mode; `skip` => may run without a prompt
-/// even in confirm mode.
+/// `force` => guarded auto mode must prompt; `skip` => ask mode may run without
+/// a prompt.
 fn accessGate(ctx: *const ToolContext, command: []const u8, cwd: ?[]const u8) AccessGate {
     const dangerous = isDangerousCommand(command);
     const result = if (ctx.settings.access_rules) |rules|
@@ -456,12 +461,26 @@ fn accessGate(ctx: *const ToolContext, command: []const u8, cwd: ?[]const u8) Ac
     else
         ai_agent_access.EvalResult{};
     const blacklisted = result.decision == .blacklisted;
+    const home = if (ctx.settings.access_rules) |rules| rules.home else "";
+    const confined = blk: {
+        const wd = ctx.settings.working_dir orelse break :blk false;
+        const ec = cwd orelse break :blk false;
+        break :blk ai_agent_access.workdirConfined(ctx.allocator, command, wd, ec, home);
+    };
     return .{
         .dangerous = dangerous,
         .blacklisted = blacklisted,
         .force = dangerous or blacklisted,
-        .skip = result.decision == .whitelisted_safe and !dangerous,
+        .skip = (result.decision == .whitelisted_safe or confined) and !dangerous and !blacklisted,
         .matched = result.matched,
+    };
+}
+
+fn approvalRequiredForGate(permission: AgentPermission, gate: AccessGate) bool {
+    return switch (permission) {
+        .confirm => !gate.skip,
+        .auto => gate.force,
+        .full => false,
     };
 }
 
@@ -473,8 +492,9 @@ fn allocBlacklistReason(allocator: std.mem.Allocator, matched: []const u8) ?[]u8
 
 fn localCommandExecTool(ctx: *const ToolContext, command: []const u8, cwd: ?[]const u8, timeout_ms: u32) ![]u8 {
     if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
-    const gate = accessGate(ctx, command, cwd);
-    if (gate.force or (ctx.settings.permission != .full and !gate.skip)) {
+    const effective_cwd = cwd orelse ctx.settings.working_dir;
+    const gate = accessGate(ctx, command, effective_cwd);
+    if (approvalRequiredForGate(ctx.settings.permission, gate)) {
         const bl_reason = if (gate.blacklisted) allocBlacklistReason(ctx.allocator, gate.matched) else null;
         defer if (bl_reason) |r| ctx.allocator.free(r);
         const reason = bl_reason orelse if (gate.dangerous) DANGEROUS_COMMAND_APPROVAL_REASON else platform_process.localCommandApprovalLabel();
@@ -482,7 +502,7 @@ fn localCommandExecTool(ctx: *const ToolContext, command: []const u8, cwd: ?[]co
             return deniedResult(ctx.allocator, command, platform_process.localCommandDeniedReason());
         }
     }
-    const result = runShellCommand(ctx.allocator, command, cwd, ctx.settings.output_limit, timeout_ms, ctx) catch |err| {
+    const result = runShellCommand(ctx.allocator, command, effective_cwd, ctx.settings.output_limit, timeout_ms, ctx) catch |err| {
         return std.fmt.allocPrint(ctx.allocator, "{s} failed: {}", .{ platform_process.localCommandFailureLabel(), err });
     };
     defer ctx.allocator.free(result.stdout);
@@ -878,7 +898,7 @@ fn terminalReplExecTool(ctx: *ToolContext, surface_id: []const u8, repl_name: []
     if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
     const control = controlKeyByte(code);
     const gate = accessGate(ctx, code, null);
-    if (gate.force or (ctx.settings.permission != .full and !gate.skip)) {
+    if (approvalRequiredForGate(ctx.settings.permission, gate)) {
         var reason_buf: [96]u8 = undefined;
         const bl_reason = if (gate.blacklisted) allocBlacklistReason(ctx.allocator, gate.matched) else null;
         defer if (bl_reason) |r| ctx.allocator.free(r);
@@ -1177,7 +1197,7 @@ fn hasPendingAgentCommand(snapshot: []const u8) bool {
 fn unixSessionExecTool(ctx: *ToolContext, kind: UnixSessionKind, surface_id: []const u8, command: []const u8, timeout_ms: u32) ![]u8 {
     if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
     const gate = accessGate(ctx, command, null);
-    if (gate.force or (ctx.settings.permission != .full and !gate.skip)) {
+    if (approvalRequiredForGate(ctx.settings.permission, gate)) {
         var reason_buf: [64]u8 = undefined;
         const bl_reason = if (gate.blacklisted) allocBlacklistReason(ctx.allocator, gate.matched) else null;
         defer if (bl_reason) |r| ctx.allocator.free(r);
@@ -1305,7 +1325,7 @@ fn sshProfileSaveTool(ctx: *ToolContext, args: SshProfileSaveArgs) ![]u8 {
 
     const approval_text = try sshProfileSaveApprovalText(ctx.allocator, args);
     defer ctx.allocator.free(approval_text);
-    if (ctx.settings.permission != .full) {
+    if (ctx.settings.permission == .confirm) {
         if (!ctx.requestApproval("ssh_profile_save", approval_text, "Save SSH server profile")) {
             return deniedResult(ctx.allocator, approval_text, "operator rejected saved SSH profile update");
         }
@@ -1337,7 +1357,7 @@ fn sshProfileSaveTool(ctx: *ToolContext, args: SshProfileSaveArgs) ![]u8 {
 
 fn sshProfileConnectTool(ctx: *ToolContext, profile_name: []const u8) ![]u8 {
     if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
-    if (ctx.settings.permission != .full) {
+    if (ctx.settings.permission == .confirm) {
         if (!ctx.requestApproval("ssh_profile_connect", profile_name, "Open saved SSH server in a new tab")) {
             return deniedResult(ctx.allocator, profile_name, "operator rejected saved SSH profile connection");
         }
@@ -1380,7 +1400,7 @@ fn tabNewTool(ctx: *ToolContext, kind: []const u8, command: ?[]const u8) ![]u8 {
 
     const trimmed_kind = std.mem.trim(u8, kind, " \t\r\n");
     const command_for_approval = command orelse trimmed_kind;
-    if (ctx.settings.permission != .full) {
+    if (ctx.settings.permission == .confirm) {
         if (!ctx.requestApproval("tab_new", command_for_approval, "Open a new local terminal tab")) {
             return deniedResult(ctx.allocator, command_for_approval, "operator rejected new tab creation");
         }
@@ -1428,7 +1448,7 @@ fn tabCloseTool(ctx: *ToolContext, tab_index: ?usize, surface_id: ?[]const u8, t
     else
         "active terminal tab";
 
-    if (ctx.settings.permission != .full) {
+    if (ctx.settings.permission == .confirm) {
         if (!ctx.requestApproval("tab_close", selector, "Close a terminal tab")) {
             return deniedResult(ctx.allocator, selector, "operator rejected tab close");
         }
@@ -1631,9 +1651,9 @@ fn truncateOwned(allocator: std.mem.Allocator, settings: AgentSettings, text: []
 
 pub const DANGEROUS_COMMAND_APPROVAL_REASON = "Destructive command (delete/rename/format) - confirm to run";
 
-/// Whether a command is destructive enough to always require operator approval,
-/// even under full-permission mode: deletes, renames/moves, disk formatting,
-/// and a few other irreversible operations.
+/// Whether a command is destructive enough to require operator approval in
+/// auto mode: deletes, renames/moves, disk formatting, and a few other
+/// irreversible operations.
 pub fn isDangerousCommand(command: []const u8) bool {
     // Distinctive multi-token / punctuated patterns: a plain substring scan is
     // safe here (these cannot collide with ordinary words).
@@ -2527,7 +2547,7 @@ test "accessGate forces approval for denied paths and skips safe allowed reads" 
         .cancelled = fakeCancelled,
     };
 
-    // Denied path → force approval even in full mode.
+    // Denied path → force approval in auto mode.
     const denied = accessGate(&ctx, "cat ~/.ssh/id_rsa", null);
     try std.testing.expect(denied.force);
     try std.testing.expect(denied.blacklisted);
@@ -2542,6 +2562,38 @@ test "accessGate forces approval for denied paths and skips safe allowed reads" 
     const neutral = accessGate(&ctx, "cat /work/other.txt", null);
     try std.testing.expect(!neutral.force);
     try std.testing.expect(!neutral.skip);
+}
+
+test "permission modes map ask auto and full approval policy" {
+    const a = std.testing.allocator;
+    var rules = try ai_agent_access.parseRules(a, "allow /work/ok\n", "/home/u");
+    defer rules.deinit();
+
+    var session_dummy: u8 = 0;
+    var ctx = ToolContext{
+        .allocator = a,
+        .ctx = &session_dummy,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .settings = .{ .permission = .auto, .access_rules = &rules },
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+
+    const denied = accessGate(&ctx, "cat ~/.ssh/id_rsa", null);
+    try std.testing.expect(approvalRequiredForGate(.auto, denied));
+    try std.testing.expect(!approvalRequiredForGate(.full, denied));
+
+    const dangerous = accessGate(&ctx, "rm /work/ok/readme.md", null);
+    try std.testing.expect(approvalRequiredForGate(.auto, dangerous));
+    try std.testing.expect(!approvalRequiredForGate(.full, dangerous));
+
+    const neutral = accessGate(&ctx, "cat /work/other.txt", null);
+    try std.testing.expect(approvalRequiredForGate(.confirm, neutral));
+    try std.testing.expect(!approvalRequiredForGate(.auto, neutral));
+
+    const allowed_read = accessGate(&ctx, "cat /work/ok/readme.md", null);
+    try std.testing.expect(!approvalRequiredForGate(.confirm, allowed_read));
 }
 
 test "accessGate with no rules degrades to dangerous-only behavior" {
@@ -2600,4 +2652,59 @@ test "Claude Code REPL input settles off the live surface snapshot, not the work
     // It returned the settled live screen, not the stale pre-input snapshot.
     try std.testing.expect(std.mem.indexOf(u8, result, "563894910") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "thinking") == null);
+}
+
+test "accessGate: working-dir sandbox skips confined non-dangerous, still forces dangerous/deny" {
+    const a = std.testing.allocator;
+    var rules = try ai_agent_access.parseRules(a, "", "/home/u");
+    defer rules.deinit();
+    var dummy: u8 = 0;
+    const ctx = types.ToolContext{
+        .allocator = a,
+        .ctx = &dummy,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .settings = .{ .working_dir = "/home/u/proj", .access_rules = &rules },
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    // confined write -> auto-approve
+    const g1 = accessGate(&ctx, "curl http://x -o out.bin", "/home/u/proj");
+    try std.testing.expect(g1.skip);
+    try std.testing.expect(!g1.force);
+    try std.testing.expect(!approvalRequiredForGate(.confirm, g1)); // confirm now auto-runs inside the dir
+    try std.testing.expect(!approvalRequiredForGate(.auto, g1));
+    // confined dangerous -> still forced
+    const g2 = accessGate(&ctx, "rm -rf build", "/home/u/proj");
+    try std.testing.expect(!g2.skip);
+    try std.testing.expect(g2.force);
+    try std.testing.expect(approvalRequiredForGate(.confirm, g2));
+    try std.testing.expect(approvalRequiredForGate(.auto, g2));
+    // escaping write -> not confined, normal gating (no skip, no force)
+    const g3 = accessGate(&ctx, "cp /etc/hosts .", "/home/u/proj");
+    try std.testing.expect(!g3.skip);
+    try std.testing.expect(!g3.force);
+    // deny-listed read inside cwd -> forced regardless of sandbox
+    const g4 = accessGate(&ctx, "cat /home/u/.ssh/id_rsa", "/home/u/proj");
+    try std.testing.expect(g4.force);
+    try std.testing.expect(!g4.skip);
+}
+
+test "accessGate: no working dir leaves behavior unchanged" {
+    const a = std.testing.allocator;
+    var rules = try ai_agent_access.parseRules(a, "", "/home/u");
+    defer rules.deinit();
+    var dummy: u8 = 0;
+    const ctx = types.ToolContext{
+        .allocator = a,
+        .ctx = &dummy,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .settings = .{ .access_rules = &rules }, // working_dir = null
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    const g = accessGate(&ctx, "curl http://x -o out.bin", null);
+    try std.testing.expect(!g.skip);
+    try std.testing.expect(!g.force);
 }

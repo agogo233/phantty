@@ -293,7 +293,7 @@ theme: ?[]const u8 = null,
 /// that is running a full-screen (non-shell) program.
 @"confirm-close-running-program": bool = true,
 
-/// Agent command permission mode: confirm (deny until approved UI exists) or full.
+/// Agent command permission mode: ask, auto, or full.
 @"ai-agent-permission": ai_agent_config.AgentPermission = .confirm,
 
 /// Timeout budget for agent shell/SSH commands.
@@ -301,6 +301,9 @@ theme: ?[]const u8 = null,
 
 /// Maximum bytes returned from a single tool result.
 @"ai-agent-output-limit": u32 = 16 * 1024,
+
+/// Default working directory for the AI agent's local commands (empty = unset).
+@"ai-agent-working-dir": []const u8 = "",
 
 /// The shell to run in the terminal. Platform aliases are resolved by
 /// platform/pty_command.zig; any other value is treated as a raw command path.
@@ -386,6 +389,10 @@ language: i18n.LanguageSetting = .auto,
 
 /// Check GitHub Releases for a newer WispTerm version after startup.
 @"auto-update-check": bool = true,
+
+/// Show the "What's New" changelog once after upgrading to a newer build.
+/// Disables only the automatic popup; the command-center entry always works.
+@"whats-new-on-update": bool = true,
 
 /// Load an additional config file. Can be repeated. Relative paths are
 /// resolved relative to the file containing the directive. Prefix with
@@ -810,6 +817,8 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
             log.warn("invalid ai-agent-output-limit: {s}", .{value});
             return;
         };
+    } else if (std.mem.eql(u8, key, "ai-agent-working-dir")) {
+        self.@"ai-agent-working-dir" = self.dupeString(allocator, value) orelse return;
     } else if (std.mem.eql(u8, key, "shell")) {
         self.shell = self.dupeString(allocator, value) orelse return;
     } else if (std.mem.eql(u8, key, "ai-default-profile")) {
@@ -914,6 +923,14 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
             self.@"auto-update-check" = false;
         } else {
             log.warn("invalid auto-update-check: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "whats-new-on-update")) {
+        if (std.mem.eql(u8, value, "true")) {
+            self.@"whats-new-on-update" = true;
+        } else if (std.mem.eql(u8, value, "false")) {
+            self.@"whats-new-on-update" = false;
+        } else {
+            log.warn("invalid whats-new-on-update: {s}", .{value});
         }
     } else if (std.mem.eql(u8, key, "config-file")) {
         self.loadConfigFileDirective(allocator, value, base_dir);
@@ -1257,9 +1274,10 @@ pub fn writeHelp(writer: anytype) !void {
         \\  --language <lang>            UI language: auto | en | zh-CN (default: auto)
         \\  --ssh-legacy-algorithms <bool> Enable legacy ssh-rsa/ssh-dss OpenSSH options
         \\  --ai-agent-enabled <bool>    Enable AI Chat agent tools by default
-        \\  --ai-agent-permission <mode> Agent tool permission: confirm | full
+        \\  --ai-agent-permission <mode> Agent tool permission: ask | auto | full
         \\  --ai-agent-command-timeout-ms <ms> Agent command timeout budget
         \\  --ai-agent-output-limit <bytes> Max bytes returned by each tool
+        \\  --ai-agent-working-dir <path> Default working directory for agent local commands
         \\  --auto-update-check <bool>  Check GitHub Releases after startup
         \\  --config-file <path>         Include another config file (prefix ? for optional)
         \\  --keybind <binding>          Configure a shortcut, e.g. global:ctrl+backquote=toggle_quake
@@ -1620,9 +1638,10 @@ const default_config_template =
     \\
     \\# AI Chat agent tools (disabled by default)
     \\# ai-agent-enabled = false
-    \\# ai-agent-permission = confirm   # confirm | full
+    \\# ai-agent-permission = ask       # ask | auto | full
     \\# ai-agent-command-timeout-ms = 60000
     \\# ai-agent-output-limit = 16384
+    \\# ai-agent-working-dir =          # default dir for downloads/clones (empty = unset)
     \\
     \\# Updates
     \\# auto-update-check = true
@@ -1936,6 +1955,10 @@ test "config: ai agent options parse" {
     try std.testing.expectEqual(ai_agent_config.AgentPermission.confirm, cfg.@"ai-agent-permission");
 
     cfg.applyKeyValue(allocator, "ai-agent-enabled", "true", ".");
+    cfg.applyKeyValue(allocator, "ai-agent-permission", "ask", ".");
+    try std.testing.expectEqual(ai_agent_config.AgentPermission.confirm, cfg.@"ai-agent-permission");
+    cfg.applyKeyValue(allocator, "ai-agent-permission", "auto", ".");
+    try std.testing.expectEqual(ai_agent_config.AgentPermission.auto, cfg.@"ai-agent-permission");
     cfg.applyKeyValue(allocator, "ai-agent-permission", "full", ".");
     cfg.applyKeyValue(allocator, "ai-agent-command-timeout-ms", "120000", ".");
     cfg.applyKeyValue(allocator, "ai-agent-output-limit", "4096", ".");
@@ -2031,4 +2054,12 @@ test "config: confirm-close-running-program defaults true and parses false" {
     try std.testing.expect(cfg.@"confirm-close-running-program");
     cfg.applyKeyValue(allocator, "confirm-close-running-program", "false", ".");
     try std.testing.expect(!cfg.@"confirm-close-running-program");
+}
+
+test "config: ai-agent-working-dir parses from a config line" {
+    const allocator = std.testing.allocator;
+    var cfg: Config = .{};
+    defer cfg.deinit(allocator); // dupeString tracks the value in _owned_strings
+    cfg.applyKeyValue(allocator, "ai-agent-working-dir", "/home/u/proj", ".");
+    try std.testing.expectEqualStrings("/home/u/proj", cfg.@"ai-agent-working-dir");
 }

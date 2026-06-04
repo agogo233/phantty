@@ -121,6 +121,10 @@ const UPDATE_STATUS_DURATION_MS: i64 = 2500;
 const SSH_CWD_HELP_URL = "https://github.com/xuzhougeng/wispterm#ssh-current-directory-for-downloads-and-uploads";
 const update_prompt_model = @import("overlays/update_prompt_model.zig");
 const UpdatePromptAction = update_prompt_model.UpdatePromptAction;
+const md = @import("../markdown_text.zig");
+const whats_new_model = @import("overlays/whats_new_model.zig");
+threadlocal var g_whats_new_visible: bool = false;
+threadlocal var g_whats_new_scroll: i64 = 0;
 threadlocal var g_update_prompt_until_ms: i64 = 0;
 threadlocal var g_update_prompt_buf: [128]u8 = undefined;
 threadlocal var g_update_prompt_len: usize = 0;
@@ -562,6 +566,7 @@ fn executeCommand(action: CommandAction) void {
             }
         },
         .open_latest_release => openLatestRelease(),
+        .show_whats_new => showWhatsNew(),
         .update_skills => {
             if (AppWindow.g_app) |app| {
                 showStatusToast(i18n.s().toast_updating_skills);
@@ -3109,13 +3114,24 @@ fn defaultAiProfileIndex() usize {
     return command_palette_model.resolveDefaultIndex(names[0..g_ai_profile_count], aiDefaultProfileName());
 }
 
-/// Name of the profile after the current default, wrapping around. Empty when
-/// no profiles exist.
-fn nextDefaultAiProfileName() []const u8 {
+/// Name of the profile `delta` positions from the current default, wrapping in
+/// both directions (+1 for next, -1 for previous). Empty when no profiles exist.
+fn cycledDefaultAiProfileName(delta: i64) []const u8 {
     loadAiProfiles();
     if (g_ai_profile_count == 0) return "";
-    const next = (defaultAiProfileIndex() + 1) % g_ai_profile_count;
-    return aiProfileField(&g_ai_profiles[next], .name);
+    const idx = command_palette_model.cycleIndex(defaultAiProfileIndex(), g_ai_profile_count, delta);
+    return aiProfileField(&g_ai_profiles[idx], .name);
+}
+
+/// Persist the default AI profile `delta` positions from the current one
+/// (+1 next, -1 previous). No-op when no profiles exist.
+fn cycleDefaultAiProfile(delta: i64) void {
+    const allocator = AppWindow.g_allocator orelse return;
+    loadAiProfiles();
+    if (g_ai_profile_count == 0) return;
+    const next_name = cycledDefaultAiProfileName(delta);
+    Config.setConfigValue(allocator, "ai-default-profile", next_name) catch {};
+    invalidateAiDefaultName();
 }
 
 fn isHttpUrlish(value: []const u8) bool {
@@ -3246,7 +3262,7 @@ fn sessionTwoColumnWidth(left: []const u8, right: []const u8) f32 {
 }
 
 fn sessionLauncherTitle() []const u8 {
-    if (g_ai_history_source_visible) return "AI History";
+    if (g_ai_history_source_visible) return i18n.s().sl_sessions;
     if (g_ai_form_visible) {
         return i18n.s().sl_ai_agent;
     }
@@ -3263,7 +3279,7 @@ fn sessionLauncherTitle() []const u8 {
             .manage => i18n.s().sl_ssh_servers,
             .edit_select => i18n.s().sl_edit_ssh_server,
             .delete_select => i18n.s().sl_delete_ssh_server,
-            .ai_history_select => "AI History SSH Profile",
+            .ai_history_select => "Sessions SSH Profile",
         };
     }
     return i18n.s().sl_new_session;
@@ -3383,7 +3399,7 @@ fn sessionDesiredBoxWidth() f32 {
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_back, i18n.s().sl_v_manage));
             },
             .ai_history_select => {
-                desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_back, "AI History"));
+                desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_back, i18n.s().sl_sessions));
             },
         }
         return desired;
@@ -3405,7 +3421,7 @@ fn sessionDesiredBoxWidth() f32 {
         desired = @max(desired, sessionTwoColumnWidth("WSL", platform_pty_command.wslLauncherDetail()));
     }
     desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ai_agent, defaultAiModeLabel()));
-    desired = @max(desired, sessionTwoColumnWidth("AI History", "Browse AI agent history"));
+    desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_sessions, i18n.s().sl_sessions_detail));
     return desired;
 }
 
@@ -3698,7 +3714,7 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
                     renderSessionRow(layout, window_height, row, i18n.s().sl_back, i18n.s().sl_v_manage, g_ssh_list_selected == row);
                 },
                 .ai_history_select => {
-                    renderSessionRow(layout, window_height, row, i18n.s().sl_back, "AI History", g_ssh_list_selected == row);
+                    renderSessionRow(layout, window_height, row, i18n.s().sl_back, i18n.s().sl_sessions, g_ssh_list_selected == row);
                 },
             }
             return;
@@ -3714,7 +3730,7 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
             row += 1;
         }
         renderSessionRow(layout, window_height, command_center_state.SESSION_LAUNCHER_ROW_AI_AGENT, i18n.s().sl_ai_agent, defaultAiModeLabel(), g_session_launcher_selected == command_center_state.SESSION_LAUNCHER_ROW_AI_AGENT);
-        renderSessionRow(layout, window_height, command_center_state.SESSION_LAUNCHER_ROW_AI_HISTORY, "AI History", "Browse AI agent history", g_session_launcher_selected == command_center_state.SESSION_LAUNCHER_ROW_AI_HISTORY);
+        renderSessionRow(layout, window_height, command_center_state.SESSION_LAUNCHER_ROW_AI_HISTORY, i18n.s().sl_sessions, i18n.s().sl_sessions_detail, g_session_launcher_selected == command_center_state.SESSION_LAUNCHER_ROW_AI_HISTORY);
         return;
     }
 
@@ -3779,6 +3795,7 @@ const SettingsAction = enum {
     toggle_focus_follows_mouse,
     cycle_shell,
     cycle_default_ai_profile,
+    cycle_default_ai_profile_prev,
     toggle_weixin_direct,
     cycle_language,
     toggle_restore_tabs,
@@ -3950,14 +3967,8 @@ fn executeSettingsAction(action: SettingsAction) void {
         .toggle_cursor_blink => Config.setConfigValue(allocator, "cursor-style-blink", if (cfg.@"cursor-style-blink") "false" else "true") catch {},
         .toggle_focus_follows_mouse => Config.setConfigValue(allocator, "focus-follows-mouse", if (cfg.@"focus-follows-mouse") "false" else "true") catch {},
         .cycle_shell => Config.setConfigValue(allocator, "shell", platform_pty_command.nextConfigShell(cfg.shell)) catch {},
-        .cycle_default_ai_profile => {
-            loadAiProfiles();
-            if (g_ai_profile_count > 0) {
-                const next_name = nextDefaultAiProfileName();
-                Config.setConfigValue(allocator, "ai-default-profile", next_name) catch {};
-                invalidateAiDefaultName();
-            }
-        },
+        .cycle_default_ai_profile => cycleDefaultAiProfile(1),
+        .cycle_default_ai_profile_prev => cycleDefaultAiProfile(-1),
         .toggle_weixin_direct => Config.setConfigValue(allocator, "weixin-direct-enabled", if (cfg.@"weixin-direct-enabled") "false" else "true") catch {},
         .cycle_language => Config.setConfigValue(allocator, "language", nextLanguageSetting(cfg.language)) catch {},
         .toggle_restore_tabs => Config.setConfigValue(allocator, "restore-tabs-on-startup", if (cfg.@"restore-tabs-on-startup") "false" else "true") catch {},
@@ -3998,6 +4009,7 @@ fn runSettingsFocusLeft() void {
     switch (g_settings_focus) {
         0 => executeSettingsAction(.font_size_minus),
         SETTINGS_THEME_ROW => cycleThemePreset(-1),
+        SETTINGS_CONTROL_ROW_START + 4 => executeSettingsAction(.cycle_default_ai_profile_prev),
         else => {},
     }
 }
@@ -4064,12 +4076,6 @@ fn currentThemePresetLabel(cfg: *const Config) []const u8 {
     if (activeThemePresetIndex(cfg)) |idx| return SETTINGS_THEME_PRESETS[idx].label;
     if (cfg.theme) |theme_name| return theme_name;
     return SETTINGS_THEME_PRESETS[0].label;
-}
-
-fn currentThemePresetDetail(cfg: *const Config) []const u8 {
-    if (activeThemePresetIndex(cfg)) |idx| return SETTINGS_THEME_PRESETS[idx].detail;
-    if (cfg.theme != null) return "Custom theme";
-    return SETTINGS_THEME_PRESETS[0].detail;
 }
 
 fn cursorStyleText(style: Config.CursorStyle) []const u8 {
@@ -4187,16 +4193,16 @@ pub fn renderSettingsPage(window_width: f32, window_height: f32, top_offset: f32
 
     var font_buf: [24]u8 = undefined;
     const font_value = std.fmt.bufPrint(&font_buf, "-  {d}  +", .{cfg.@"font-size"}) catch "";
-    renderSettingsRow(layout, window_height, 0, i18n.s().settings_font_size, font_value, i18n.s().settings_hint_left_right, true, g_settings_focus == 0);
+    renderSettingsRow(layout, window_height, 0, i18n.s().settings_font_size, font_value, "", true, g_settings_focus == 0);
 
     var theme_buf: [96]u8 = undefined;
     const theme_value = std.fmt.bufPrint(&theme_buf, "< {s} >", .{currentThemePresetLabel(cfg)}) catch currentThemePresetLabel(cfg);
-    renderSettingsRow(layout, window_height, SETTINGS_THEME_ROW, i18n.s().settings_theme, theme_value, currentThemePresetDetail(cfg), true, g_settings_focus == SETTINGS_THEME_ROW);
+    renderSettingsRow(layout, window_height, SETTINGS_THEME_ROW, i18n.s().settings_theme, theme_value, "", true, g_settings_focus == SETTINGS_THEME_ROW);
 
-    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 0, i18n.s().settings_cursor_style, cursorStyleText(cfg.@"cursor-style"), i18n.s().settings_hint_enter_cycle, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 0);
-    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 1, i18n.s().settings_cursor_blink, boolText(cfg.@"cursor-style-blink"), i18n.s().settings_hint_enter_cycle, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 1);
-    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 2, i18n.s().settings_focus_follows_mouse, boolText(cfg.@"focus-follows-mouse"), i18n.s().settings_hint_enter_cycle, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 2);
-    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 3, i18n.s().settings_shell, cfg.shell, platform_pty_command.shellSettingChoicesHint(), true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 3);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 0, i18n.s().settings_cursor_style, cursorStyleText(cfg.@"cursor-style"), "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 0);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 1, i18n.s().settings_cursor_blink, boolText(cfg.@"cursor-style-blink"), "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 1);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 2, i18n.s().settings_focus_follows_mouse, boolText(cfg.@"focus-follows-mouse"), "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 2);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 3, i18n.s().settings_shell, cfg.shell, "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 3);
     loadAiProfiles();
     const ai_default_value = if (g_ai_profile_count > 0)
         aiProfileField(&g_ai_profiles[defaultAiProfileIndex()], .name)
@@ -4207,9 +4213,9 @@ pub fn renderSettingsPage(window_width: f32, window_height: f32, top_offset: f32
     else
         i18n.s().settings_hint_add_profiles;
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 4, i18n.s().settings_default_ai, ai_default_value, ai_default_hint, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 4);
-    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 5, i18n.s().settings_weixin_direct, boolText(cfg.@"weixin-direct-enabled"), i18n.s().settings_hint_enter_cycle, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 5);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 5, i18n.s().settings_weixin_direct, boolText(cfg.@"weixin-direct-enabled"), "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 5);
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 6, i18n.s().settings_language, languageSettingText(cfg.language), i18n.s().settings_hint_restart, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 6);
-    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 7, i18n.s().settings_restore_tabs, boolText(cfg.@"restore-tabs-on-startup"), i18n.s().settings_hint_enter_cycle, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 7);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 7, i18n.s().settings_restore_tabs, boolText(cfg.@"restore-tabs-on-startup"), "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 7);
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 8, i18n.s().settings_raw_config, i18n.s().settings_value_open, i18n.s().settings_hint_advanced_editor, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 8);
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 9, i18n.s().settings_restore_defaults, "Enter", "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 9);
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 10, i18n.s().settings_close, "Esc", "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 10);
@@ -4991,6 +4997,303 @@ pub fn renderTransferToast(window_width: f32, window_height: f32) void {
     const text_x = layout.x + pad_h;
     const y = layout.y + pad_v;
     renderTitlebarTextStrongLimited(text, text_x, y, accent, layout.w - pad_h * 2);
+}
+
+fn whatsNewNotes() []const u8 {
+    return app_metadata.release_notes;
+}
+
+pub fn showWhatsNew() void {
+    g_whats_new_scroll = 0;
+    g_whats_new_visible = true;
+}
+
+pub fn hideWhatsNew() void {
+    g_whats_new_visible = false;
+}
+
+pub fn whatsNewVisible() bool {
+    return g_whats_new_visible;
+}
+
+pub fn whatsNewHandleKey(ev: input_key.KeyEvent) void {
+    if (!g_whats_new_visible) return;
+    switch (ev.key) {
+        .escape, .enter => hideWhatsNew(),
+        .page_up => g_whats_new_scroll -= 10,
+        .page_down => g_whats_new_scroll += 10,
+        .arrow_up => g_whats_new_scroll -= 1,
+        .arrow_down => g_whats_new_scroll += 1,
+        .home => g_whats_new_scroll = 0,
+        .end => g_whats_new_scroll = std.math.maxInt(i32),
+        else => {},
+    }
+}
+
+pub fn whatsNewHandleScroll(delta_y: f64) void {
+    if (!g_whats_new_visible) return;
+    g_whats_new_scroll += if (delta_y > 0) @as(i64, -3) else 3;
+}
+
+fn openWhatsNewRelease() void {
+    const allocator = AppWindow.g_allocator orelse return;
+    var url_buf: [256]u8 = undefined;
+    const url = whats_new_model.releaseTagUrl(&url_buf, app_metadata.version);
+    _ = platform_open_url.open(allocator, .{ .url = url });
+}
+
+/// Returns true if the click was consumed by the modal (always true while open,
+/// so clicks never fall through to the terminal underneath).
+pub fn whatsNewExecuteAt(xpos: f64, ypos: f64, window_width: f32, window_height: f32) bool {
+    if (!g_whats_new_visible) return false;
+    const layout = whatsNewLayout(window_width, window_height);
+    const px: f32 = @floatCast(xpos);
+    const py: f32 = @floatCast(ypos);
+    switch (whats_new_model.buttonActionAt(layout, px, py)) {
+        .view_on_github => {
+            openWhatsNewRelease();
+            hideWhatsNew();
+        },
+        .close => hideWhatsNew(),
+        .none => {
+            // A click outside the panel dismisses; inside is ignored (so users can
+            // click/select within the modal without closing it).
+            if (!layout.panel.contains(px, py)) hideWhatsNew();
+        },
+    }
+    return true;
+}
+
+fn whatsNewTrimV(v: []const u8) []const u8 {
+    return std.mem.trimLeft(u8, v, "vV");
+}
+
+fn whatsNewLineHeight() f32 {
+    return @round(@max(@as(f32, 24), font.g_titlebar_cell_height + 6));
+}
+
+const WHATS_NEW_VIEW_LABEL = "View on GitHub";
+const WHATS_NEW_OK_LABEL = "OK";
+
+fn whatsNewButtonMetrics() whats_new_model.ButtonMetrics {
+    return .{
+        .view_w = @round(measureTitlebarText(WHATS_NEW_VIEW_LABEL) + 44),
+        .close_w = @round(measureTitlebarText(WHATS_NEW_OK_LABEL) + 42),
+    };
+}
+
+fn whatsNewLayout(window_width: f32, window_height: f32) whats_new_model.Layout {
+    return whats_new_model.computeLayoutWithButtons(window_width, window_height, whatsNewLineHeight(), whatsNewButtonMetrics());
+}
+
+fn topRectY(window_height: f32, rect: whats_new_model.Rect) f32 {
+    return window_height - rect.y - rect.h;
+}
+
+fn drawWhatsNewButton(rect: whats_new_model.Rect, label: []const u8, window_height: f32, border: [3]f32, fill: [3]f32, text: [3]f32, strong: bool) void {
+    const y_bu = window_height - rect.y - rect.h;
+    renderRoundedQuadAlpha(rect.x - 1, y_bu - 1, rect.w + 2, rect.h + 2, 8, border, 0.64);
+    renderRoundedQuadAlpha(rect.x, y_bu, rect.w, rect.h, 7, fill, 0.96);
+    const tw = measureTitlebarText(label);
+    const tx = if (tw <= rect.w - 18) rect.x + (rect.w - tw) / 2 else rect.x + 12;
+    const ty = rowTextY(y_bu, rect.h);
+    if (strong) {
+        renderTitlebarTextStrongLimited(label, tx, ty, text, rect.x + rect.w - tx - 12);
+    } else {
+        renderTitlebarTextLimited(label, tx, ty, text, rect.x + rect.w - tx - 12);
+    }
+}
+
+const WhatsNewRows = struct {
+    row_index: usize = 0,
+    drawn: usize = 0,
+    scroll: usize = 0,
+};
+
+fn renderWhatsNewWrappedLine(
+    layout: whats_new_model.Layout,
+    window_height: f32,
+    text: []const u8,
+    x: f32,
+    color: [3]f32,
+    strong: bool,
+    wrap_cols: usize,
+    line_h: f32,
+    rows_state: *WhatsNewRows,
+) bool {
+    const rows = whats_new_model.lineRows(text.len, wrap_cols);
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        defer rows_state.row_index += 1;
+        if (rows_state.row_index < rows_state.scroll) continue;
+        if (rows_state.drawn >= layout.visible_rows) return false;
+
+        const start = r * wrap_cols;
+        const end = @min(text.len, start + wrap_cols);
+        const slice = if (start < text.len) text[start..end] else "";
+        const top = layout.content.y + @as(f32, @floatFromInt(rows_state.drawn)) * line_h;
+        const row_y = window_height - top - line_h;
+        const text_y = rowTextY(row_y, line_h);
+        if (slice.len > 0) {
+            const max_w = layout.content.x + layout.content.w - x;
+            if (strong) {
+                renderTitlebarTextStrongLimited(slice, x, text_y, color, max_w);
+            } else {
+                renderTitlebarTextLimited(slice, x, text_y, color, max_w);
+            }
+        }
+        rows_state.drawn += 1;
+    }
+    return true;
+}
+
+fn whatsNewHighlightsRows(highlights: whats_new_model.Highlights, wrap_cols: usize) usize {
+    if (highlights.len == 0) return 0;
+    var total: usize = whats_new_model.lineRows("Highlights".len, wrap_cols);
+    var i: usize = 0;
+    while (i < highlights.len) : (i += 1) {
+        total += whats_new_model.lineRows(highlights.items[i].len + 2, wrap_cols);
+    }
+    return total + 1; // spacer after highlights
+}
+
+fn renderWhatsNewHighlights(
+    layout: whats_new_model.Layout,
+    window_height: f32,
+    highlights: whats_new_model.Highlights,
+    wrap_cols: usize,
+    line_h: f32,
+    rows_state: *WhatsNewRows,
+    heading_color: [3]f32,
+    accent: [3]f32,
+    body: [3]f32,
+) bool {
+    if (highlights.len == 0) return true;
+    if (!renderWhatsNewWrappedLine(layout, window_height, "Highlights", layout.content.x, heading_color, true, wrap_cols, line_h, rows_state)) return false;
+
+    var i: usize = 0;
+    while (i < highlights.len) : (i += 1) {
+        var line_buf: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "* {s}", .{highlights.items[i]}) catch highlights.items[i];
+        if (!renderWhatsNewWrappedLine(layout, window_height, line, layout.content.x + 16, mixColor(body, accent, 0.08), false, wrap_cols, line_h, rows_state)) return false;
+    }
+    return renderWhatsNewWrappedLine(layout, window_height, "", layout.content.x, body, false, wrap_cols, line_h, rows_state);
+}
+
+fn renderWhatsNewBody(
+    layout: whats_new_model.Layout,
+    window_height: f32,
+    notes: []const u8,
+    wrap_cols: usize,
+    line_h: f32,
+    rows_state: *WhatsNewRows,
+    heading_color: [3]f32,
+    body: [3]f32,
+    muted: [3]f32,
+) void {
+    var in_code = false;
+    var it = std.mem.splitScalar(u8, notes, '\n');
+    while (it.next()) |raw| {
+        var cbuf: [1024]u8 = undefined;
+        const cleaned = md.cleanedLine(&cbuf, raw, in_code);
+        if (cleaned.style == .fence) {
+            in_code = !in_code;
+            if (!renderWhatsNewWrappedLine(layout, window_height, "", layout.content.x, muted, false, wrap_cols, line_h, rows_state)) return;
+            continue;
+        }
+
+        const x = switch (cleaned.style) {
+            .list, .quote, .code => layout.content.x + 16,
+            else => layout.content.x,
+        };
+        const color = switch (cleaned.style) {
+            .heading => heading_color,
+            .quote, .code => muted,
+            else => body,
+        };
+        const strong = cleaned.style == .heading;
+        if (!renderWhatsNewWrappedLine(layout, window_height, cleaned.text, x, color, strong, wrap_cols, line_h, rows_state)) return;
+    }
+}
+
+pub fn renderWhatsNew(window_width: f32, window_height: f32) void {
+    if (!g_whats_new_visible) return;
+
+    const line_h = whatsNewLineHeight();
+    const layout = whatsNewLayout(window_width, window_height);
+
+    const bg = AppWindow.g_theme.background;
+    const fg = AppWindow.g_theme.foreground;
+    const accent = AppWindow.g_theme.cursor_color;
+    const panel = mixColor(bg, fg, 0.05);
+    const panel_top = mixColor(bg, fg, 0.075);
+    const panel_footer = mixColor(bg, fg, 0.060);
+    const panel_border = mixColor(bg, fg, 0.24);
+    const quiet_border = mixColor(bg, fg, 0.15);
+    const muted = mixColor(bg, fg, 0.56);
+    const body = mixColor(bg, fg, 0.82);
+    const heading = mixColor(fg, accent, 0.12);
+
+    // Background scrim + panel (panel drawn in bottom-up space).
+    ui_pipeline.fillQuadAlpha(0, 0, window_width, window_height, .{ 0.0, 0.0, 0.0 }, 0.46);
+    const panel_y_bu = window_height - layout.panel.y - layout.panel.h;
+    renderRoundedQuadAlpha(layout.panel.x + 10, panel_y_bu - 10, layout.panel.w, layout.panel.h, 13, .{ 0.0, 0.0, 0.0 }, 0.26);
+    renderRoundedQuadAlpha(layout.panel.x - 1, panel_y_bu - 1, layout.panel.w + 2, layout.panel.h + 2, 13, panel_border, 0.42);
+    renderRoundedQuadAlpha(layout.panel.x, panel_y_bu, layout.panel.w, layout.panel.h, 12, panel, 0.99);
+    renderRoundedQuadAlpha(layout.panel.x, panel_y_bu, 5, layout.panel.h, 12, accent, 0.78);
+
+    const header_y = topRectY(window_height, layout.header);
+    const footer_y = topRectY(window_height, layout.footer);
+    renderRoundedQuadAlpha(layout.header.x + 1, header_y, layout.header.w - 2, layout.header.h - 1, 12, panel_top, 0.76);
+    ui_pipeline.fillQuadAlpha(layout.header.x + 5, header_y, layout.header.w - 5, 1, quiet_border, 0.45);
+    ui_pipeline.fillQuadAlpha(layout.footer.x + 5, footer_y + layout.footer.h - 1, layout.footer.w - 5, 1, quiet_border, 0.50);
+    ui_pipeline.fillQuadAlpha(layout.footer.x + 1, footer_y, layout.footer.w - 2, layout.footer.h, panel_footer, 0.45);
+
+    const notes = whatsNewNotes();
+    var title_buf: [96]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "WispTerm v{s}", .{whatsNewTrimV(app_metadata.version)}) catch "WispTerm";
+    const title_top = layout.header.y + 20;
+    const header_right = layout.title_close_btn.x - 16;
+    renderTitlebarTextStrongLimited(title, layout.content.x, textYFromTop(window_height, title_top), fg, header_right - layout.content.x);
+
+    const close_y = topRectY(window_height, layout.title_close_btn);
+    titlebar.renderCloseIcon(layout.title_close_btn.x, close_y, layout.title_close_btn.w, layout.title_close_btn.h, muted);
+
+    if (notes.len > 0) {
+        var summary_buf: [512]u8 = undefined;
+        const summary = whats_new_model.summaryText(&summary_buf, notes);
+        if (summary.len > 0) {
+            const subtitle_top = title_top + overlayTextHeight() + 12;
+            renderTitlebarTextLimited(summary, layout.content.x, textYFromTop(window_height, subtitle_top), body, header_right - layout.content.x);
+        }
+    }
+
+    if (notes.len == 0) {
+        renderTitlebarText("Release notes unavailable for this version.", layout.content.x, window_height - layout.content.y - line_h, muted);
+    } else {
+        const adv = @max(@as(f32, 1), titlebar.titlebarGlyphAdvance('M'));
+        var wrap_cols: usize = @intFromFloat(layout.content.w / adv);
+        if (wrap_cols < whats_new_model.MIN_WRAP_COLS) wrap_cols = whats_new_model.MIN_WRAP_COLS;
+
+        const body_notes = whats_new_model.bodyNotes(notes);
+        var summary_buf: [512]u8 = undefined;
+        const summary = whats_new_model.summaryText(&summary_buf, notes);
+        var highlights_buf: [512]u8 = undefined;
+        const highlights = whats_new_model.highlightClauses(&highlights_buf, summary);
+
+        const total = whatsNewHighlightsRows(highlights, wrap_cols) + whats_new_model.totalRows(body_notes, wrap_cols);
+        const scroll = whats_new_model.clampScroll(g_whats_new_scroll, total, layout.visible_rows);
+        g_whats_new_scroll = @intCast(scroll);
+
+        var rows_state: WhatsNewRows = .{ .scroll = scroll };
+        if (renderWhatsNewHighlights(layout, window_height, highlights, wrap_cols, line_h, &rows_state, heading, accent, body)) {
+            renderWhatsNewBody(layout, window_height, body_notes, wrap_cols, line_h, &rows_state, heading, body, muted);
+        }
+    }
+
+    // Footer buttons.
+    drawWhatsNewButton(layout.view_btn, WHATS_NEW_VIEW_LABEL, window_height, quiet_border, mixColor(bg, fg, 0.10), body, false);
+    drawWhatsNewButton(layout.close_btn, WHATS_NEW_OK_LABEL, window_height, mixColor(accent, fg, 0.22), mixColor(bg, accent, 0.24), mixColor(fg, accent, 0.16), true);
 }
 
 pub fn renderUpdatePrompt(window_width: f32, window_height: f32) void {

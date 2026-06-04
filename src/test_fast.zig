@@ -30,10 +30,12 @@ test {
     _ = @import("renderer/overlays/profile_codec.zig");
     _ = @import("renderer/overlays/transfer_toast_model.zig");
     _ = @import("renderer/overlays/update_prompt_model.zig");
+    _ = @import("renderer/overlays/whats_new_model.zig");
     _ = @import("close_confirm.zig");
     _ = @import("command_palette_model.zig");
     _ = @import("command_center_state.zig");
     _ = @import("platform/window_state_codec.zig");
+    _ = @import("whats_new_gate.zig");
     _ = @import("startup_tabs.zig");
     _ = @import("config.zig");
     _ = @import("ai_agent_config.zig");
@@ -48,6 +50,8 @@ test {
     _ = @import("ai_chat_composer_layout.zig");
     _ = @import("ai_chat_input_text.zig");
     _ = @import("ai_chat_composer.zig");
+    _ = @import("ai_loop_schedule.zig");
+    _ = @import("ai_skill_distill.zig");
     _ = @import("ai_history_types.zig");
     _ = @import("ai_history_provider_codex.zig");
     _ = @import("ai_history_provider_claude.zig");

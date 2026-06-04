@@ -18,12 +18,15 @@ const markdown_text = @import("markdown_text.zig");
 const ai_chat_protocol = @import("ai_chat_protocol.zig");
 const ai_chat_composer = @import("ai_chat_composer.zig");
 const ai_chat_skills = @import("ai_chat_skills.zig");
+const ai_skill_distill = @import("ai_skill_distill.zig");
 const ai_chat_types = @import("ai_chat_types.zig");
 const ai_chat_tools = @import("ai_chat_tools.zig");
 const ai_agent_access = @import("ai_agent_access.zig");
 const platform_dirs = @import("platform/dirs.zig");
 const ai_chat_markdown = @import("ai_chat_markdown.zig");
 const weixin_types = @import("weixin/types.zig");
+const ai_loop_store = @import("ai_loop_store.zig");
+const ai_loop_schedule = @import("ai_loop_schedule.zig");
 
 pub const AgentSettings = ai_chat_types.AgentSettings;
 pub const AgentPermission = ai_chat_types.AgentPermission;
@@ -64,6 +67,7 @@ pub fn parseVisionEnabled(value: []const u8) bool {
 const REMOTE_SNAPSHOT_MAX_BYTES: usize = 24 * 1024;
 const INPUT_PROMPT_MAX_BYTES: usize = 64 * 1024;
 const SYSTEM_PROMPT_MAX_BYTES: usize = 16 * 1024;
+const WORKING_DIR_MAX_BYTES: usize = 1024;
 /// 两次 ESC 间隔不超过此毫秒数时判定为"双击"，用于打开回溯选择器。
 const DOUBLE_ESC_WINDOW_MS: i64 = 400;
 
@@ -238,6 +242,8 @@ var g_agent_mutex: std.Thread.Mutex = .{};
 var g_agent_settings: AgentSettings = .{};
 var g_access_rules_storage: ?ai_agent_access.AccessRules = null;
 var g_access_rules: ?*const ai_agent_access.AccessRules = null;
+var g_default_working_dir_buf: [WORKING_DIR_MAX_BYTES]u8 = undefined;
+var g_default_working_dir_len: usize = 0;
 var g_session_id_counter = std.atomic.Value(u64).init(1);
 var g_skill_update_trigger: ?*const fn () void = null;
 var g_session_resume_trigger: ?*const fn () void = null;
@@ -290,6 +296,23 @@ pub fn loadAccessRules(allocator: std.mem.Allocator) void {
     g_access_rules = &g_access_rules_storage.?;
 }
 
+/// Set the persistent default working directory (from config). Empty clears it.
+/// Copies into a static buffer; oversized paths are truncated.
+pub fn setDefaultWorkingDir(path: []const u8) void {
+    g_agent_mutex.lock();
+    defer g_agent_mutex.unlock();
+    const n = @min(path.len, g_default_working_dir_buf.len);
+    @memcpy(g_default_working_dir_buf[0..n], path[0..n]);
+    g_default_working_dir_len = n;
+}
+
+fn defaultWorkingDir() ?[]const u8 {
+    g_agent_mutex.lock();
+    defer g_agent_mutex.unlock();
+    if (g_default_working_dir_len == 0) return null;
+    return g_default_working_dir_buf[0..g_default_working_dir_len];
+}
+
 fn resolveHomeDir(allocator: std.mem.Allocator) ?[]u8 {
     if (std.process.getEnvVarOwned(allocator, "HOME")) |v| {
         return v;
@@ -298,6 +321,16 @@ fn resolveHomeDir(allocator: std.mem.Allocator) ?[]u8 {
         return v;
     } else |_| {}
     return null;
+}
+
+fn expandTilde(allocator: std.mem.Allocator, path: []const u8, home: ?[]const u8) ![]u8 {
+    if (path.len >= 1 and path[0] == '~') {
+        if (home) |h| {
+            if (path.len == 1) return allocator.dupe(u8, h);
+            if (path[1] == '/' or path[1] == '\\') return std.fmt.allocPrint(allocator, "{s}{s}", .{ h, path[1..] });
+        }
+    }
+    return allocator.dupe(u8, path);
 }
 
 pub fn setToolHost(host: ?ToolHost) void {
@@ -309,6 +342,7 @@ pub fn currentAgentSettings() AgentSettings {
     defer g_agent_mutex.unlock();
     var s = g_agent_settings;
     s.access_rules = g_access_rules;
+    if (g_default_working_dir_len > 0) s.working_dir = g_default_working_dir_buf[0..g_default_working_dir_len];
     return s;
 }
 
@@ -354,15 +388,38 @@ fn slashCommandOutput(allocator: std.mem.Allocator, command: SlashCommand) ![]u8
         .rewind_picker => allocator.dupe(u8, "No previous user messages to rewind."),
         .resume_session => allocator.dupe(u8, "Opening saved conversation history..."),
         .permission => permissionStatusOutput(allocator),
+        .cwd => allocator.dupe(u8, "Working directory updated."),
         .export_markdown => allocator.dupe(u8, "Exporting the conversation as Markdown..."),
+        .distill => allocator.dupe(u8, "Use /distill [topic] to preview a reusable skill candidate."),
         .unknown => allocator.dupe(u8, "Unknown command. Use /commands to list commands."),
         .skills => ai_chat_skills.listSkillsForDisplay(allocator),
+        // .loop and .watch suppress output and emit their own messages via
+        // runLoopCommandLocked; this path is never reached.
+        .loop, .watch => allocator.dupe(u8, ""),
+    };
+}
+
+fn previewPrompt(p: []const u8) []const u8 {
+    return if (p.len > 48) p[0..48] else p;
+}
+
+fn loopErrorText(err: ai_loop_schedule.ParseError, kind: ai_loop_schedule.TaskKind) []const u8 {
+    return switch (err) {
+        error.MissingArgs => if (kind == .loop)
+            "Usage: /loop <interval> <count> <prompt>  e.g. /loop 30m 8 check ci"
+        else
+            "Usage: /watch <HH:MM | YYYY-MM-DD HH:MM> <prompt>",
+        error.BadInterval => "Bad interval. Use a number + s/m/h/d, e.g. 30m, 5h.",
+        error.BadCount => "Count must be a positive integer.",
+        error.BadTime => "Bad time. Use HH:MM or YYYY-MM-DD HH:MM (24h).",
+        error.PastTime => "That time is already in the past.",
+        error.EmptyPrompt => "Add the prompt text after the schedule.",
     };
 }
 
 fn permissionStatusOutput(allocator: std.mem.Allocator) ![]u8 {
     const current = currentAgentSettings().permission;
-    return std.fmt.allocPrint(allocator, "Agent permission is '{s}'. Use /permission confirm or /permission full to change it.", .{current.name()});
+    return std.fmt.allocPrint(allocator, "Agent permission is '{s}'. Use /permission ask, /permission auto, or /permission full to change it.", .{current.name()});
 }
 
 pub fn agentPermission() AgentPermission {
@@ -427,6 +484,10 @@ pub const Session = struct {
     request_thread: ?std.Thread = null,
     title_thread: ?std.Thread = null,
     pending_weixin_reply_context: ?WeixinReplyContext = null,
+    distill_candidate: ?ai_skill_distill.Candidate = null,
+    distill_suggestion_pending: bool = false,
+    distill_last_suggested_turn_count: usize = 0,
+    distill_inflight: bool = false,
     auto_title_attempted: bool = false,
     closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -448,6 +509,8 @@ pub const Session = struct {
     copilot: bool = false,
     bound_surface_id_buf: [16]u8 = undefined,
     bound_surface_id_len: usize = 0,
+    working_dir_buf: [WORKING_DIR_MAX_BYTES]u8 = undefined,
+    working_dir_len: usize = 0,
 
     pub const RequestState = struct {
         inflight: bool,
@@ -456,6 +519,17 @@ pub const Session = struct {
 
     pub fn reasoningEffort(self: *const Session) []const u8 {
         return self.reasoning_effort_buf[0..self.reasoning_effort_len];
+    }
+
+    /// Per-conversation working-dir override, or null when unset.
+    pub fn workingDirOverride(self: *const Session) ?[]const u8 {
+        if (self.working_dir_len == 0) return null;
+        return self.working_dir_buf[0..self.working_dir_len];
+    }
+
+    fn effectiveWorkingDirLocked(self: *Session) ?[]const u8 {
+        if (self.working_dir_len > 0) return self.working_dir_buf[0..self.working_dir_len];
+        return defaultWorkingDir();
     }
 
     pub fn apiProtocolName(self: *const Session) []const u8 {
@@ -688,6 +762,7 @@ pub const Session = struct {
         self.freeCustomCommandSuggestions();
         command_registry.freeCommandList(self.allocator, self.custom_commands);
         if (self.pending_weixin_reply_context) |*ctx| ctx.deinit(self.allocator);
+        if (self.distill_candidate) |*candidate| candidate.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -1060,6 +1135,27 @@ pub const Session = struct {
         if (text_start < data.len) self.appendInputText(data[text_start..]);
     }
 
+    /// Inject a scheduled prompt as if the user typed + submitted it. Returns
+    /// false (skipped, nothing sent) if a request is already inflight. Clears any
+    /// half-typed composer text first so the scheduled prompt is sent verbatim.
+    /// Caller must run this on the UI thread (mirrors applyRemoteInput).
+    pub fn submitScheduledPrompt(self: *Session, text: []const u8) bool {
+        self.mutex.lock();
+        if (self.request_inflight) {
+            self.mutex.unlock();
+            return false;
+        }
+        self.input_len = 0;
+        self.input_cursor = 0;
+        self.input_scroll_row = 0;
+        self.input_scroll_follow_cursor = true;
+        self.input_select_all = false;
+        self.mutex.unlock();
+        self.appendInputText(text);
+        self.submit();
+        return true;
+    }
+
     pub fn applyWeixinInput(self: *Session, data: []const u8, ctx: weixin_types.ReplyContext) void {
         self.mutex.lock();
         if (self.pending_weixin_reply_context) |*old| old.deinit(self.allocator);
@@ -1121,6 +1217,7 @@ pub const Session = struct {
             .end => self.moveInputCursorEnd(),
             .tab => _ = self.completeComposerSuggestion(.tab),
             .escape => {
+                if (self.dismissDistillSuggestion()) return;
                 const now = self.now_ms_override orelse std.time.milliTimestamp();
                 if (self.request_inflight) {
                     // 生成中：仅停止，不参与双击；停止后变空闲再双击才进选择器。
@@ -1146,6 +1243,7 @@ pub const Session = struct {
                 if (ev.shift) {
                     self.appendInputText("\n");
                 } else {
+                    if (self.acceptDistillSuggestion()) return;
                     if (!self.completeComposerSuggestion(.enter)) self.submit();
                 }
             },
@@ -1391,6 +1489,37 @@ pub const Session = struct {
         return allowed;
     }
 
+    fn canUseDistillSuggestionLocked(self: *Session) bool {
+        return self.distill_suggestion_pending and
+            self.input_len == 0 and
+            !self.input_select_all and
+            !self.transcript_select_all and
+            self.transcript_selection == null;
+    }
+
+    fn acceptDistillSuggestion(self: *Session) bool {
+        self.mutex.lock();
+        const ok = self.canUseDistillSuggestionLocked();
+        self.mutex.unlock();
+        if (!ok) return false;
+        self.startDistillRequest("");
+        return true;
+    }
+
+    fn dismissDistillSuggestion(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.canUseDistillSuggestionLocked()) return false;
+        self.distill_suggestion_pending = false;
+        self.last_esc_ms = 0;
+        self.appendLocalToolMessageLocked("Distill suggestion ignored.") catch {
+            self.setStatusLocked("Out of memory");
+            return true;
+        };
+        self.setStatusLocked("Ready");
+        return true;
+    }
+
     fn copyApprovalLocked(self: *Session, tool: []const u8, command: []const u8, reason: []const u8) void {
         self.approval_tool_len = @min(tool.len, self.approval_tool_buf.len);
         @memcpy(self.approval_tool_buf[0..self.approval_tool_len], tool[0..self.approval_tool_len]);
@@ -1398,6 +1527,34 @@ pub const Session = struct {
         @memcpy(self.approval_command_buf[0..self.approval_command_len], command[0..self.approval_command_len]);
         self.approval_reason_len = @min(reason.len, self.approval_reason_buf.len);
         @memcpy(self.approval_reason_buf[0..self.approval_reason_len], reason[0..self.approval_reason_len]);
+    }
+
+    fn appendLocalToolMessageLocked(self: *Session, text: []const u8) !void {
+        const content = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(content);
+        try self.messages.append(self.allocator, .{
+            .role = .tool,
+            .content = content,
+            .replay_to_model = false,
+            .persist_to_history = false,
+            .content_collapsed = false,
+            .content_auto_expand = false,
+        });
+        self.scroll_px = 1_000_000;
+    }
+
+    fn clearDistillCandidateLocked(self: *Session) void {
+        if (self.distill_candidate) |*candidate| candidate.deinit(self.allocator);
+        self.distill_candidate = null;
+    }
+
+    fn submitDistillCommand(self: *Session, arg: []const u8) void {
+        const parsed = ai_skill_distill.parseCommandArgs(arg);
+        switch (parsed.action) {
+            .start => self.startDistillRequest(parsed.topic),
+            .confirm => self.confirmDistillCandidate(),
+            .cancel => self.cancelDistillCandidate(),
+        }
     }
 
     pub fn submit(self: *Session) void {
@@ -1428,6 +1585,12 @@ pub const Session = struct {
 
         // 1) Built-in command (with optional argument), exact first-token match.
         if (ai_chat_composer.exactBuiltinCommand(first_tok)) |command| {
+            if (command == .distill) {
+                self.clearPendingWeixinReplyContextLocked();
+                self.mutex.unlock();
+                self.submitDistillCommand(arg);
+                return;
+            }
             const r = self.runBuiltinCommandLocked(command, arg);
             self.clearPendingWeixinReplyContextLocked();
             self.mutex.unlock();
@@ -1465,7 +1628,7 @@ pub const Session = struct {
         // otherwise (e.g. "/help me", "/usr/bin path", or a rebound template body): fall through.
 
         if (self.api_key_len == 0) {
-            self.setStatusLocked("Missing API key. Edit the AI Chat profile or set DEEPSEEK_API_KEY.");
+            self.setStatusLocked("Missing API key. Edit the Copilot profile or set DEEPSEEK_API_KEY.");
             self.clearPendingWeixinReplyContextLocked();
             self.mutex.unlock();
             return;
@@ -1605,6 +1768,57 @@ pub const Session = struct {
         if (skill_preload_appended) self.notifyHistoryChange(history_change);
     }
 
+    /// Handle `/cwd`. Assumes self.mutex is held. Appends its own tool message
+    /// (the caller suppresses the generic slash output).
+    fn applyCwdArgLocked(self: *Session, arg: []const u8) void {
+        switch (ai_chat_composer.parseCwdArg(arg)) {
+            .show => {
+                if (self.effectiveWorkingDirLocked()) |w| {
+                    const msg = std.fmt.allocPrint(self.allocator, "Working directory: {s}", .{w}) catch return;
+                    defer self.allocator.free(msg);
+                    self.appendLocalToolMessageLocked(msg) catch {};
+                } else {
+                    self.appendLocalToolMessageLocked("Working directory: (unset). Use /cwd <path> to set one.") catch {};
+                }
+            },
+            .reset => {
+                self.working_dir_len = 0;
+                self.appendLocalToolMessageLocked("Working directory override cleared; using the default.") catch {};
+            },
+            .set => |path| {
+                const home = resolveHomeDir(self.allocator);
+                defer if (home) |h| self.allocator.free(h);
+                const expanded = expandTilde(self.allocator, path, home) catch return;
+                defer self.allocator.free(expanded);
+                const abs = std.fs.cwd().realpathAlloc(self.allocator, expanded) catch {
+                    const m = std.fmt.allocPrint(self.allocator, "No such directory: {s}", .{path}) catch return;
+                    defer self.allocator.free(m);
+                    self.appendLocalToolMessageLocked(m) catch {};
+                    return;
+                };
+                defer self.allocator.free(abs);
+                var dir = std.fs.openDirAbsolute(abs, .{}) catch {
+                    const m = std.fmt.allocPrint(self.allocator, "Not a directory: {s}", .{path}) catch return;
+                    defer self.allocator.free(m);
+                    self.appendLocalToolMessageLocked(m) catch {};
+                    return;
+                };
+                dir.close();
+                if (abs.len > self.working_dir_buf.len) {
+                    self.appendLocalToolMessageLocked("Path too long for the working directory.") catch {};
+                    return;
+                }
+                @memcpy(self.working_dir_buf[0..abs.len], abs);
+                self.working_dir_len = abs.len;
+                const m = std.fmt.allocPrint(self.allocator, "Working directory set to {s} for this conversation.", .{abs}) catch return;
+                defer self.allocator.free(m);
+                self.appendLocalToolMessageLocked(m) catch {};
+            },
+        }
+        self.clearSubmittedInputLocked();
+        self.setStatusLocked("Ready");
+    }
+
     /// Runs a built-in slash command's side-effects and appends its output as a
     /// tool message. Assumes self.mutex is held. Returns the captured history
     /// change (non-null only for /clear) plus any action the caller must fire
@@ -1629,10 +1843,16 @@ pub const Session = struct {
                 }
             },
             .permission => applyPermissionArg(arg),
+            .cwd => {
+                self.applyCwdArgLocked(arg);
+                result.suppress_output = true;
+            },
             .resume_session => result.deferred = .resume_picker,
             .export_markdown => result.deferred = .{
                 .export_markdown = if (std.mem.eql(u8, std.mem.trim(u8, arg, " \t\r\n"), "full")) .full else .clean,
             },
+            .loop => self.runLoopCommandLocked(.loop, arg, &result),
+            .watch => self.runLoopCommandLocked(.watch, arg, &result),
             else => {},
         }
         if (result.suppress_output) return result;
@@ -1640,21 +1860,273 @@ pub const Session = struct {
             self.setStatusLocked("Could not run command");
             return result;
         };
-        self.messages.append(self.allocator, .{
-            .role = .tool,
-            .content = output,
-            .replay_to_model = false,
-            .persist_to_history = false,
-            .content_collapsed = false,
-            .content_auto_expand = false,
-        }) catch {
-            self.allocator.free(output);
+        defer self.allocator.free(output);
+        self.appendLocalToolMessageLocked(output) catch {
             self.setStatusLocked("Out of memory");
             return result;
         };
         self.clearSubmittedInputLocked();
         self.setStatusLocked("Ready");
         return result;
+    }
+
+    fn runLoopCommandLocked(self: *Session, kind: ai_loop_schedule.TaskKind, arg: []const u8, result: *BuiltinResult) void {
+        result.suppress_output = true;
+        const store = ai_loop_store.active() orelse {
+            self.emitLoopMessageLocked("Scheduler is not available.");
+            return;
+        };
+        const trimmed = std.mem.trim(u8, arg, " \t\r\n");
+        const now_ms = std.time.milliTimestamp();
+        const offset_s = @import("ai_history_time.zig").localOffsetSeconds();
+        const ctx = ai_loop_store.SessionCtx{
+            .session_id = self.sessionId(),
+            .model = self.model(),
+            .title = self.title(),
+        };
+
+        if (trimmed.len == 0) {
+            self.listLoopTasksLocked(store, kind);
+            return;
+        }
+        if (std.mem.startsWith(u8, trimmed, "stop")) {
+            const rest = std.mem.trim(u8, trimmed["stop".len..], " \t\r\n");
+            if (std.mem.eql(u8, rest, "all")) {
+                const n = store.stopAll(ctx.session_id, kind);
+                var buf: [64]u8 = undefined;
+                self.emitLoopMessageLocked(std.fmt.bufPrint(&buf, "Cancelled {d} task(s).", .{n}) catch "Cancelled tasks.");
+            } else {
+                const id = std.fmt.parseInt(u32, rest, 10) catch {
+                    self.emitLoopMessageLocked("Usage: stop <id> | stop all");
+                    return;
+                };
+                const ok = store.stop(ctx.session_id, id);
+                self.emitLoopMessageLocked(if (ok) "Task cancelled." else "No such task in this session.");
+            }
+            return;
+        }
+
+        const info = switch (kind) {
+            .loop => store.registerLoop(trimmed, ctx, now_ms, offset_s),
+            .watch => store.registerWatch(trimmed, ctx, now_ms, offset_s),
+        } catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.emitLoopMessageLocked("Out of memory.");
+                return;
+            },
+            else => |parse_err| {
+                self.emitLoopMessageLocked(loopErrorText(parse_err, kind));
+                return;
+            },
+        };
+        self.emitRegisterConfirmationLocked(info);
+    }
+
+    fn listLoopTasksLocked(self: *Session, store: *ai_loop_store.Store, kind: ai_loop_schedule.TaskKind) void {
+        const views = store.snapshotForSession(self.allocator, self.sessionId(), kind) catch {
+            self.emitLoopMessageLocked("Out of memory.");
+            return;
+        };
+        defer ai_loop_store.freeSnapshot(self.allocator, views);
+        if (views.len == 0) {
+            self.emitLoopMessageLocked(if (kind == .loop) "No active loop tasks." else "No active watch tasks.");
+            return;
+        }
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        const w = buf.writer(self.allocator);
+        for (views) |v| {
+            if (kind == .loop) {
+                const iv = ai_loop_schedule.formatInterval(v.interval_ms);
+                w.print("#{d}  every {d}{c}  remaining {d}  \u{2192} {s}\n", .{
+                    v.id, iv.value, iv.unit, v.remaining, previewPrompt(v.prompt),
+                }) catch return;
+            } else if (v.daily) {
+                w.print("#{d}  daily {d:0>2}:{d:0>2}  \u{2192} {s}\n", .{
+                    v.id, @divTrunc(v.tod_minutes, 60), @mod(v.tod_minutes, 60), previewPrompt(v.prompt),
+                }) catch return;
+            } else {
+                w.print("#{d}  once  \u{2192} {s}\n", .{ v.id, previewPrompt(v.prompt) }) catch return;
+            }
+        }
+        self.emitLoopMessageLocked(buf.items);
+    }
+
+    fn emitRegisterConfirmationLocked(self: *Session, info: ai_loop_store.RegisterInfo) void {
+        var buf: [160]u8 = undefined;
+        const msg = switch (info.kind) {
+            .loop => blk: {
+                const iv = ai_loop_schedule.formatInterval(info.interval_ms);
+                break :blk std.fmt.bufPrint(&buf, "Created loop task #{d}: every {d}{c}, {d} times.", .{
+                    info.id, iv.value, iv.unit, info.remaining,
+                }) catch "Created loop task.";
+            },
+            .watch => if (info.daily)
+                std.fmt.bufPrint(&buf, "Created watch task #{d} (daily).", .{info.id}) catch "Created watch task."
+            else
+                std.fmt.bufPrint(&buf, "Created watch task #{d} (one-shot).", .{info.id}) catch "Created watch task.",
+        };
+        self.emitLoopMessageLocked(msg);
+    }
+
+    fn emitLoopMessageLocked(self: *Session, text: []const u8) void {
+        self.appendLocalToolMessageLocked(text) catch {
+            self.setStatusLocked("Out of memory");
+            return;
+        };
+        self.clearSubmittedInputLocked();
+        self.setStatusLocked("Ready");
+    }
+
+    fn cancelDistillCandidate(self: *Session) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.clearDistillCandidateLocked();
+        self.distill_suggestion_pending = false;
+        self.clearSubmittedInputLocked();
+        self.appendLocalToolMessageLocked("Distill candidate discarded.") catch {
+            self.setStatusLocked("Out of memory");
+            return;
+        };
+        self.setStatusLocked("Ready");
+    }
+
+    fn confirmDistillCandidate(self: *Session) void {
+        var candidate: ?ai_skill_distill.Candidate = null;
+        self.mutex.lock();
+        if (self.distill_candidate) |existing| {
+            candidate = existing;
+            self.distill_candidate = null;
+            self.distill_suggestion_pending = false;
+            self.clearSubmittedInputLocked();
+        } else {
+            self.distill_suggestion_pending = false;
+            self.clearSubmittedInputLocked();
+            self.appendLocalToolMessageLocked("No distill candidate is waiting for confirmation.") catch {
+                self.setStatusLocked("Out of memory");
+                self.mutex.unlock();
+                return;
+            };
+            self.setStatusLocked("Ready");
+            self.mutex.unlock();
+            return;
+        }
+        self.mutex.unlock();
+
+        var moved = candidate.?;
+        defer moved.deinit(self.allocator);
+        var saved = ai_chat_skills.saveDistilledCandidate(self.allocator, moved) catch |err| {
+            const text = switch (err) {
+                error.SkillAlreadyExists => std.fmt.allocPrint(
+                    self.allocator,
+                    "A skill named ${s} already exists. Use /distill with a more specific topic or remove the old skill first.",
+                    .{moved.name},
+                ),
+                else => std.fmt.allocPrint(self.allocator, "Could not save distilled skill: {}.", .{err}),
+            } catch null;
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (text) |msg| {
+                defer self.allocator.free(msg);
+                self.appendLocalToolMessageLocked(msg) catch self.setStatusLocked("Out of memory");
+            } else {
+                self.setStatusLocked("Out of memory");
+            }
+            self.setStatusLocked("Ready");
+            return;
+        };
+        defer saved.deinit(self.allocator);
+
+        const text = std.fmt.allocPrint(
+            self.allocator,
+            "Distilled skill: ${s}\nSaved to: {s}",
+            .{ saved.skill_name, saved.skill_path },
+        ) catch null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (text) |msg| {
+            defer self.allocator.free(msg);
+            self.appendLocalToolMessageLocked(msg) catch self.setStatusLocked("Out of memory");
+        } else {
+            self.setStatusLocked("Out of memory");
+            return;
+        }
+        self.freeSkillSuggestions();
+        self.setStatusLocked("Ready");
+    }
+
+    fn startDistillRequest(self: *Session, topic: []const u8) void {
+        self.mutex.lock();
+        if (self.request_thread) |thread| {
+            if (self.request_inflight) {
+                self.distill_suggestion_pending = false;
+                self.clearSubmittedInputLocked();
+                self.appendLocalToolMessageLocked("Wait for the current AI request to finish before distilling.") catch {
+                    self.setStatusLocked("Out of memory");
+                    self.mutex.unlock();
+                    return;
+                };
+                self.setStatusLocked("Ready");
+                self.mutex.unlock();
+                return;
+            }
+            self.request_thread = null;
+            self.mutex.unlock();
+            thread.join();
+            self.mutex.lock();
+        }
+        if (self.api_key_len == 0) {
+            self.distill_suggestion_pending = false;
+            self.clearSubmittedInputLocked();
+            self.setStatusLocked("Missing API key. Edit the AI Chat profile or set DEEPSEEK_API_KEY.");
+            self.mutex.unlock();
+            return;
+        }
+
+        self.clearDistillCandidateLocked();
+        self.distill_suggestion_pending = false;
+        const request = self.buildDistillRequestLocked(topic) catch |err| {
+            self.clearSubmittedInputLocked();
+            const text = switch (err) {
+                error.NotEnoughContext => "Not enough reusable context to distill yet.",
+                else => "Could not prepare distill request.",
+            };
+            self.appendLocalToolMessageLocked(text) catch self.setStatusLocked("Out of memory");
+            self.setStatusLocked("Ready");
+            self.mutex.unlock();
+            return;
+        };
+
+        self.clearSubmittedInputLocked();
+        self.stop_requested.store(false, .release);
+        self.request_stopping = false;
+        self.request_inflight = true;
+        self.distill_inflight = true;
+        self.appendLocalToolMessageLocked("Distilling a reusable skill candidate.") catch {
+            request.deinit();
+            self.request_inflight = false;
+            self.distill_inflight = false;
+            self.setStatusLocked("Out of memory");
+            self.mutex.unlock();
+            return;
+        };
+        self.setStatusLocked("Distilling skill.");
+        self.mutex.unlock();
+
+        const thread = std.Thread.spawn(.{}, ai_chat_request.distillThreadMain, .{request}) catch {
+            request.deinit();
+            self.mutex.lock();
+            self.request_inflight = false;
+            self.distill_inflight = false;
+            self.appendLocalToolMessageLocked("Failed to start distill request thread.") catch self.setStatusLocked("Out of memory");
+            self.setStatusLocked("Ready");
+            self.mutex.unlock();
+            return;
+        };
+
+        self.mutex.lock();
+        self.request_thread = thread;
+        self.mutex.unlock();
     }
 
     /// Assumes self.mutex is held. Returns the captured history change for the
@@ -2102,7 +2574,7 @@ pub const Session = struct {
             .clean => try self.appendCleanMarkdownExportLocked(allocator, &out),
         }
 
-        if (out.items.len == 0) try out.appendSlice(allocator, "# WispTerm AI Chat\n\nNo messages yet.\n");
+        if (out.items.len == 0) try out.appendSlice(allocator, "# WispTerm Copilot\n\nNo messages yet.\n");
         return out.toOwnedSlice(allocator);
     }
 
@@ -2224,6 +2696,92 @@ pub const Session = struct {
         }
 
         return messages;
+    }
+
+    fn allocDistillTurnsLocked(self: *Session) ![]ai_skill_distill.DistillTurn {
+        const turns = try self.allocator.alloc(ai_skill_distill.DistillTurn, self.messages.items.len);
+        for (self.messages.items, 0..) |msg, idx| {
+            turns[idx] = .{
+                .role = switch (msg.role) {
+                    .user => .user,
+                    .assistant => .assistant,
+                    .tool => .tool,
+                },
+                .content = msg.content,
+                .replay_to_model = msg.replay_to_model,
+            };
+        }
+        return turns;
+    }
+
+    fn buildDistillRequestLocked(self: *Session, topic: []const u8) !*ChatRequest {
+        const turns = try self.allocDistillTurnsLocked();
+        defer self.allocator.free(turns);
+
+        const prompt = try ai_skill_distill.buildDistillUserPrompt(self.allocator, topic, turns);
+        defer self.allocator.free(prompt);
+
+        const messages = try self.allocator.alloc(RequestMessage, 1);
+        var message_initialized = false;
+        errdefer {
+            if (message_initialized) messages[0].deinit(self.allocator);
+            self.allocator.free(messages);
+        }
+        messages[0] = try ai_chat_request.requestMessageWithClonedFields(self.allocator, .user, prompt, null, null, null, null);
+        message_initialized = true;
+
+        const base_url = try self.allocator.dupe(u8, self.baseUrl());
+        errdefer self.allocator.free(base_url);
+        const api_key = try self.allocator.dupe(u8, self.apiKey());
+        errdefer self.allocator.free(api_key);
+        const model_name = try self.allocator.dupe(u8, self.model());
+        errdefer self.allocator.free(model_name);
+        const system_prompt = try self.allocator.dupe(u8, ai_skill_distill.distiller_system_prompt);
+        errdefer self.allocator.free(system_prompt);
+        const reasoning_effort = try self.allocator.dupe(u8, self.reasoningEffort());
+        errdefer self.allocator.free(reasoning_effort);
+
+        const req = try self.allocator.create(ChatRequest);
+        errdefer self.allocator.destroy(req);
+        req.* = .{
+            .allocator = self.allocator,
+            .session = self,
+            .base_url = base_url,
+            .api_key = api_key,
+            .model = model_name,
+            .protocol = self.protocol,
+            .system_prompt = system_prompt,
+            .messages = messages,
+            .thinking_enabled = self.thinking_enabled,
+            .reasoning_effort = reasoning_effort,
+            .stream = false,
+            .max_tokens = self.max_tokens,
+            .agent_enabled = false,
+            .copilot = false,
+            .tool_host = null,
+            .tool_snapshot = null,
+            .weixin_reply_context = null,
+            .started_ms = std.time.milliTimestamp(),
+        };
+        message_initialized = false;
+        return req;
+    }
+
+    fn maybeAppendDistillSuggestionLocked(self: *Session) void {
+        const turns = self.allocDistillTurnsLocked() catch return;
+        defer self.allocator.free(turns);
+        const should = ai_skill_distill.shouldSuggest(.{
+            .turns = turns,
+            .pending_candidate = self.distill_candidate != null,
+            .suggestion_pending = self.distill_suggestion_pending,
+            .last_suggested_turn_count = self.distill_last_suggested_turn_count,
+        });
+        if (!should) return;
+        self.appendLocalToolMessageLocked(
+            "This task looks reusable. Distill it into a skill?\nPress Enter to preview /distill, or Esc to ignore.",
+        ) catch return;
+        self.distill_suggestion_pending = true;
+        self.distill_last_suggested_turn_count = turns.len;
     }
 
     fn buildRequestLocked(self: *Session) !*ChatRequest {
@@ -2669,6 +3227,7 @@ pub fn finishStoppedRequest(session: *Session) void {
     defer session.mutex.unlock();
     if (session.closing.load(.acquire)) return;
     session.request_inflight = false;
+    session.distill_inflight = false;
     session.request_stopping = false;
     session.stop_requested.store(false, .release);
     session.collapseAutoExpandedDetailsLocked();
@@ -2836,10 +3395,81 @@ pub fn appendAssistantResult(session: *Session, result: ApiResult, started_ms: i
     };
     usage_footer = null;
     session.request_inflight = false;
+    session.distill_inflight = false;
     session.collapseAutoExpandedDetailsLocked();
     session.scroll_px = 1_000_000;
     session.setCompletionStatusLocked(started_ms, result.usage);
+    session.maybeAppendDistillSuggestionLocked();
     history_change = session.captureHistoryChangeLocked();
+}
+
+pub fn applyDistillCandidate(session: *Session, candidate: *ai_skill_distill.Candidate) void {
+    const allocator = session.allocator;
+    const root = ai_chat_skills.defaultWritableSkillRootPath(allocator) catch |err| {
+        candidate.deinit(allocator);
+        failDistillRequest(session, err);
+        return;
+    };
+    defer allocator.free(root);
+    const save_path = std.fs.path.join(allocator, &.{ root, candidate.name, "SKILL.md" }) catch |err| {
+        candidate.deinit(allocator);
+        failDistillRequest(session, err);
+        return;
+    };
+    defer allocator.free(save_path);
+    const preview = ai_skill_distill.renderPreviewMarkdown(allocator, candidate.*, save_path) catch |err| {
+        candidate.deinit(allocator);
+        failDistillRequest(session, err);
+        return;
+    };
+    defer allocator.free(preview);
+
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    if (session.closing.load(.acquire) or session.stop_requested.load(.acquire)) {
+        candidate.deinit(allocator);
+        session.request_inflight = false;
+        session.request_stopping = false;
+        session.distill_inflight = false;
+        session.stop_requested.store(false, .release);
+        session.setStatusLocked("Stopped");
+        return;
+    }
+
+    session.clearDistillCandidateLocked();
+    session.distill_candidate = candidate.*;
+    candidate.* = undefined;
+    session.distill_suggestion_pending = false;
+    session.request_inflight = false;
+    session.request_stopping = false;
+    session.distill_inflight = false;
+    session.appendLocalToolMessageLocked(preview) catch {
+        session.clearDistillCandidateLocked();
+        session.setStatusLocked("Out of memory");
+        return;
+    };
+    session.setStatusLocked("Distill preview ready");
+}
+
+pub fn failDistillRequest(session: *Session, err: anyerror) void {
+    const allocator = session.allocator;
+    const text = std.fmt.allocPrint(allocator, "Could not distill this conversation: {}.", .{err}) catch null;
+    defer if (text) |msg| allocator.free(msg);
+
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    session.request_inflight = false;
+    session.request_stopping = false;
+    session.distill_inflight = false;
+    session.stop_requested.store(false, .release);
+    session.clearDistillCandidateLocked();
+    if (text) |msg| {
+        session.appendLocalToolMessageLocked(msg) catch {
+            session.setStatusLocked("Out of memory");
+            return;
+        };
+    }
+    session.setStatusLocked("Ready");
 }
 
 pub fn appendProgressMessage(session: *Session, text: []const u8) !void {
@@ -2986,6 +3616,7 @@ pub fn finishAssistantStream(session: *Session, message_idx: usize, started_ms: 
     if (session.closing.load(.acquire)) return;
     if (session.stop_requested.load(.acquire)) {
         session.request_inflight = false;
+        session.distill_inflight = false;
         session.request_stopping = false;
         session.stop_requested.store(false, .release);
         session.setStatusLocked("Stopped");
@@ -3004,9 +3635,11 @@ pub fn finishAssistantStream(session: *Session, message_idx: usize, started_ms: 
         history_change = session.captureHistoryChangeLocked();
     }
     session.request_inflight = false;
+    session.distill_inflight = false;
     session.collapseAutoExpandedDetailsLocked();
     session.scroll_px = 1_000_000;
     session.setCompletionStatusLocked(started_ms, usage);
+    session.maybeAppendDistillSuggestionLocked();
 }
 
 pub fn failAssistantStream(session: *Session, message_idx: ?usize, text: []const u8) void {
@@ -3219,7 +3852,7 @@ test "ai chat slash command suggestions show and filter from input" {
     var session = Session{ .allocator = allocator };
     session.appendInputText("/");
 
-    try std.testing.expectEqual(@as(usize, 10), session.slashCommandSuggestionCount());
+    try std.testing.expectEqual(@as(usize, 11), session.slashCommandSuggestionCount());
     try std.testing.expectEqualStrings("/skills", session.slashCommandSuggestionAt(0).?.command);
 
     session.appendInputText("c");
@@ -3418,9 +4051,6 @@ test "ai chat dollar skill suggestions filter and enter completes with trailing 
     try std.testing.expectEqual(@as(usize, 0), session.messages.items.len);
 }
 
-
-
-
 const WeixinAttachmentCapture = struct {
     called: bool = false,
     kind: weixin_types.AttachmentKind = .file,
@@ -3565,7 +4195,6 @@ test "weixin_send_attachment calls the active Weixin sender" {
     try std.testing.expectEqualStrings("ctx-1", capture.context_token);
     try std.testing.expectEqualStrings("Sent file to Weixin: report.pdf", result);
 }
-
 
 test "ai_chat: session serializes to history record" {
     const allocator = std.testing.allocator;
@@ -4311,12 +4940,6 @@ test "wsl_session_exec refuses to paste shell wrapper into Claude Code" {
     try std.testing.expect(std.mem.indexOf(u8, result, "repl=claude_code") != null);
 }
 
-
-
-
-
-
-
 test "ai chat ctrl a selects input and replacement clears selection" {
     const allocator = std.testing.allocator;
     var session = Session{ .allocator = allocator };
@@ -4938,6 +5561,111 @@ test "ai chat escape stops in-flight request" {
     try std.testing.expectEqualStrings("Stopping...", session.status());
 }
 
+fn testDistillCandidate(allocator: std.mem.Allocator) !ai_skill_distill.Candidate {
+    return .{
+        .name = try allocator.dupe(u8, "ssh-transfer"),
+        .description = try allocator.dupe(u8, "Diagnose SSH transfer failures."),
+        .body = try allocator.dupe(u8, "# Steps\n\nRun checks."),
+        .source_summary = try allocator.dupe(u8, "Derived from test conversation."),
+    };
+}
+
+test "ai chat distill cancel clears pending candidate" {
+    const a = std.testing.allocator;
+    var session = Session{ .allocator = a };
+    defer {
+        if (session.distill_candidate) |*candidate| candidate.deinit(a);
+        for (session.messages.items) |msg| msg.deinit(a);
+        session.messages.deinit(a);
+    }
+    session.distill_candidate = try testDistillCandidate(a);
+    session.appendInputText("/distill cancel");
+
+    session.submit();
+
+    try std.testing.expect(session.distill_candidate == null);
+    try std.testing.expectEqualStrings("", session.input());
+    try std.testing.expectEqual(@as(usize, 1), session.messages.items.len);
+    try std.testing.expect(std.mem.containsAtLeast(u8, session.messages.items[0].content, 1, "discarded"));
+}
+
+test "ai chat distill confirm without candidate is local only" {
+    const a = std.testing.allocator;
+    var session = Session{ .allocator = a };
+    defer {
+        if (session.distill_candidate) |*candidate| candidate.deinit(a);
+        for (session.messages.items) |msg| msg.deinit(a);
+        session.messages.deinit(a);
+    }
+    session.appendInputText("/沉淀 确认");
+
+    session.submit();
+
+    try std.testing.expect(!session.request_inflight);
+    try std.testing.expectEqual(@as(usize, 1), session.messages.items.len);
+    try std.testing.expect(std.mem.containsAtLeast(u8, session.messages.items[0].content, 1, "No distill candidate"));
+}
+
+test "ai chat appends automatic distill suggestion after tool-heavy result" {
+    const a = std.testing.allocator;
+    var session = Session{ .allocator = a };
+    defer {
+        if (session.distill_candidate) |*candidate| candidate.deinit(a);
+        for (session.messages.items) |msg| msg.deinit(a);
+        session.messages.deinit(a);
+    }
+    try session.messages.append(a, .{ .role = .user, .content = try a.dupe(u8, "fix this") });
+    try session.messages.append(a, .{ .role = .tool, .content = try a.dupe(u8, "running exec one"), .persist_to_history = false });
+    try session.messages.append(a, .{ .role = .tool, .content = try a.dupe(u8, "running exec two"), .persist_to_history = false });
+    session.request_inflight = true;
+
+    appendAssistantResult(&session, .{ .content = @constCast("done") }, 0);
+
+    try std.testing.expect(session.distill_suggestion_pending);
+    try std.testing.expectEqual(@as(usize, 5), session.messages.items.len);
+    try std.testing.expectEqual(Role.tool, session.messages.items[4].role);
+    try std.testing.expect(!session.messages.items[4].persist_to_history);
+    try std.testing.expect(std.mem.containsAtLeast(u8, session.messages.items[4].content, 1, "Distill it into a skill"));
+}
+
+test "ai chat escape dismisses pending distill suggestion before rewind" {
+    const a = std.testing.allocator;
+    var session = Session{ .allocator = a };
+    defer {
+        if (session.distill_candidate) |*candidate| candidate.deinit(a);
+        for (session.messages.items) |msg| msg.deinit(a);
+        session.messages.deinit(a);
+    }
+    try session.messages.append(a, .{ .role = .user, .content = try a.dupe(u8, "hi") });
+    session.distill_suggestion_pending = true;
+    session.now_ms_override = 1000;
+
+    session.handleKey(.{ .key = input_key.Key.escape });
+
+    try std.testing.expect(!session.distill_suggestion_pending);
+    try std.testing.expect(!session.rewind_open);
+    try std.testing.expectEqual(@as(i64, 0), session.last_esc_ms);
+}
+
+test "ai chat enter on pending distill suggestion requires api key and does not send chat" {
+    const a = std.testing.allocator;
+    var session = Session{ .allocator = a };
+    defer {
+        if (session.distill_candidate) |*candidate| candidate.deinit(a);
+        for (session.messages.items) |msg| msg.deinit(a);
+        session.messages.deinit(a);
+    }
+    try session.messages.append(a, .{ .role = .user, .content = try a.dupe(u8, "fix this") });
+    try session.messages.append(a, .{ .role = .assistant, .content = try a.dupe(u8, "done") });
+    session.distill_suggestion_pending = true;
+
+    session.handleKey(.{ .key = input_key.Key.enter });
+
+    try std.testing.expect(!session.request_inflight);
+    try std.testing.expect(!session.distill_suggestion_pending);
+    try std.testing.expectEqualStrings("Missing API key. Edit the AI Chat profile or set DEEPSEEK_API_KEY.", session.status());
+}
+
 test "ai chat rewind point count and index map user messages" {
     const a = std.testing.allocator;
     var session = Session{ .allocator = a };
@@ -5041,7 +5769,6 @@ test "ai chat request state exposes in-flight stop status for remote layout" {
     try std.testing.expect(state.stopping);
 }
 
-
 test "ai chat collapse helper only closes auto-expanded details" {
     const allocator = std.testing.allocator;
     var session = Session{ .allocator = allocator };
@@ -5115,13 +5842,15 @@ test "clearMessages empties transcript but keeps settings" {
     try std.testing.expectEqualStrings("m1", session.model());
 }
 
-test "/permission full flips the global agent permission" {
+test "/permission accepts ask auto and full modes" {
     const saved = currentAgentSettings();
     defer configureAgent(saved); // restore global state for other tests
     configureAgent(.{ .permission = .confirm });
+    applyPermissionArg("auto");
+    try std.testing.expectEqual(AgentPermission.auto, currentAgentSettings().permission);
     applyPermissionArg("full");
     try std.testing.expectEqual(AgentPermission.full, currentAgentSettings().permission);
-    applyPermissionArg("confirm");
+    applyPermissionArg("ask");
     try std.testing.expectEqual(AgentPermission.confirm, currentAgentSettings().permission);
     applyPermissionArg("bogus"); // invalid → no change
     try std.testing.expectEqual(AgentPermission.confirm, currentAgentSettings().permission);
@@ -5518,7 +6247,15 @@ test "ai chat request setup cleans scalar fields on allocation failure" {
 test "copilot session pre-targets the bound surface in its request" {
     const session = try Session.init(
         std.testing.allocator,
-        "copilot", "", "", "", "", "", "", "", "",
+        "copilot",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
     );
     defer session.deinit();
     session.copilot = true;
@@ -5528,4 +6265,64 @@ test "copilot session pre-targets the bound surface in its request" {
     defer req.deinit();
 
     try std.testing.expectEqualStrings("abc123", req.write_context_surface_id[0..req.write_context_surface_id_len]);
+}
+
+test "setDefaultWorkingDir is reflected in currentAgentSettings" {
+    setDefaultWorkingDir("/tmp/proj");
+    defer setDefaultWorkingDir(""); // reset global state for other tests
+    try std.testing.expectEqualStrings("/tmp/proj", currentAgentSettings().working_dir.?);
+    setDefaultWorkingDir("");
+    try std.testing.expect(currentAgentSettings().working_dir == null);
+}
+
+test "submitScheduledPrompt sets composer and reports busy state" {
+    const a = std.testing.allocator;
+    const session = try Session.init(a, "test", "", "", "", "", "", "", "", "");
+    defer session.deinit();
+
+    // Not inflight: returns true and submit is invoked (no agent configured, no-ops).
+    const ok = session.submitScheduledPrompt("hello world");
+    try std.testing.expect(ok);
+
+    // Inflight: returns false (skip).
+    session.request_inflight = true;
+    const skipped = session.submitScheduledPrompt("again");
+    try std.testing.expect(!skipped);
+    session.request_inflight = false;
+}
+
+test "runLoopCommandLocked creates, lists, and stops a loop task" {
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir_path);
+    const path = try std.fs.path.join(a, &.{ dir_path, "loop_tasks.json" });
+    defer a.free(path);
+
+    var store = ai_loop_store.Store.init(a, path);
+    defer store.deinit();
+    ai_loop_store.setActive(&store);
+    defer ai_loop_store.clearActive();
+
+    const session = try Session.init(a, "test", "", "", "", "", "", "", "", "");
+    defer session.deinit();
+    session.copySessionId("session-test");
+
+    session.mutex.lock();
+    _ = session.runBuiltinCommandLocked(.loop, "30m 3 hello");
+    session.mutex.unlock();
+
+    const snap = try store.snapshotForSession(a, "session-test", .loop);
+    defer ai_loop_store.freeSnapshot(a, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expectEqualStrings("hello", snap[0].prompt);
+
+    session.mutex.lock();
+    _ = session.runBuiltinCommandLocked(.loop, "stop 1");
+    session.mutex.unlock();
+    const snap2 = try store.snapshotForSession(a, "session-test", .loop);
+    defer ai_loop_store.freeSnapshot(a, snap2);
+    try std.testing.expectEqual(@as(usize, 0), snap2.len);
 }
