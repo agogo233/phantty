@@ -23,6 +23,7 @@ const ai_chat_skills = @import("ai_chat_skills.zig");
 const platform_process = @import("platform/process.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
 const platform_agent_prompt = @import("platform/agent_prompt.zig");
+const ai_agent_access = @import("ai_agent_access.zig");
 
 /// Number of output lines included in a copilot context block.
 pub const COPILOT_CONTEXT_LINES: usize = 40;
@@ -229,6 +230,19 @@ fn weixinSendAttachmentTool(
     const wx_ctx = ctx.weixin_reply_context orelse {
         return ctx.allocator.dupe(u8, "No active Weixin reply context; cannot send attachment.");
     };
+    // Sending an attachment reads the file off disk and uploads it to a remote
+    // user, so a protected path here is an exfiltration risk. Force approval for
+    // a denied path even in full-permission mode (deny list always wins).
+    if (ctx.settings.access_rules) |rules| {
+        if (ai_agent_access.isPathDenied(ctx.allocator, rules, path, null)) {
+            const bl_reason = allocBlacklistReason(ctx.allocator, path);
+            defer if (bl_reason) |r| ctx.allocator.free(r);
+            const reason = bl_reason orelse "Sends a protected file — confirm to allow";
+            if (!ctx.requestApproval("weixin_send_attachment", path, reason)) {
+                return deniedResult(ctx.allocator, path, "operator rejected sending a protected file");
+            }
+        }
+    }
     wx_ctx.sender.sendAttachment(kind, path, display_name, wx_ctx.to_user_id, wx_ctx.context_token) catch |err| {
         return std.fmt.allocPrint(ctx.allocator, "Failed to send {s} to Weixin: {}", .{ kind.name(), err });
     };
@@ -289,8 +303,15 @@ fn terminalSnapshotTool(ctx: *const ToolContext, surface_id: ?[]const u8) ![]u8 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
 
+    // Resolve a focused-surface alias (focused/active/current/empty) to a
+    // concrete id so the filter below matches the focused terminal.
+    var target_id = surface_id;
+    if (surface_id) |sid| {
+        if (resolveSurfaceId(snapshot, sid, selectedWriteContext(ctx))) |s| target_id = s.id;
+    }
+
     for (snapshot.surfaces) |surface| {
-        if (surface_id) |id| {
+        if (target_id) |id| {
             if (!std.mem.eql(u8, surface.id, id)) continue;
         }
         try out.print(ctx.allocator, "surface={s} title=\"{s}\" kind={s} focused={}", .{
@@ -307,17 +328,31 @@ fn terminalSnapshotTool(ctx: *const ToolContext, surface_id: ?[]const u8) ![]u8 
             });
         }
         try out.append(ctx.allocator, '\n');
-        try out.appendSlice(ctx.allocator, surface.snapshot);
+
+        // For a specifically targeted surface, read the LIVE screen via the
+        // per-surface snapshot (mutex-protected, works on the worker thread)
+        // rather than the request-start pre-capture, which goes stale mid-turn.
+        var live: ?[]u8 = null;
+        defer if (live) |t| ctx.allocator.free(t);
+        if (target_id != null) {
+            if (ctx.tool_host) |host| {
+                live = host.surfaceSnapshot(host.ctx, ctx.allocator, surface.ptr) catch null;
+            }
+        }
+        try out.appendSlice(ctx.allocator, live orelse surface.snapshot);
         try out.appendSlice(ctx.allocator, "\n---\n");
     }
-    if (out.items.len == 0) try out.appendSlice(ctx.allocator, "No matching terminal surface.");
+    if (out.items.len == 0) {
+        if (surface_id) |sid| return allocNoSurfaceError(ctx.allocator, snapshot, sid);
+        try out.appendSlice(ctx.allocator, "No matching terminal surface.");
+    }
     return truncateOwned(ctx.allocator, ctx.settings, try out.toOwnedSlice(ctx.allocator));
 }
 
 fn terminalSelectTool(ctx: *ToolContext, surface_id: []const u8) ![]u8 {
     const snapshot = collectToolSnapshot(ctx) catch return ctx.allocator.dupe(u8, "No terminal snapshot host is available.");
     defer snapshot.deinit(ctx.allocator);
-    const surface = findSurface(snapshot, surface_id) orelse return std.fmt.allocPrint(ctx.allocator, "No matching terminal surface for surface_id={s}.", .{surface_id});
+    const surface = resolveSurfaceId(snapshot, surface_id, selectedWriteContext(ctx)) orelse return allocNoSurfaceError(ctx.allocator, snapshot, surface_id);
     setWriteContext(ctx, surface.id);
     return std.fmt.allocPrint(
         ctx.allocator,
@@ -403,11 +438,46 @@ pub fn rememberClosedTab(ctx: *ToolContext, closed: ToolClosedTab) !void {
 // Local command exec tool
 // ---------------------------------------------------------------------------
 
+const AccessGate = struct {
+    dangerous: bool,
+    blacklisted: bool,
+    force: bool,
+    skip: bool,
+    matched: []const u8,
+};
+
+/// Combine the destructive-command check with the private file-access guard.
+/// `force` => must prompt even in full mode; `skip` => may run without a prompt
+/// even in confirm mode.
+fn accessGate(ctx: *const ToolContext, command: []const u8, cwd: ?[]const u8) AccessGate {
+    const dangerous = isDangerousCommand(command);
+    const result = if (ctx.settings.access_rules) |rules|
+        ai_agent_access.evaluate(ctx.allocator, rules, command, cwd)
+    else
+        ai_agent_access.EvalResult{};
+    const blacklisted = result.decision == .blacklisted;
+    return .{
+        .dangerous = dangerous,
+        .blacklisted = blacklisted,
+        .force = dangerous or blacklisted,
+        .skip = result.decision == .whitelisted_safe and !dangerous,
+        .matched = result.matched,
+    };
+}
+
+/// Allocate a human-readable approval reason naming the protected path. Returns
+/// null on OOM (callers fall back to a static reason).
+fn allocBlacklistReason(allocator: std.mem.Allocator, matched: []const u8) ?[]u8 {
+    return std.fmt.allocPrint(allocator, "Reads protected path \"{s}\" — confirm to allow", .{matched}) catch null;
+}
+
 fn localCommandExecTool(ctx: *const ToolContext, command: []const u8, cwd: ?[]const u8, timeout_ms: u32) ![]u8 {
     if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
-    const dangerous = isDangerousCommand(command);
-    if (ctx.settings.permission != .full or dangerous) {
-        const reason = if (dangerous) DANGEROUS_COMMAND_APPROVAL_REASON else platform_process.localCommandApprovalLabel();
+    const gate = accessGate(ctx, command, cwd);
+    if (gate.force or (ctx.settings.permission != .full and !gate.skip)) {
+        const bl_reason = if (gate.blacklisted) allocBlacklistReason(ctx.allocator, gate.matched) else null;
+        defer if (bl_reason) |r| ctx.allocator.free(r);
+        const reason = bl_reason orelse if (gate.dangerous) DANGEROUS_COMMAND_APPROVAL_REASON else platform_process.localCommandApprovalLabel();
         if (!ctx.requestApproval(platform_process.localCommandToolName(), command, reason)) {
             return deniedResult(ctx.allocator, command, platform_process.localCommandDeniedReason());
         }
@@ -676,6 +746,47 @@ pub fn shellExecInteractiveAgentCommandRefusal(allocator: std.mem.Allocator, kin
     return message;
 }
 
+/// Detect a *bare* interactive REPL launcher (the word alone, e.g. `python`,
+/// `R`, `node`). The shell-exec sentinel wrapper waits for the command to exit,
+/// which never happens for an interactive REPL, so the gate refuses it. Returns
+/// the launcher word, or null if the command runs-and-exits (`python app.py`,
+/// `python --version`, `pip ...`) or is not a REPL.
+fn commandLaunchesBareRepl(command: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    // First token, stopping at whitespace or a shell separator.
+    var end: usize = 0;
+    while (end < trimmed.len and !std.ascii.isWhitespace(trimmed[end]) and
+        trimmed[end] != ';' and trimmed[end] != '&' and trimmed[end] != '|') : (end += 1)
+    {}
+    var word = std.mem.trim(u8, trimmed[0..end], "\"'");
+    if (std.mem.lastIndexOfAny(u8, word, "/\\")) |slash| word = word[slash + 1 ..];
+    // Anything after the launcher word means it runs and exits (a script, -c,
+    // -m, --version, …), which is fine through shell exec — do not refuse.
+    if (std.mem.trim(u8, trimmed[end..], " \t\r\n").len != 0) return null;
+    const repls = [_][]const u8{ "python", "python3", "ipython", "R", "node", "irb" };
+    for (repls) |r| {
+        if (std.mem.eql(u8, word, r)) return r;
+    }
+    return null;
+}
+
+/// REPL name to pass to terminal_repl_exec for a detected launcher word.
+fn evalReplForLauncher(launcher: []const u8) []const u8 {
+    if (std.mem.eql(u8, launcher, "R")) return "r";
+    if (std.mem.eql(u8, launcher, "python") or std.mem.eql(u8, launcher, "python3") or std.mem.eql(u8, launcher, "ipython")) return "python";
+    return "plain";
+}
+
+fn shellExecBareReplRefusal(allocator: std.mem.Allocator, kind: UnixSessionKind, command: []const u8) !?[]u8 {
+    const launcher = commandLaunchesBareRepl(command) orelse return null;
+    return try std.fmt.allocPrint(
+        allocator,
+        "Refusing to start interactive {s} via {s}: the shell-exec wrapper waits for the command to exit, which never happens for a REPL (it hangs and floods the screen). Use terminal_repl_exec with repl=plain code=\"{s}\" to launch it, then terminal_repl_exec with repl={s} to run code.",
+        .{ launcher, kind.toolName(), launcher, evalReplForLauncher(launcher) },
+    );
+}
+
 fn sshSessionExecTool(ctx: *ToolContext, surface_id: []const u8, command: []const u8, timeout_ms: u32) ![]u8 {
     return unixSessionExecTool(ctx, .ssh, surface_id, command, timeout_ms);
 }
@@ -766,10 +877,12 @@ fn terminalReplExecTool(ctx: *ToolContext, surface_id: []const u8, repl_name: []
     const repl = ReplKind.parse(repl_name) orelse return std.fmt.allocPrint(ctx.allocator, "Unsupported repl \"{s}\". Use r, python, codex, claude_code, or plain.", .{repl_name});
     if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
     const control = controlKeyByte(code);
-    const dangerous = isDangerousCommand(code);
-    if (ctx.settings.permission != .full or dangerous) {
+    const gate = accessGate(ctx, code, null);
+    if (gate.force or (ctx.settings.permission != .full and !gate.skip)) {
         var reason_buf: [96]u8 = undefined;
-        const reason = if (dangerous)
+        const bl_reason = if (gate.blacklisted) allocBlacklistReason(ctx.allocator, gate.matched) else null;
+        defer if (bl_reason) |r| ctx.allocator.free(r);
+        const reason = bl_reason orelse if (gate.dangerous)
             DANGEROUS_COMMAND_APPROVAL_REASON
         else if (control != null)
             std.fmt.bufPrint(&reason_buf, "Send control key {s} to terminal", .{std.mem.trim(u8, code, " \t\r\n")}) catch "Send control key to terminal"
@@ -783,7 +896,7 @@ fn terminalReplExecTool(ctx: *ToolContext, surface_id: []const u8, repl_name: []
     const snapshot = collectToolSnapshot(ctx) catch return ctx.allocator.dupe(u8, "No terminal snapshot host is available.");
     defer snapshot.deinit(ctx.allocator);
     const host = ctx.tool_host orelse return ctx.allocator.dupe(u8, "No terminal tool host is available.");
-    const surface = findSurface(snapshot, surface_id) orelse return ctx.allocator.dupe(u8, "No matching terminal surface.");
+    const surface = resolveSurfaceId(snapshot, surface_id, selectedWriteContext(ctx)) orelse return allocNoSurfaceError(ctx.allocator, snapshot, surface_id);
     if (try ensureWriteContext(ctx, surface)) |message| return message;
 
     if (control) |byte| {
@@ -798,9 +911,16 @@ fn terminalReplExecTool(ctx: *ToolContext, surface_id: []const u8, repl_name: []
     };
 }
 
+/// Pause between writing a Codex message body and its submit keystroke so the
+/// Enter lands as its own key event instead of being folded into Codex's
+/// paste-burst (which would leave a literal newline and never submit).
+const CODEX_SUBMIT_DELAY_MS: u64 = 120;
+
 fn plainReplSubmitKey(repl: ReplKind, surface: ToolSurface) []const u8 {
+    // Codex queues a follow-up while it is working with Tab ("tab to queue
+    // message"); otherwise Enter (\r) submits. A literal \n is inserted as a
+    // newline by the Codex composer rather than submitting, so never use it.
     if (repl == .codex and surface.agent_state == .running) return "\t";
-    if (repl == .codex) return "\n";
     return "\r";
 }
 
@@ -809,11 +929,25 @@ pub fn allocPlainReplInput(allocator: std.mem.Allocator, repl: ReplKind, surface
 }
 
 pub fn plainReplInputTool(ctx: *const ToolContext, host: ToolHost, surface: ToolSurface, repl: ReplKind, text: []const u8, timeout_ms: u32) ![]u8 {
-    const input = try allocPlainReplInput(ctx.allocator, repl, surface, text);
-    defer ctx.allocator.free(input);
-
-    if (!host.writeSurface(host.ctx, surface.ptr, input)) {
-        return ctx.allocator.dupe(u8, "Failed to write to terminal surface.");
+    if (repl == .codex) {
+        // Codex's TUI treats a fast input burst as a paste and folds a trailing
+        // Enter into the pasted text, leaving a literal newline that never
+        // submits (the "多余的换行" / unsent-at-prompt symptom). Send the body,
+        // pause so the burst ends, then send the submit key as its own
+        // keystroke — emulating type-then-Enter.
+        if (!host.writeSurface(host.ctx, surface.ptr, text)) {
+            return ctx.allocator.dupe(u8, "Failed to write to terminal surface.");
+        }
+        std.Thread.sleep(CODEX_SUBMIT_DELAY_MS * std.time.ns_per_ms);
+        if (!host.writeSurface(host.ctx, surface.ptr, plainReplSubmitKey(repl, surface))) {
+            return ctx.allocator.dupe(u8, "Failed to write to terminal surface.");
+        }
+    } else {
+        const input = try allocPlainReplInput(ctx.allocator, repl, surface, text);
+        defer ctx.allocator.free(input);
+        if (!host.writeSurface(host.ctx, surface.ptr, input)) {
+            return ctx.allocator.dupe(u8, "Failed to write to terminal surface.");
+        }
     }
 
     if (repl == .codex or repl == .claude_code) {
@@ -829,13 +963,6 @@ pub fn plainReplInputTool(ctx: *const ToolContext, host: ToolHost, surface: Tool
 
     const latest = host.surfaceSnapshot(host.ctx, ctx.allocator, surface.ptr) catch return ctx.allocator.dupe(u8, "Input sent; failed to read terminal snapshot.");
     return truncateOwned(ctx.allocator, ctx.settings, latest);
-}
-
-fn agentAppStateIsTerminal(state: agent_detector.State) bool {
-    return switch (state) {
-        .waiting_approval, .needs_input, .halted, .failed, .done => true,
-        .none, .running => false,
-    };
 }
 
 fn replSnapshotLooksBusy(repl: ReplKind, snapshot: []const u8) bool {
@@ -887,59 +1014,48 @@ fn waitForAgentAppReplResult(ctx: *const ToolContext, host: ToolHost, surface: T
     const min_wait_ms: i64 = 750;
     const started = std.time.milliTimestamp();
     const deadline = started + @as(i64, @intCast(wait_ms));
+
+    // Read the live screen via the per-surface snapshot. It holds the surface's
+    // render mutex over heap-owned terminal state, so it works from the agent
+    // request worker thread. collectSnapshot() must NOT be used here: the tab
+    // model is thread-local to the UI thread and reads empty on the worker (see
+    // the pre-capture comment in ai_chat.zig), which previously left this wait
+    // blind and spinning to the full timeout while the model saw a stale screen.
+    var last_text = host.surfaceSnapshot(host.ctx, ctx.allocator, surface.ptr) catch
+        try ctx.allocator.dupe(u8, surface.snapshot);
+    defer ctx.allocator.free(last_text);
     var last_change_ms = started;
-    var changed_once = false;
-    var last_app = surface.agent_app;
-    var last_state = surface.agent_state;
-    var last_confidence = surface.agent_confidence;
-    var last_snapshot = try ctx.allocator.dupe(u8, surface.snapshot);
-    defer ctx.allocator.free(last_snapshot);
 
     while (std.time.milliTimestamp() < deadline) {
         if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
+        std.Thread.sleep(150 * std.time.ns_per_ms);
         const now = std.time.milliTimestamp();
-        const live = host.collectSnapshot(host.ctx, ctx.allocator) catch null;
-        if (live) |snapshot| {
-            defer snapshot.deinit(ctx.allocator);
-            if (findSurface(snapshot, surface.id)) |latest| {
-                last_app = latest.agent_app;
-                last_state = latest.agent_state;
-                last_confidence = latest.agent_confidence;
-                if (!std.mem.eql(u8, last_snapshot, latest.snapshot)) {
-                    const new_snapshot = try ctx.allocator.dupe(u8, latest.snapshot);
-                    ctx.allocator.free(last_snapshot);
-                    last_snapshot = new_snapshot;
-                    last_change_ms = now;
-                    changed_once = true;
-                }
-                if (agentAppStateIsTerminal(latest.agent_state)) {
-                    return allocAgentAppReplResult(
-                        ctx.allocator,
-                        ctx.settings,
-                        repl,
-                        latest.agent_app,
-                        latest.agent_state,
-                        latest.agent_confidence,
-                        "reported a terminal state",
-                        latest.snapshot,
-                    );
-                }
-                const settled = changed_once and now >= started + min_wait_ms and now - last_change_ms >= quiet_ms;
-                if (settled and !replSnapshotLooksBusy(repl, latest.snapshot)) {
-                    return allocAgentAppReplResult(
-                        ctx.allocator,
-                        ctx.settings,
-                        repl,
-                        latest.agent_app,
-                        latest.agent_state,
-                        latest.agent_confidence,
-                        "screen settled without an active busy marker",
-                        latest.snapshot,
-                    );
-                }
-            }
+
+        const text = host.surfaceSnapshot(host.ctx, ctx.allocator, surface.ptr) catch continue;
+        if (std.mem.eql(u8, last_text, text)) {
+            ctx.allocator.free(text);
+        } else {
+            ctx.allocator.free(last_text);
+            last_text = text;
+            last_change_ms = now;
         }
-        std.Thread.sleep(250 * std.time.ns_per_ms);
+
+        // Settle on a screen that has been stable for quiet_ms (after a min-wait
+        // floor) and shows no active busy marker. The busy-marker gate keeps us
+        // waiting while Codex/Claude Code is still working.
+        const settled = now - started >= min_wait_ms and now - last_change_ms >= quiet_ms;
+        if (settled and !replSnapshotLooksBusy(repl, last_text)) {
+            return allocAgentAppReplResult(
+                ctx.allocator,
+                ctx.settings,
+                repl,
+                surface.agent_app,
+                surface.agent_state,
+                surface.agent_confidence,
+                "screen settled without an active busy marker",
+                last_text,
+            );
+        }
     }
 
     const note = try std.fmt.allocPrint(
@@ -952,11 +1068,11 @@ fn waitForAgentAppReplResult(ctx: *const ToolContext, host: ToolHost, surface: T
         ctx.allocator,
         ctx.settings,
         repl,
-        last_app,
-        last_state,
-        last_confidence,
+        surface.agent_app,
+        surface.agent_state,
+        surface.agent_confidence,
         note,
-        last_snapshot,
+        last_text,
     );
 }
 
@@ -1060,10 +1176,12 @@ fn hasPendingAgentCommand(snapshot: []const u8) bool {
 
 fn unixSessionExecTool(ctx: *ToolContext, kind: UnixSessionKind, surface_id: []const u8, command: []const u8, timeout_ms: u32) ![]u8 {
     if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
-    const dangerous = isDangerousCommand(command);
-    if (ctx.settings.permission != .full or dangerous) {
+    const gate = accessGate(ctx, command, null);
+    if (gate.force or (ctx.settings.permission != .full and !gate.skip)) {
         var reason_buf: [64]u8 = undefined;
-        const reason = if (dangerous)
+        const bl_reason = if (gate.blacklisted) allocBlacklistReason(ctx.allocator, gate.matched) else null;
+        defer if (bl_reason) |r| ctx.allocator.free(r);
+        const reason = bl_reason orelse if (gate.dangerous)
             DANGEROUS_COMMAND_APPROVAL_REASON
         else
             std.fmt.bufPrint(&reason_buf, "Type command into opened {s} terminal", .{kind.label()}) catch "Type command into terminal";
@@ -1074,13 +1192,14 @@ fn unixSessionExecTool(ctx: *ToolContext, kind: UnixSessionKind, surface_id: []c
     const snapshot = collectToolSnapshot(ctx) catch return ctx.allocator.dupe(u8, "No terminal snapshot host is available.");
     defer snapshot.deinit(ctx.allocator);
     const host = ctx.tool_host orelse return ctx.allocator.dupe(u8, "No terminal tool host is available.");
-    const surface = findSurface(snapshot, surface_id) orelse return ctx.allocator.dupe(u8, "No matching terminal surface.");
+    const surface = resolveSurfaceId(snapshot, surface_id, selectedWriteContext(ctx)) orelse return allocNoSurfaceError(ctx.allocator, snapshot, surface_id);
     if (try ensureWriteContext(ctx, surface)) |message| return message;
     if (!kind.matches(surface)) {
         return std.fmt.allocPrint(ctx.allocator, "Target surface is not an opened {s} session.", .{kind.label()});
     }
     if (try shellExecAgentAppRefusal(ctx.allocator, kind, surface)) |message| return message;
     if (try shellExecInteractiveAgentCommandRefusal(ctx.allocator, kind, command)) |message| return message;
+    if (try shellExecBareReplRefusal(ctx.allocator, kind, command)) |message| return message;
 
     // Refuse to inject a new command while the previous one is still running:
     // interleaved sentinels confuse parsing and the model tends to re-issue,
@@ -1343,6 +1462,54 @@ pub fn findSurface(snapshot: ToolSnapshot, surface_id: []const u8) ?ToolSurface 
         if (std.mem.eql(u8, surface.id, surface_id)) return surface;
     }
     return null;
+}
+
+/// Sentinel surface ids that mean "the terminal the user is looking at".
+fn isFocusedSurfaceAlias(surface_id: []const u8) bool {
+    const t = std.mem.trim(u8, surface_id, " \t\r\n");
+    return t.len == 0 or
+        std.ascii.eqlIgnoreCase(t, "focused") or
+        std.ascii.eqlIgnoreCase(t, "active") or
+        std.ascii.eqlIgnoreCase(t, "current");
+}
+
+fn focusedSurface(snapshot: ToolSnapshot) ?ToolSurface {
+    for (snapshot.surfaces) |surface| {
+        if (surface.focused) return surface;
+    }
+    return null;
+}
+
+/// Resolve a tool surface_id, honoring focused-surface aliases
+/// (focused/active/current/empty → the focused terminal, falling back to the
+/// selected write-context). Returns null if nothing matches.
+pub fn resolveSurfaceId(snapshot: ToolSnapshot, surface_id: []const u8, write_context: ?[]const u8) ?ToolSurface {
+    if (isFocusedSurfaceAlias(surface_id)) {
+        if (focusedSurface(snapshot)) |surface| return surface;
+        if (write_context) |wc| return findSurface(snapshot, wc);
+        return null;
+    }
+    return findSurface(snapshot, surface_id);
+}
+
+/// Error result for an unmatched surface_id that lists the open surfaces, so the
+/// model can retry in one step instead of calling terminal_list.
+fn allocNoSurfaceError(allocator: std.mem.Allocator, snapshot: ToolSnapshot, surface_id: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator, "No terminal surface matches surface_id={s}. Open surfaces:\n", .{surface_id});
+    if (snapshot.surfaces.len == 0) try out.appendSlice(allocator, "(none)\n");
+    for (snapshot.surfaces) |surface| {
+        try out.print(allocator, "- id={s} tab={d} focused={} kind={s} title=\"{s}\"\n", .{
+            surface.id,
+            surface.tab_index + 1,
+            surface.focused,
+            toolSurfaceKind(surface),
+            surface.title,
+        });
+    }
+    try out.appendSlice(allocator, "Use one of these ids, or surface_id=focused for the focused terminal.");
+    return out.toOwnedSlice(allocator);
 }
 
 /// Build the per-message copilot context block from a full surface snapshot:
@@ -1623,6 +1790,46 @@ test "ai chat tools prefer request-local terminal snapshot" {
     try std.testing.expect(snapshot.surfaces[0].id.ptr != cached_snapshot.surfaces[0].id.ptr);
 }
 
+test "terminal_snapshot reads the live surface screen for a targeted surface" {
+    const allocator = std.testing.allocator;
+    var host_ctx = ReplWaitTestHost.Ctx{ .busy_until = 0, .settled_text = "LIVE-SCREEN-9999" };
+    var surfaces = try allocator.alloc(ToolSurface, 1);
+    surfaces[0] = .{
+        .id = try allocator.dupe(u8, "s1"),
+        .title = try allocator.dupe(u8, "Local Shell"),
+        .cwd = try allocator.dupe(u8, "/home/user"),
+        // The request-start pre-capture is stale; the live read must win.
+        .snapshot = try allocator.dupe(u8, "STALE-PRECAPTURE-0000"),
+        .tab_index = 0,
+        .focused = true,
+        .is_ssh = false,
+        .is_wsl = false,
+        .agent_app = .none,
+        .agent_state = .none,
+        .agent_confidence = 0,
+        .ptr = @ptrFromInt(1),
+    };
+    const cached = ToolSnapshot{ .surfaces = surfaces, .active_tab = 0 };
+    defer cached.deinit(allocator);
+
+    var dummy: u8 = 0;
+    const ctx = ToolContext{
+        .allocator = allocator,
+        .ctx = &dummy,
+        .tool_host = ReplWaitTestHost.host(&host_ctx),
+        .tool_snapshot = cached,
+        .settings = .{},
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+
+    const result = try terminalSnapshotTool(&ctx, "s1");
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "LIVE-SCREEN-9999") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "STALE-PRECAPTURE") == null);
+    try std.testing.expectEqual(@as(usize, 1), host_ctx.snap_calls);
+}
+
 test "ai chat write context requires explicit selection and can switch surfaces" {
     const allocator = std.testing.allocator;
     var surfaces = try allocator.alloc(ToolSurface, 2);
@@ -1761,6 +1968,102 @@ test "shell exec refuses interactive Codex launcher commands" {
     try std.testing.expect(try shellExecInteractiveAgentCommandRefusal(allocator, .wsl, "codex --version") == null);
 }
 
+fn twoSurfaceSnapshotForTest(allocator: std.mem.Allocator) !ToolSnapshot {
+    var surfaces = try allocator.alloc(ToolSurface, 2);
+    surfaces[0] = .{
+        .id = try allocator.dupe(u8, "aaa"),
+        .title = try allocator.dupe(u8, "shell"),
+        .cwd = try allocator.dupe(u8, "/"),
+        .snapshot = try allocator.dupe(u8, "$ "),
+        .tab_index = 0,
+        .focused = false,
+        .is_ssh = false,
+        .is_wsl = false,
+        .agent_app = .none,
+        .agent_state = .none,
+        .agent_confidence = 0,
+        .ptr = @ptrFromInt(1),
+    };
+    surfaces[1] = .{
+        .id = try allocator.dupe(u8, "bbb"),
+        .title = try allocator.dupe(u8, "codex"),
+        .cwd = try allocator.dupe(u8, "/"),
+        .snapshot = try allocator.dupe(u8, "› "),
+        .tab_index = 0,
+        .focused = true,
+        .is_ssh = false,
+        .is_wsl = false,
+        .agent_app = .codex,
+        .agent_state = .none,
+        .agent_confidence = 50,
+        .ptr = @ptrFromInt(2),
+    };
+    return .{ .surfaces = surfaces, .active_tab = 0 };
+}
+
+test "terminal_select resolves the focused-surface alias to the focused surface" {
+    const allocator = std.testing.allocator;
+    const cached = try twoSurfaceSnapshotForTest(allocator);
+    defer cached.deinit(allocator);
+    var dummy: u8 = 0;
+    var ctx = ToolContext{
+        .allocator = allocator,
+        .ctx = &dummy,
+        .tool_host = null,
+        .tool_snapshot = cached,
+        .settings = .{},
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    for ([_][]const u8{ "focused", "active", "current", "" }) |alias| {
+        const result = try terminalSelectTool(&ctx, alias);
+        defer allocator.free(result);
+        try std.testing.expect(std.mem.indexOf(u8, result, "surface_id=bbb") != null);
+    }
+    // An exact id still resolves directly.
+    const exact = try terminalSelectTool(&ctx, "aaa");
+    defer allocator.free(exact);
+    try std.testing.expect(std.mem.indexOf(u8, exact, "surface_id=aaa") != null);
+}
+
+test "terminal_select lists available surfaces when the id does not match" {
+    const allocator = std.testing.allocator;
+    const cached = try twoSurfaceSnapshotForTest(allocator);
+    defer cached.deinit(allocator);
+    var dummy: u8 = 0;
+    var ctx = ToolContext{
+        .allocator = allocator,
+        .ctx = &dummy,
+        .tool_host = null,
+        .tool_snapshot = cached,
+        .settings = .{},
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    const result = try terminalSelectTool(&ctx, "zzz");
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "zzz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "aaa") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "bbb") != null);
+}
+
+test "shell exec refuses bare REPL launchers but allows run-and-exit invocations" {
+    const allocator = std.testing.allocator;
+    const bare = [_][]const u8{ "python", "python3", "ipython", "R", "node", "irb", "/usr/bin/python", "python " };
+    for (bare) |cmd| {
+        const m = (try shellExecBareReplRefusal(allocator, .wsl, cmd)) orelse {
+            std.debug.print("expected a refusal for bare launcher: {s}\n", .{cmd});
+            return error.TestExpectedRefusal;
+        };
+        defer allocator.free(m);
+        try std.testing.expect(std.mem.indexOf(u8, m, "repl=plain") != null);
+    }
+    const allowed = [_][]const u8{ "python app.py", "python -c 'x=1'", "python --version", "R --version", "node app.js", "which python", "pip install foo", "ls" };
+    for (allowed) |cmd| {
+        try std.testing.expect((try shellExecBareReplRefusal(allocator, .wsl, cmd)) == null);
+    }
+}
+
 test "ai chat R string literal escapes code for REPL eval" {
     const allocator = std.testing.allocator;
     const literal = try rStringLiteral(allocator, "print(\"hello\")\npath <- \"C:\\\\tmp\"");
@@ -1802,7 +2105,45 @@ test "ai chat Codex running REPL input queues with tab instead of enter" {
     idle_surface.agent_state = .done;
     const idle_input = try allocPlainReplInput(allocator, .codex, idle_surface, "/status");
     defer allocator.free(idle_input);
-    try std.testing.expectEqualStrings("/status\n", idle_input);
+    // Idle Codex submits with a real Enter (\r). A literal \n is treated by the
+    // Codex composer as an inserted newline, not a submit.
+    try std.testing.expectEqualStrings("/status\r", idle_input);
+}
+
+test "codex repl input submits the Enter keystroke separately from the message body" {
+    const allocator = std.testing.allocator;
+    var host_ctx = ReplWaitTestHost.Ctx{ .busy_until = 0, .settled_text = "codex idle\n› " };
+    var dummy: u8 = 0;
+    const ctx = ToolContext{
+        .allocator = allocator,
+        .ctx = &dummy,
+        .tool_host = ReplWaitTestHost.host(&host_ctx),
+        .tool_snapshot = null,
+        .settings = .{},
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    const surface = ToolSurface{
+        .id = @constCast("surface-codex"),
+        .title = @constCast("codex"),
+        .cwd = @constCast("/home/xzg"),
+        .snapshot = @constCast("› "),
+        .tab_index = 0,
+        .focused = true,
+        .is_ssh = false,
+        .is_wsl = true,
+        .agent_app = .codex,
+        .agent_state = .done,
+        .agent_confidence = 70,
+        .ptr = @ptrCast(&host_ctx),
+    };
+
+    const result = try plainReplInputTool(&ctx, ReplWaitTestHost.host(&host_ctx), surface, .codex, "hello codex", 1000);
+    defer allocator.free(result);
+    // Codex's paste-burst detection folds a same-write Enter into the pasted
+    // text, so the body and the Enter keystroke must be two separate writes.
+    try std.testing.expectEqual(@as(usize, 2), host_ctx.write_calls);
+    try std.testing.expectEqualStrings("hello codex\r", host_ctx.all_writes[0..host_ctx.all_len]);
 }
 
 test "ai chat Python string literal escapes code for REPL eval" {
@@ -2094,36 +2435,37 @@ test "weixin_send_attachment calls the active Weixin sender" {
 const ReplWaitTestHost = struct {
     const Ctx = struct {
         collect_calls: usize = 0,
+        snap_calls: usize = 0,
         write_calls: usize = 0,
-        done_after: usize = 2,
+        // Number of leading surface-snapshot reads that still look busy before
+        // the screen settles. The wait must settle off the *live* per-surface
+        // read, not collectSnapshot (which is empty on the worker thread).
+        busy_until: usize = 2,
+        settled_text: []const u8 = "Claude Code\nDone. result = 563894910\n> ",
         last_write: [256]u8 = undefined,
         last_write_len: usize = 0,
+        // Concatenation of every write, to distinguish a single combined write
+        // (body+key) from a separated body + submit-key keystroke.
+        all_writes: [256]u8 = undefined,
+        all_len: usize = 0,
     };
 
+    // Simulates the real worker thread: the tab model is thread-local to the UI
+    // thread, so collectSnapshot reads empty here. Tools must not depend on it.
     fn collectSnapshot(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!ToolSnapshot {
         const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
         ctx.collect_calls += 1;
-        const done = ctx.collect_calls >= ctx.done_after;
-        var surfaces = try allocator.alloc(ToolSurface, 1);
-        surfaces[0] = .{
-            .id = try allocator.dupe(u8, "surface-claude"),
-            .title = try allocator.dupe(u8, "Claude Code"),
-            .cwd = try allocator.dupe(u8, "/home/xzg"),
-            .snapshot = try allocator.dupe(u8, if (done) "Claude Code\nFINISHED" else "Claude Code\nthinking"),
-            .tab_index = 0,
-            .focused = true,
-            .is_ssh = false,
-            .is_wsl = true,
-            .agent_app = .claude_code,
-            .agent_state = if (done) .done else .running,
-            .agent_confidence = 82,
-            .ptr = @ptrCast(ctx),
-        };
+        const surfaces = try allocator.alloc(ToolSurface, 0);
         return .{ .surfaces = surfaces, .active_tab = 0 };
     }
 
-    fn surfaceSnapshot(_: *anyopaque, allocator: std.mem.Allocator, _: *anyopaque) anyerror![]u8 {
-        return allocator.dupe(u8, "fallback snapshot");
+    // The per-surface snapshot holds the surface's render mutex and therefore
+    // works from the worker thread. It reports a busy screen, then a settled one.
+    fn surfaceSnapshot(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, _: *anyopaque) anyerror![]u8 {
+        const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
+        ctx.snap_calls += 1;
+        const busy = ctx.snap_calls <= ctx.busy_until;
+        return allocator.dupe(u8, if (busy) "Claude Code\nthinking… (esc to interrupt)" else ctx.settled_text);
     }
 
     fn writeSurface(ctx_ptr: *anyopaque, _: *anyopaque, data: []const u8) bool {
@@ -2132,6 +2474,10 @@ const ReplWaitTestHost = struct {
         @memcpy(ctx.last_write[0..len], data[0..len]);
         ctx.last_write_len = len;
         ctx.write_calls += 1;
+        const room = ctx.all_writes.len - ctx.all_len;
+        const take = @min(room, data.len);
+        @memcpy(ctx.all_writes[ctx.all_len..][0..take], data[0..take]);
+        ctx.all_len += take;
         return true;
     }
 
@@ -2165,9 +2511,58 @@ const ReplWaitTestHost = struct {
     }
 };
 
-test "Claude Code REPL input waits for app state before returning" {
+test "accessGate forces approval for denied paths and skips safe allowed reads" {
+    const a = std.testing.allocator;
+    var rules = try ai_agent_access.parseRules(a, "allow /work/ok\n", "/home/u");
+    defer rules.deinit();
+
+    var session_dummy: u8 = 0;
+    var ctx = ToolContext{
+        .allocator = a,
+        .ctx = &session_dummy,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .settings = .{ .permission = .full, .access_rules = &rules },
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+
+    // Denied path → force approval even in full mode.
+    const denied = accessGate(&ctx, "cat ~/.ssh/id_rsa", null);
+    try std.testing.expect(denied.force);
+    try std.testing.expect(denied.blacklisted);
+
+    // Safe read confined to an allow root → skip even in confirm mode.
+    ctx.settings.permission = .confirm;
+    const safe = accessGate(&ctx, "cat /work/ok/readme.md", null);
+    try std.testing.expect(safe.skip);
+    try std.testing.expect(!safe.force);
+
+    // Unrelated read → neutral (no force, no skip).
+    const neutral = accessGate(&ctx, "cat /work/other.txt", null);
+    try std.testing.expect(!neutral.force);
+    try std.testing.expect(!neutral.skip);
+}
+
+test "accessGate with no rules degrades to dangerous-only behavior" {
+    const a = std.testing.allocator;
+    var session_dummy: u8 = 0;
+    var ctx = ToolContext{
+        .allocator = a,
+        .ctx = &session_dummy,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .settings = .{ .permission = .full, .access_rules = null },
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    try std.testing.expect(!accessGate(&ctx, "cat foo.txt", null).force);
+    try std.testing.expect(accessGate(&ctx, "rm foo.txt", null).force); // dangerous still forces
+}
+
+test "Claude Code REPL input settles off the live surface snapshot, not the worker-empty collectSnapshot" {
     const allocator = std.testing.allocator;
-    var host_ctx = ReplWaitTestHost.Ctx{ .done_after = 2 };
+    var host_ctx = ReplWaitTestHost.Ctx{ .busy_until = 2 };
     var dummy: u8 = 0;
     const ctx = ToolContext{
         .allocator = allocator,
@@ -2193,11 +2588,16 @@ test "Claude Code REPL input waits for app state before returning" {
         .ptr = @ptrCast(&host_ctx),
     };
 
-    const result = try plainReplInputTool(&ctx, ReplWaitTestHost.host(&host_ctx), surface, .claude_code, "analyze system", 2000);
+    const result = try plainReplInputTool(&ctx, ReplWaitTestHost.host(&host_ctx), surface, .claude_code, "analyze system", 3000);
     defer allocator.free(result);
+    // The input was submitted with the Claude Code submit key.
     try std.testing.expectEqual(@as(usize, 1), host_ctx.write_calls);
-    try std.testing.expect(host_ctx.collect_calls >= 2);
     try std.testing.expectEqualStrings("analyze system\r", host_ctx.last_write[0..host_ctx.last_write_len]);
-    try std.testing.expect(std.mem.indexOf(u8, result, "reported a terminal state") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "FINISHED") != null);
+    // The wait read the live per-surface snapshot and ignored the worker-empty
+    // collectSnapshot path entirely.
+    try std.testing.expectEqual(@as(usize, 0), host_ctx.collect_calls);
+    try std.testing.expect(host_ctx.snap_calls > 0);
+    // It returned the settled live screen, not the stale pre-input snapshot.
+    try std.testing.expect(std.mem.indexOf(u8, result, "563894910") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "thinking") == null);
 }

@@ -37,6 +37,7 @@ test {
     _ = @import("startup_tabs.zig");
     _ = @import("config.zig");
     _ = @import("ai_agent_config.zig");
+    _ = @import("ai_agent_access.zig");
     _ = @import("ssh_connection.zig");
     _ = @import("appwindow/active_tab.zig");
     _ = @import("scp.zig");
@@ -81,6 +82,9 @@ test {
     _ = @import("weixin/binding.zig");
     _ = @import("ai_chat_title.zig");
     _ = @import("command_registry.zig");
+    // Pure login-shell argv logic (macOS bash/.bashrc fix). OS-agnostic, so it
+    // runs here on the native host rather than in the POSIX-only exec path.
+    _ = @import("platform/login_shell.zig");
     // Generic POSIX SSH/WSL command builder: asserts native (non-Windows)
     // command-line shapes, so it runs here rather than in test-full's Windows
     // cross-compile path. (The Windows backend stays in test-full.)
