@@ -1358,11 +1358,14 @@ pub fn renderBrowserUrlBar(window_width: f32, window_height: f32, top_offset: f3
         .top = @floatFromInt(url_bar.top),
         .height = @floatFromInt(url_bar.bottom - url_bar.top),
     };
-    const close = hit_test.panelCloseButtonRect(close_layout) orelse return;
+    const close = hit_test.panelHeaderButtonRect(close_layout, 0) orelse return;
+    const toggle_rect = hit_test.panelHeaderButtonRect(close_layout, 1);
+    const refresh_rect = hit_test.panelHeaderButtonRect(close_layout, 2);
     const close_btn_w: f32 = @floatCast(close.width);
     const close_x = @round(@as(f32, @floatCast(close.left)));
     const input_x = @round(@as(f32, @floatFromInt(url_bar.left)) + margin);
-    const input_w = @max(1.0, close_x - input_x - margin);
+    const first_button_x = if (refresh_rect) |r| @round(@as(f32, @floatCast(r.left))) else close_x;
+    const input_w = @max(1.0, first_button_x - input_x - margin);
     const input_h = @max(24.0, bar_h - margin * 2);
     const input_y = @round(bar_y + margin);
     renderRoundedQuadAlpha(input_x - 1, input_y - 1, input_w + 2, input_h + 2, 6, field_border, if (browser_panel.urlBarFocused()) 0.70 else 0.34);
@@ -1395,7 +1398,7 @@ pub fn renderBrowserUrlBar(window_width: f32, window_height: f32, top_offset: f3
     }
     titlebar.renderCloseIcon(close_x, bar_y, close_btn_w, bar_h, if (close_hovered) fg else mixColor(bg, fg, 0.68));
 
-    if (hit_test.panelSecondButtonRect(close_layout)) |t| {
+    if (toggle_rect) |t| {
         const t_left = @round(@as(f32, @floatCast(t.left)));
         const toggle_hovered = blk: {
             const win = AppWindow.g_window orelse break :blk false;
@@ -1416,6 +1419,25 @@ pub fn renderBrowserUrlBar(window_width: f32, window_height: f32, top_offset: f3
             ui_pipeline.fillQuadAlpha(gx, gy, 1.5, 12, glyph_color, 0.9);
             ui_pipeline.fillQuadAlpha(gx + 10.5, gy, 1.5, 12, glyph_color, 0.9);
         }
+    }
+
+    if (refresh_rect) |r| {
+        const r_left = @round(@as(f32, @floatCast(r.left)));
+        const refresh_hovered = blk: {
+            const win = AppWindow.g_window orelse break :blk false;
+            if (win.mouse_x < 0 or win.mouse_y < 0) break :blk false;
+            break :blk hit_test.panelHeaderButton(close_layout, 2, @floatFromInt(win.mouse_x), @floatFromInt(win.mouse_y));
+        };
+        if (refresh_hovered) {
+            ui_pipeline.fillQuadAlpha(r_left + 6, bar_y + @round((bar_h - 20) / 2), 20, 20, mixColor(bg, fg, 0.14), 0.95);
+        }
+        const glyph_color = if (refresh_hovered) fg else mixColor(bg, fg, 0.68);
+        const cx = r_left + @as(f32, @floatCast(r.width)) / 2;
+        const cy = bar_y + bar_h / 2;
+        ui_pipeline.fillQuadAlpha(cx - 5, cy - 6, 8, 1.5, glyph_color, 0.9);
+        ui_pipeline.fillQuadAlpha(cx + 3, cy - 6, 1.5, 6, glyph_color, 0.9);
+        ui_pipeline.fillQuadAlpha(cx - 5, cy + 4.5, 8, 1.5, glyph_color, 0.9);
+        ui_pipeline.fillQuadAlpha(cx - 6.5, cy - 1, 1.5, 6, glyph_color, 0.9);
     }
 
     ui_pipeline.fillQuadAlpha(panel_x, bar_y, panel_w, 1, mixColor(bg, fg, 0.18), 0.55);
@@ -4720,6 +4742,73 @@ test "overlays: SSH list filter backspace restores matching rows" {
     try std.testing.expectEqual(@as(usize, 2), sshListRowCount());
 }
 
+test "overlays: anyBlockingOverlayVisible reflects each modal overlay" {
+    const saved_palette = g_command_palette_visible;
+    const saved_settings = g_settings_visible;
+    const saved_whats_new = g_whats_new_visible;
+    const saved_close = g_window_close_confirm_visible;
+    const saved_restore = g_restore_defaults_confirm_visible;
+    const saved_transfer = g_transfer_cancel_confirm_visible;
+    const saved_session = g_session_launcher_visible;
+    const saved_ssh_list = g_ssh_list_visible;
+    const saved_ssh_form = g_ssh_form_visible;
+    const saved_ai_list = g_ai_list_visible;
+    const saved_ai_form = g_ai_form_visible;
+    const saved_ai_history = g_ai_history_source_visible;
+    defer {
+        g_command_palette_visible = saved_palette;
+        g_settings_visible = saved_settings;
+        g_whats_new_visible = saved_whats_new;
+        g_window_close_confirm_visible = saved_close;
+        g_restore_defaults_confirm_visible = saved_restore;
+        g_transfer_cancel_confirm_visible = saved_transfer;
+        g_session_launcher_visible = saved_session;
+        g_ssh_list_visible = saved_ssh_list;
+        g_ssh_form_visible = saved_ssh_form;
+        g_ai_list_visible = saved_ai_list;
+        g_ai_form_visible = saved_ai_form;
+        g_ai_history_source_visible = saved_ai_history;
+    }
+
+    // Clear every blocking flag → nothing should report blocking.
+    g_command_palette_visible = false;
+    g_settings_visible = false;
+    g_whats_new_visible = false;
+    g_window_close_confirm_visible = false;
+    g_restore_defaults_confirm_visible = false;
+    g_transfer_cancel_confirm_visible = false;
+    g_session_launcher_visible = false;
+    g_ssh_list_visible = false;
+    g_ssh_form_visible = false;
+    g_ai_list_visible = false;
+    g_ai_form_visible = false;
+    g_ai_history_source_visible = false;
+    try std.testing.expect(!anyBlockingOverlayVisible());
+
+    // Each modal independently makes the webview need hiding.
+    g_command_palette_visible = true;
+    try std.testing.expect(anyBlockingOverlayVisible());
+    g_command_palette_visible = false;
+
+    g_settings_visible = true;
+    try std.testing.expect(anyBlockingOverlayVisible());
+    g_settings_visible = false;
+
+    g_whats_new_visible = true;
+    try std.testing.expect(anyBlockingOverlayVisible());
+    g_whats_new_visible = false;
+
+    g_window_close_confirm_visible = true;
+    try std.testing.expect(anyBlockingOverlayVisible());
+    g_window_close_confirm_visible = false;
+
+    g_session_launcher_visible = true;
+    try std.testing.expect(anyBlockingOverlayVisible());
+    g_session_launcher_visible = false;
+
+    try std.testing.expect(!anyBlockingOverlayVisible());
+}
+
 fn showVersionToast() void {
     const msg = app_metadata.versionLine(&g_copy_toast_buf) catch return;
     g_copy_toast_len = msg.len;
@@ -5081,6 +5170,22 @@ pub fn hideWhatsNew() void {
 
 pub fn whatsNewVisible() bool {
     return g_whats_new_visible;
+}
+
+/// True when a full-window GPU overlay is up that the native browser/Jupyter
+/// webview would otherwise occlude. The webview is an OS-level control
+/// composited ABOVE the GPU surface, so in full mode it covers the entire
+/// content area — including these modals. Callers (browser_panel.sync) hide the
+/// webview while this holds so the command center, settings, confirm dialogs,
+/// etc. stay visible.
+pub fn anyBlockingOverlayVisible() bool {
+    return commandPaletteVisible() or
+        settingsPageVisible() or
+        sessionLauncherVisible() or
+        whatsNewVisible() or
+        windowCloseConfirmVisible() or
+        restoreDefaultsConfirmVisible() or
+        transferCancelConfirmVisible();
 }
 
 pub fn whatsNewHandleKey(ev: input_key.KeyEvent) void {

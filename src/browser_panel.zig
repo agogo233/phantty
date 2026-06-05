@@ -4,6 +4,7 @@ const std = @import("std");
 const Surface = @import("Surface.zig");
 const platform_webview = @import("platform/webview.zig");
 const ssh_tunnel = @import("ssh_tunnel.zig");
+const html_server = @import("html_server.zig");
 const window_backend = @import("platform/window_backend.zig");
 const ui_perf = @import("ui_perf.zig");
 const tab = @import("appwindow/tab.zig");
@@ -97,6 +98,13 @@ pub fn width() f32 {
 pub fn isVisibleForActiveTab() bool {
     const owner = g_owner_tab orelse return false;
     return g_visible and owner == active_tab_state.g_active_tab;
+}
+
+/// Whether the native webview should be shown this frame. Visible on its owning
+/// active tab, UNLESS a blocking GPU overlay is up (`suppressed`) — the webview
+/// composites above the GPU surface and would occlude the command center et al.
+pub fn shouldShowWebview(suppressed: bool) bool {
+    return isVisibleForActiveTab() and !suppressed;
 }
 
 pub fn onTabClosed(closed_idx: usize) void {
@@ -238,6 +246,12 @@ pub fn focus() void {
     }
 }
 
+pub fn refresh() void {
+    const browser = g_browser orelse return;
+    platform_webview.reload(browser);
+    g_last_error = platform_webview.lastError(browser);
+}
+
 pub fn isReady() bool {
     const browser = g_browser orelse return false;
     return platform_webview.isReady(browser);
@@ -250,13 +264,13 @@ pub fn lastError() platform_webview.ErrorCode {
     return g_last_error;
 }
 
-pub fn sync(parent: window_backend.NativeHandle, window_width: i32, window_height: i32, titlebar_height: f32, left_offset: f32, right_offset: f32) void {
+pub fn sync(parent: window_backend.NativeHandle, window_width: i32, window_height: i32, titlebar_height: f32, left_offset: f32, right_offset: f32, suppressed: bool) void {
     const perf = ui_perf.begin("browser_panel.sync");
     defer perf.end();
 
     if (window_width <= 0 or window_height <= 0) return;
 
-    if (!isVisibleForActiveTab()) {
+    if (!shouldShowWebview(suppressed)) {
         if (g_browser) |browser| platform_webview.setVisible(browser, false);
         return;
     }
@@ -296,6 +310,7 @@ pub fn sync(parent: window_backend.NativeHandle, window_width: i32, window_heigh
 
 pub fn deinit() void {
     destroyBrowser();
+    html_server.deinit();
     ssh_tunnel.deinit();
     g_visible = false;
     g_owner_tab = null;
@@ -522,6 +537,34 @@ test "full mode: terminal-layout width stays side; only the draw rect goes full"
     try std.testing.expectEqual(@as(f32, 1600), panelDrawWidthForWindow(1600, 0, 0));
 }
 
+test "browser_panel: a blocking overlay suppresses the webview even on the active tab" {
+    // The native webview composites ABOVE the GPU surface, so a full-mode panel
+    // would otherwise occlude GPU overlays like the command center. sync() must
+    // hide the webview whenever the caller reports a blocking overlay is up.
+    const saved_visible = g_visible;
+    const saved_owner = g_owner_tab;
+    const saved_active_tab = active_tab_state.g_active_tab;
+    defer {
+        g_visible = saved_visible;
+        g_owner_tab = saved_owner;
+        active_tab_state.g_active_tab = saved_active_tab;
+    }
+
+    active_tab_state.g_active_tab = 0;
+    g_visible = true;
+    g_owner_tab = 0;
+
+    // No overlay: shown on the owning active tab.
+    try std.testing.expect(shouldShowWebview(false));
+    // Overlay up: hidden, so the command center shows through.
+    try std.testing.expect(!shouldShowWebview(true));
+
+    // Inactive tab stays hidden regardless of the overlay flag.
+    active_tab_state.g_active_tab = 1;
+    try std.testing.expect(!shouldShowWebview(false));
+    try std.testing.expect(!shouldShowWebview(true));
+}
+
 test "browser_panel: public parent handle API uses window backend handle" {
     const open_info = @typeInfo(@TypeOf(open)).@"fn";
     try std.testing.expect(open_info.params[0].type.? == ?window_backend.NativeHandle);
@@ -537,4 +580,7 @@ test "browser_panel: public parent handle API uses window backend handle" {
 
     const submit_info = @typeInfo(@TypeOf(submitUrlBar)).@"fn";
     try std.testing.expect(submit_info.params[1].type.? == ?window_backend.NativeHandle);
+
+    const refresh_info = @typeInfo(@TypeOf(refresh)).@"fn";
+    try std.testing.expectEqual(@as(usize, 0), refresh_info.params.len);
 }
