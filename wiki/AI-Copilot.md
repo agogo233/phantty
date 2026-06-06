@@ -80,6 +80,16 @@ sidebar — to insert that file's absolute path into the composer. The path is
 quoted automatically when it contains spaces, with a trailing space added so you
 can keep typing your request.
 
+## File editing
+
+The AI agent can read and edit files directly:
+
+- **read_file** — read a local or remote text file (returns numbered lines; supports an `offset`/`limit` line range for large files).
+- **write_file** — create or overwrite a file with exact content.
+- **edit_file** — replace an exact, unique string (or every occurrence with `replace_all`).
+
+To edit a file on a remote SSH server, the agent passes the `surface_id` of an open SSH terminal tab; the operation runs on that host over the existing connection. Local files (no `surface_id`) resolve relative paths against the conversation's working directory. Writes and edits display a diff and, depending on the permission level (confirm / auto / full), may ask you to approve before applying.
+
 ## Working directory
 
 Local agent commands run in a default working directory set globally by
@@ -99,6 +109,14 @@ an alias for `ask`):
 - `auto` — run ordinary tools automatically, but still confirm protected-path
   and dangerous commands.
 - `full` — skip approval guard prompts entirely.
+
+## Remote approval replies
+
+If WeChat direct control is connected, a pending Copilot approval can also be
+sent to WeChat. Reply `Y`/`yes` to approve or `N`/`no` to deny; WispTerm routes
+that reply back into the same approval dialog that would otherwise wait in the
+desktop UI. The desktop app remains the source of truth, and protected file
+paths still use the normal access gate before an approval prompt is emitted.
 
 ## Sessions browser & resume
 

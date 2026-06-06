@@ -5,6 +5,8 @@ const std = @import("std");
 const weixin_types = @import("weixin/types.zig");
 const agent_detector = @import("agent_detector.zig");
 const ai_agent_access = @import("ai_agent_access.zig");
+const ssh_connection = @import("ssh_connection.zig");
+pub const SshConnection = ssh_connection.SshConnection;
 
 const DEFAULT_AGENT_TIMEOUT_MS: u32 = 60_000;
 const DEFAULT_AGENT_OUTPUT_LIMIT: u32 = 16 * 1024;
@@ -144,32 +146,48 @@ pub const ToolHost = struct {
     closeTab: *const fn (*anyopaque, std.mem.Allocator, ?usize, ?[]const u8, ?[]const u8) anyerror!ToolClosedTab,
     saveSshProfile: *const fn (*anyopaque, std.mem.Allocator, SshProfileSaveArgs) anyerror!SavedSshProfile,
     connectSshProfile: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!ToolSurface,
+    /// Resolve `surface_id` to its SSH connection for out-of-band file IO, or
+    /// null for local/WSL/unknown surfaces. Only the real AppWindow host sets
+    /// this; others leave it null (file tools then treat the target as local).
+    sshConnectionForSurface: ?*const fn (*anyopaque, []const u8) ?SshConnection = null,
 };
 
 pub const WeixinReplyContext = struct {
     sender: weixin_types.AttachmentSender,
     to_user_id: []u8,
     context_token: []u8,
+    model_context: []u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator, ctx: weixin_types.ReplyContext) !WeixinReplyContext {
-        return .{
+        var out = WeixinReplyContext{
             .sender = ctx.sender,
             .to_user_id = try allocator.dupe(u8, ctx.to_user_id),
-            .context_token = try allocator.dupe(u8, ctx.context_token),
+            .context_token = &.{},
         };
+        errdefer allocator.free(out.to_user_id);
+        out.context_token = try allocator.dupe(u8, ctx.context_token);
+        errdefer allocator.free(out.context_token);
+        out.model_context = if (ctx.model_context.len != 0) try allocator.dupe(u8, ctx.model_context) else &.{};
+        return out;
     }
 
     pub fn clone(self: WeixinReplyContext, allocator: std.mem.Allocator) !WeixinReplyContext {
-        return .{
+        var out = WeixinReplyContext{
             .sender = self.sender,
             .to_user_id = try allocator.dupe(u8, self.to_user_id),
-            .context_token = try allocator.dupe(u8, self.context_token),
+            .context_token = &.{},
         };
+        errdefer allocator.free(out.to_user_id);
+        out.context_token = try allocator.dupe(u8, self.context_token);
+        errdefer allocator.free(out.context_token);
+        out.model_context = if (self.model_context.len != 0) try allocator.dupe(u8, self.model_context) else &.{};
+        return out;
     }
 
     pub fn deinit(self: *WeixinReplyContext, allocator: std.mem.Allocator) void {
         allocator.free(self.to_user_id);
         allocator.free(self.context_token);
+        if (self.model_context.len != 0) allocator.free(self.model_context);
         self.* = undefined;
     }
 };
@@ -179,6 +197,8 @@ pub const ApprovalView = struct {
     command: []const u8,
     reason: []const u8,
 };
+
+fn noopNote(_: *anyopaque, _: []const u8) void {}
 
 /// Narrow context handed to the tool layer so it never touches `Session`.
 pub const ToolContext = struct {
@@ -194,6 +214,9 @@ pub const ToolContext = struct {
 
     approve: *const fn (ctx: *anyopaque, tool: []const u8, command: []const u8, reason: []const u8) bool,
     cancelled: *const fn (ctx: *anyopaque) bool,
+    /// Post a transcript note (e.g. a diff) before an approval prompt. Defaults
+    /// to a no-op so test contexts need not wire it.
+    note: *const fn (ctx: *anyopaque, text: []const u8) void = noopNote,
 
     pub fn requestApproval(self: *const ToolContext, tool: []const u8, command: []const u8, reason: []const u8) bool {
         return self.approve(self.ctx, tool, command, reason);
@@ -204,5 +227,13 @@ pub const ToolContext = struct {
     pub fn writeContextSurfaceId(self: *const ToolContext) ?[]const u8 {
         if (self.write_context_surface_id_len == 0) return null;
         return self.write_context_surface_id[0..self.write_context_surface_id_len];
+    }
+    pub fn emitNote(self: *const ToolContext, text: []const u8) void {
+        self.note(self.ctx, text);
+    }
+    pub fn sshConnectionForSurface(self: *const ToolContext, surface_id: []const u8) ?SshConnection {
+        const host = self.tool_host orelse return null;
+        const resolver = host.sshConnectionForSurface orelse return null;
+        return resolver(host.ctx, surface_id);
     }
 };

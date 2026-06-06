@@ -54,6 +54,9 @@ target. WispTerm connects to the selected target, scans `$HOME/.codex`,
 `$HOME/.claude`, and `$HOME/.reasonix` for metadata, and loads a transcript
 only when you open that row.
 
+The `Subagent` category separates sessions whose title starts with `You are`;
+those sessions still appear under `All`.
+
 Use `Resume` to open a real terminal tab on the same target. WispTerm first
 checks the original project directory recorded in the history file; if that
 directory is missing, resume stops instead of falling back to `$HOME`.
@@ -64,8 +67,8 @@ Press `Ctrl+Shift+A` (`Cmd+Shift+A` on macOS) on a terminal tab to toggle a
 right-side AI copilot bound to the currently focused terminal. The copilot is
 terminal-only — it does not open on a Copilot tab or other non-terminal tabs.
 
-- Each terminal tab keeps its own copilot conversation. The conversation is
-  per-tab, and closing the tab discards it.
+- Each terminal tab keeps its own copilot conversation and open/closed sidebar
+  state. Closing the tab discards that conversation.
 - Terminal actions default to the current terminal, so there is no tab to pick
   before asking. The copilot can still operate other terminals when you
   explicitly ask it to.
@@ -98,6 +101,16 @@ Drag a local file onto a visible chat surface — a Copilot tab or the Copilot
 sidebar — to insert that file's absolute path into the composer. The path is
 quoted automatically when it contains spaces and is followed by a trailing
 space, so you can keep typing your request after it.
+
+## File editing
+
+The AI agent can read and edit files directly:
+
+- **read_file** — read a local or remote text file (returns numbered lines; supports an `offset`/`limit` line range for large files).
+- **write_file** — create or overwrite a file with exact content.
+- **edit_file** — replace an exact, unique string (or every occurrence with `replace_all`).
+
+To edit a file on a remote SSH server, the agent passes the `surface_id` of an open SSH terminal tab; the operation runs on that host over the existing connection. Local files (no `surface_id`) resolve relative paths against the conversation's working directory. Writes and edits display a diff and, depending on the permission level (confirm / auto / full), may ask you to approve before applying.
 
 ## Markdown Export
 

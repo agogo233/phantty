@@ -654,6 +654,7 @@ fn forEachToolSpec(
     comptime emit: fn (Ctx, []const u8, []const u8, []const u8) anyerror!void,
 ) !void {
     try emit(ctx, "terminal_list", "List WispTerm terminal surfaces visible to the agent, including the current agent-selected write context. Before any terminal write, use terminal_select to choose the intended surface_id; use focused=true only as a default hint.", "{}");
+    try emit(ctx, "terminal_context", "Report the current selected terminal write context/binding without changing it. Use this to verify which terminal Copilot or the agent will write to.", "{}");
     try emit(ctx, "terminal_snapshot", "Read a bounded text snapshot from one terminal surface or all surfaces.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Optional surface id from terminal_list.\"}}");
     try emit(ctx, "terminal_select", platform_pty_command.terminalSelectToolDescription(), "{\"surface_id\":{\"type\":\"string\",\"description\":\"Surface id from terminal_list to make the current agent write context.\"}}");
     try emit(ctx, platform_process.localCommandToolName(), platform_process.localCommandToolDescription(), "{\"command\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}");
@@ -662,12 +663,17 @@ fn forEachToolSpec(
         try emit(ctx, platform_pty_command.wslSessionToolName(), platform_pty_command.wslSessionToolDescription(), platform_pty_command.wslSessionToolPropertiesJson());
     }
     try emit(ctx, "terminal_repl_exec", "Send code or text to the selected already-open interactive REPL/app terminal without shell syntax. The surface_id must match the current terminal_select context. Use repl=r for R, repl=python for Python, repl=codex for Codex, repl=claude_code for Claude Code, or repl=plain for raw text input. For Codex and Claude Code, this waits until the app settles, requests approval/input, reports completion/failure, or reaches timeout_ms.", "{\"surface_id\":{\"type\":\"string\",\"description\":\"Selected surface id from terminal_select.\"},\"repl\":{\"type\":\"string\",\"description\":\"r, python, codex, claude_code, or plain\"},\"code\":{\"type\":\"string\",\"description\":\"Code or plain text to submit. To send a control key instead, set code to exactly one of <ctrl-c>, <ctrl-d>, <ctrl-u>, <esc>, <enter> — e.g. to interrupt a stuck command or leave a `>` continuation prompt.\"},\"timeout_ms\":{\"type\":\"integer\"}}");
+    try emit(ctx, "read_file", "Read a local or remote text file. Returns numbered lines. Set surface_id to an open SSH terminal surface to read on that remote host; omit it (or use a local surface) for the local filesystem. Relative paths resolve against the agent working directory. Use offset/limit to read a line range of a large file.", "{\"path\":{\"type\":\"string\",\"description\":\"File path. Absolute, or relative to the working directory.\"},\"surface_id\":{\"type\":\"string\",\"description\":\"Optional SSH surface id (from terminal_list) to read the file on that remote host. Omit for local.\"},\"offset\":{\"type\":\"integer\",\"description\":\"Optional 1-based first line to return.\"},\"limit\":{\"type\":\"integer\",\"description\":\"Optional maximum number of lines to return.\"}}");
+    try emit(ctx, "write_file", "Create or overwrite a local or remote text file with exact content. Shows a diff and (unless permission is full) asks for approval. Set surface_id to an open SSH terminal surface to write on that remote host; omit for local. Relative paths resolve against the agent working directory.", "{\"path\":{\"type\":\"string\",\"description\":\"File path. Absolute, or relative to the working directory.\"},\"content\":{\"type\":\"string\",\"description\":\"Full file content to write.\"},\"surface_id\":{\"type\":\"string\",\"description\":\"Optional SSH surface id to write on that remote host. Omit for local.\"}}");
+    try emit(ctx, "edit_file", "Replace an exact unique string in a local or remote text file. old_string must match exactly and be unique unless replace_all is true. Shows a diff and (unless permission is full) asks for approval. Set surface_id to an open SSH terminal surface to edit on that remote host; omit for local.", "{\"path\":{\"type\":\"string\",\"description\":\"File path. Absolute, or relative to the working directory.\"},\"old_string\":{\"type\":\"string\",\"description\":\"Exact text to replace. Must be unique unless replace_all is true.\"},\"new_string\":{\"type\":\"string\",\"description\":\"Replacement text. May be empty to delete.\"},\"replace_all\":{\"type\":\"boolean\",\"description\":\"Replace every occurrence instead of requiring a unique match.\"},\"surface_id\":{\"type\":\"string\",\"description\":\"Optional SSH surface id to edit on that remote host. Omit for local.\"}}");
     try emit(ctx, "ssh_profile_save", "Create or update a saved WispTerm SSH server profile. Use before ssh_profile_connect when the user provides SSH host, user, port, or password details.", "{\"name\":{\"type\":\"string\",\"description\":\"Optional profile name; defaults to host for new profiles.\"},\"host\":{\"type\":\"string\",\"description\":\"SSH host name or IP address.\"},\"user\":{\"type\":\"string\",\"description\":\"SSH username.\"},\"password\":{\"type\":\"string\",\"description\":\"Optional SSH password; omit when using keys.\"},\"port\":{\"type\":\"string\",\"description\":\"Optional SSH port; defaults to 22 for new profiles.\"},\"proxy_jump\":{\"type\":\"string\",\"description\":\"Optional OpenSSH ProxyJump/jump host: [user@]host[:port], comma-separated for multi-hop. Omit for a direct connection.\"}}");
     try emit(ctx, "ssh_profile_connect", "Create a new tab connected to a saved WispTerm SSH server profile by its profile name or host.", "{\"profile_name\":{\"type\":\"string\",\"description\":\"Saved SSH profile name or host to open in a new tab.\"}}");
     try emit(ctx, "tab_new", platform_pty_command.tabNewToolDescription(), platform_pty_command.tabNewToolPropertiesJson());
     try emit(ctx, "tab_close", "Close a terminal tab by tab_number (the one-based `tab` shown by terminal_list, matching the tab number the user sees), surface_id, title, or the active terminal tab when no selector is provided. Cannot close the AI chat tab running the agent.", "{\"tab_number\":{\"type\":\"integer\",\"description\":\"One-based UI tab number — the `tab` value shown by terminal_list and what the user sees.\"},\"tab_index\":{\"type\":\"integer\",\"description\":\"Zero-based tab index (tab_number minus one). Prefer tab_number.\"},\"surface_id\":{\"type\":\"string\",\"description\":\"Surface id from terminal_list.\"},\"title\":{\"type\":\"string\",\"description\":\"Terminal tab title to close, such as CPU2.\"}}");
     try emit(ctx, "skill_info", "Load a WispTerm skill by stable name. Use when the user explicitly names a skill or asks for specialized skill instructions.", "{\"skill_name\":{\"type\":\"string\",\"description\":\"Skill name or skill directory name.\"}}");
     try emit(ctx, "wispterm_docs", "Read WispTerm's own documentation (features, configuration, shortcuts, AI agent, file explorer, media). Call with no topic to list available topics, then call again with a topic to read its full text.", "{\"topic\":{\"type\":\"string\",\"description\":\"Topic name from the list. Omit to list available topics.\"}}");
+    try emit(ctx, "websearch", "Search the web for current information via Jina. Returns the top results with titles, URLs, and page content. Use when you need facts newer than your training or to look something up online.", "{\"query\":{\"type\":\"string\",\"description\":\"The search query.\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Optional max number of results (default 10, max 20).\"}}");
+    try emit(ctx, "webread", "Read a web page or local file into clean markdown via Jina Reader. Pass an http(s):// URL to fetch a page, or a local file path (PDF, Word, Excel, PowerPoint) to upload and convert it. Use when you need the full content of one source, not a search.", "{\"url\":{\"type\":\"string\",\"description\":\"An http(s):// URL, or a local file path to upload.\"}}");
     try emit(ctx, "weixin_send_attachment", "Send a local file back to the active Weixin conversation that triggered this agent request. Use only when the current request came from Weixin; normal local chat requests have no Weixin reply context. Audio and voice files are sent as ordinary file attachments.", "{\"kind\":{\"type\":\"string\",\"description\":\"Attachment kind: file, image, or voice. Voice is accepted as an alias for file.\"},\"path\":{\"type\":\"string\",\"description\":\"Readable local file path to send.\"},\"display_name\":{\"type\":\"string\",\"description\":\"Optional filename shown in Weixin for file attachments; defaults to the path basename.\"}}");
 }
 
@@ -1477,6 +1483,24 @@ test "anthropic maps tool_calls to tool_use and tool results to grouped tool_res
     try std.testing.expect(std.mem.indexOf(u8, json, "\"input_schema\"") != null);
 }
 
+test "agent tool set includes websearch" {
+    const a = std.testing.allocator;
+    var msgs = [_]RequestMessage{.{ .role = .user, .content = @constCast("hi") }};
+    const params = RequestParams{ .model = "m", .system_prompt = "", .protocol = .anthropic, .thinking_enabled = false, .reasoning_effort = "", .stream = false, .max_tokens = 8192 };
+    const json = try buildRequestJson(a, params, &msgs, true);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"websearch\"") != null);
+}
+
+test "agent tool set includes webread" {
+    const a = std.testing.allocator;
+    var msgs = [_]RequestMessage{.{ .role = .user, .content = @constCast("hi") }};
+    const params = RequestParams{ .model = "m", .system_prompt = "", .protocol = .anthropic, .thinking_enabled = false, .reasoning_effort = "", .stream = false, .max_tokens = 8192 };
+    const json = try buildRequestJson(a, params, &msgs, true);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"webread\"") != null);
+}
+
 // ---------------------------------------------------------------------------
 // Stream-response parser
 // ---------------------------------------------------------------------------
@@ -1613,4 +1637,16 @@ test "ai chat Responses API stream aggregates output text and usage" {
     try std.testing.expectEqual(@as(u64, 12), result.usage.?.total_tokens);
     try std.testing.expectEqual(@as(u64, 2), result.usage.?.prompt_cache_hit_tokens);
     try std.testing.expectEqual(@as(u64, 7), result.usage.?.prompt_cache_miss_tokens);
+}
+
+test "file-edit tools appear in the tool schema" {
+    const a = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+    try appendToolSchemas(a, &out);
+    const json = out.items;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"read_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"write_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"edit_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"replace_all\"") != null);
 }

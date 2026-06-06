@@ -636,6 +636,7 @@ comptime {
     _ = @import("build_guards.zig");
     _ = @import("command_center_state.zig");
     _ = @import("command_palette_model.zig");
+    _ = @import("openssh_config_import.zig");
     _ = @import("config.zig");
     _ = @import("i18n.zig");
     _ = @import("config_watcher.zig");
@@ -704,11 +705,13 @@ comptime {
     _ = @import("weixin/agent.zig");
     _ = @import("weixin/reply_progress.zig");
     _ = @import("weixin/ilink_codec.zig");
+    _ = @import("weixin/media_inbound.zig");
     _ = @import("weixin/ilink_client.zig");
     _ = @import("weixin/poller.zig");
     _ = @import("weixin/controller.zig");
     _ = @import("weixin/qr_code.zig");
     _ = @import("weixin/qr_panel.zig");
+    _ = @import("weixin/approval_reply.zig");
     _ = @import("renderer/overlay_keys.zig");
     _ = @import("close_confirm.zig");
     _ = @import("renderer/overlays.zig");

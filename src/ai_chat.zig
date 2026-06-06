@@ -79,6 +79,9 @@ pub const Role = ai_chat_protocol.Role;
 pub const Message = struct {
     role: Role,
     content: []u8,
+    /// Model-only context appended when building API requests. This is not
+    /// rendered, exported, or persisted in history.
+    model_context: ?[]u8 = null,
     reasoning: ?[]u8 = null,
     usage_footer: ?[]u8 = null,
     tool_call_id: ?[]u8 = null,
@@ -94,6 +97,7 @@ pub const Message = struct {
 
     fn deinit(self: Message, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
+        if (self.model_context) |ctx| allocator.free(ctx);
         if (self.reasoning) |reasoning| allocator.free(reasoning);
         if (self.usage_footer) |footer| allocator.free(footer);
         if (self.tool_call_id) |id| allocator.free(id);
@@ -139,6 +143,7 @@ const ImageBlock = ai_chat_protocol.ImageBlock;
 const ai_chat_title = @import("ai_chat_title.zig");
 const ToolCall = ai_chat_protocol.ToolCall;
 const ai_chat_request = @import("ai_chat_request.zig");
+const web_search = @import("web_search.zig");
 
 pub const ChatRequest = struct {
     allocator: std.mem.Allocator,
@@ -185,6 +190,51 @@ pub const ChatRequest = struct {
             .stream = self.stream,
             .max_tokens = self.max_tokens,
         };
+    }
+};
+
+/// Lightweight background job for a `$websearch` user command. Owns its query.
+/// The spawning code stores the thread in `session.request_thread`, so
+/// `Session.deinit` joins it before freeing the session (no use-after-free).
+pub const WebSearchRequest = struct {
+    allocator: std.mem.Allocator,
+    session: *Session,
+    query: []u8,
+
+    pub fn create(allocator: std.mem.Allocator, session: *Session, query: []const u8) !*WebSearchRequest {
+        const self = try allocator.create(WebSearchRequest);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .session = session, .query = try allocator.dupe(u8, query) };
+        return self;
+    }
+
+    pub fn deinit(self: *WebSearchRequest) void {
+        self.allocator.free(self.query);
+        self.allocator.destroy(self);
+    }
+};
+
+/// Lightweight background job for a `$webread` user command. Owns its target.
+/// Mirrors `WebSearchRequest`; joined by `Session.deinit` via `request_thread`.
+pub const WebReadRequest = struct {
+    allocator: std.mem.Allocator,
+    session: *Session,
+    target: []u8,
+    working_dir: []u8, // "" = none; used as the cache root
+
+    pub fn create(allocator: std.mem.Allocator, session: *Session, target: []const u8, working_dir: []const u8) !*WebReadRequest {
+        const self = try allocator.create(WebReadRequest);
+        errdefer allocator.destroy(self);
+        const target_dup = try allocator.dupe(u8, target);
+        errdefer allocator.free(target_dup);
+        self.* = .{ .allocator = allocator, .session = session, .target = target_dup, .working_dir = try allocator.dupe(u8, working_dir) };
+        return self;
+    }
+
+    pub fn deinit(self: *WebReadRequest) void {
+        self.allocator.free(self.target);
+        self.allocator.free(self.working_dir);
+        self.allocator.destroy(self);
     }
 };
 
@@ -306,7 +356,7 @@ pub fn setDefaultWorkingDir(path: []const u8) void {
     g_default_working_dir_len = n;
 }
 
-fn defaultWorkingDir() ?[]const u8 {
+pub fn defaultWorkingDir() ?[]const u8 {
     g_agent_mutex.lock();
     defer g_agent_mutex.unlock();
     if (g_default_working_dir_len == 0) return null;
@@ -403,12 +453,18 @@ fn previewPrompt(p: []const u8) []const u8 {
     return if (p.len > 48) p[0..48] else p;
 }
 
+const LoopTaskListScope = enum { session, all };
+
+fn taskOwnerLabel(v: ai_loop_store.TaskView) []const u8 {
+    return if (v.title.len > 0) v.title else v.session_id;
+}
+
 fn loopErrorText(err: ai_loop_schedule.ParseError, kind: ai_loop_schedule.TaskKind) []const u8 {
     return switch (err) {
         error.MissingArgs => if (kind == .loop)
-            "Usage: /loop <interval> <count> <prompt>  e.g. /loop 30m 8 check ci"
+            "Usage: /loop <interval> <count> <prompt>; /loop all; /loop stop <id>|all"
         else
-            "Usage: /watch <HH:MM | YYYY-MM-DD HH:MM> <prompt>",
+            "Usage: /watch <HH:MM | YYYY-MM-DD HH:MM> <prompt>; /watch all; /watch stop <id>|all",
         error.BadInterval => "Bad interval. Use a number + s/m/h/d, e.g. 30m, 5h.",
         error.BadCount => "Count must be a positive integer.",
         error.BadTime => "Bad time. Use HH:MM or YYYY-MM-DD HH:MM (24h).",
@@ -1366,6 +1422,28 @@ pub const Session = struct {
     }
 
     pub fn allocRemoteSnapshot(self: *Session, allocator: std.mem.Allocator) ![]u8 {
+        // Capture any pending approval under approval_mutex BEFORE taking
+        // self.mutex (sequential locks, never nested — no reverse ordering
+        // exists, so this cannot deadlock). A resolution racing the gap between
+        // the two locks costs at most one extra Approval snapshot, which the
+        // remote consumer's once-per-episode announcer already de-dupes.
+        var cap_tool_buf: [64]u8 = undefined;
+        var cap_cmd_buf: [1024]u8 = undefined;
+        var cap_tool: []const u8 = "";
+        var cap_command: []const u8 = "";
+        {
+            self.approval_mutex.lock();
+            defer self.approval_mutex.unlock();
+            if (self.approval_pending and !self.approval_resolved) {
+                const tl = self.approval_tool_len;
+                @memcpy(cap_tool_buf[0..tl], self.approval_tool_buf[0..tl]);
+                cap_tool = cap_tool_buf[0..tl];
+                const cl = self.approval_command_len;
+                @memcpy(cap_cmd_buf[0..cl], self.approval_command_buf[0..cl]);
+                cap_command = cap_cmd_buf[0..cl];
+            }
+        }
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -1374,6 +1452,17 @@ pub const Session = struct {
 
         try appendLimitedSection(allocator, &out, "Model", self.model(), REMOTE_SNAPSHOT_MAX_BYTES);
         try appendLimitedSection(allocator, &out, "Status", self.status(), REMOTE_SNAPSHOT_MAX_BYTES);
+
+        if (cap_tool.len != 0) {
+            var approval_text: std.ArrayListUnmanaged(u8) = .empty;
+            defer approval_text.deinit(allocator);
+            try approval_text.appendSlice(allocator, cap_tool);
+            if (cap_command.len != 0) {
+                try approval_text.append(allocator, '\n');
+                try approval_text.appendSlice(allocator, cap_command);
+            }
+            try appendLimitedSection(allocator, &out, "Approval", approval_text.items, REMOTE_SNAPSHOT_MAX_BYTES);
+        }
 
         var sections: std.ArrayListUnmanaged(RemoteSnapshotSection) = .empty;
         defer sections.deinit(allocator);
@@ -1466,6 +1555,13 @@ pub const Session = struct {
         return true;
     }
 
+    /// Resolve a pending approval from a remote driver (e.g. the WeChat bridge),
+    /// mirroring the local handleApprovalKey path. Returns true if there was a
+    /// pending approval to resolve.
+    pub fn resolveApprovalExternal(self: *Session, approve: bool) bool {
+        return self.resolveApproval(approve);
+    }
+
     pub fn requestApproval(self: *Session, tool: []const u8, command: []const u8, reason: []const u8) bool {
         if (self.stop_requested.load(.acquire)) return false;
         self.approval_mutex.lock();
@@ -1541,6 +1637,14 @@ pub const Session = struct {
             .content_auto_expand = false,
         });
         self.scroll_px = 1_000_000;
+    }
+
+    /// Thread-safe wrapper used by the tool layer (worker thread) to post a
+    /// transcript note such as a diff. Swallows OOM (best-effort UI message).
+    pub fn appendLocalToolMessage(self: *Session, text: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.appendLocalToolMessageLocked(text) catch {};
     }
 
     fn clearDistillCandidateLocked(self: *Session) void {
@@ -1627,6 +1731,16 @@ pub const Session = struct {
         }
         // otherwise (e.g. "/help me", "/usr/bin path", or a rebound template body): fall through.
 
+        if (ai_chat_composer.parseWebCommand(first_tok)) |web_cmd| {
+            self.clearPendingWeixinReplyContextLocked();
+            self.mutex.unlock();
+            switch (web_cmd) {
+                .websearch => self.startWebSearchRequest(arg),
+                .webread => self.startWebReadRequest(arg),
+            }
+            return;
+        }
+
         if (self.api_key_len == 0) {
             self.setStatusLocked("Missing API key. Edit the Copilot profile or set DEEPSEEK_API_KEY.");
             self.clearPendingWeixinReplyContextLocked();
@@ -1657,12 +1771,26 @@ pub const Session = struct {
             self.mutex.unlock();
             return;
         };
+        var prompt_model_context: ?[]u8 = null;
+        if (self.pending_weixin_reply_context) |ctx| {
+            if (ctx.model_context.len != 0) {
+                prompt_model_context = self.allocator.dupe(u8, ctx.model_context) catch {
+                    if (skill_preload_content) |content| self.allocator.free(content);
+                    self.allocator.free(prompt);
+                    self.setStatusLocked("Out of memory");
+                    self.clearPendingWeixinReplyContextLocked();
+                    self.mutex.unlock();
+                    return;
+                };
+            }
+        }
         // Hand any pasted images to this user turn. They are re-sent on every
         // subsequent request for the life of the session (multi-turn vision).
         const user_images = self.takePendingImages();
-        self.messages.append(self.allocator, .{ .role = .user, .content = prompt, .images = user_images }) catch {
+        self.messages.append(self.allocator, .{ .role = .user, .content = prompt, .model_context = prompt_model_context, .images = user_images }) catch {
             if (skill_preload_content) |content| self.allocator.free(content);
             self.allocator.free(prompt);
+            if (prompt_model_context) |ctx| self.allocator.free(ctx);
             if (user_images) |imgs| {
                 for (imgs) |img| img.deinit(self.allocator);
                 self.allocator.free(imgs);
@@ -1672,6 +1800,7 @@ pub const Session = struct {
             self.mutex.unlock();
             return;
         };
+        prompt_model_context = null;
 
         var skill_preload_appended = false;
         if (invocation) |parsed| if (skill_preload_content) |skill_content| {
@@ -1886,7 +2015,15 @@ pub const Session = struct {
         };
 
         if (trimmed.len == 0) {
-            self.listLoopTasksLocked(store, kind);
+            self.listLoopTasksLocked(store, kind, .session);
+            return;
+        }
+        if (std.mem.eql(u8, trimmed, "all")) {
+            if (!self.copilot) {
+                self.emitLoopMessageLocked("Global scheduled task listing is only available in Copilot.");
+                return;
+            }
+            self.listLoopTasksLocked(store, kind, .all);
             return;
         }
         if (std.mem.startsWith(u8, trimmed, "stop")) {
@@ -1900,8 +2037,9 @@ pub const Session = struct {
                     self.emitLoopMessageLocked("Usage: stop <id> | stop all");
                     return;
                 };
-                const ok = store.stop(ctx.session_id, id);
-                self.emitLoopMessageLocked(if (ok) "Task cancelled." else "No such task in this session.");
+                var ok = store.stop(ctx.session_id, id);
+                if (!ok and self.copilot) ok = store.stopById(id);
+                self.emitLoopMessageLocked(if (ok) "Task cancelled." else "No such task.");
             }
             return;
         }
@@ -1922,8 +2060,11 @@ pub const Session = struct {
         self.emitRegisterConfirmationLocked(info);
     }
 
-    fn listLoopTasksLocked(self: *Session, store: *ai_loop_store.Store, kind: ai_loop_schedule.TaskKind) void {
-        const views = store.snapshotForSession(self.allocator, self.sessionId(), kind) catch {
+    fn listLoopTasksLocked(self: *Session, store: *ai_loop_store.Store, kind: ai_loop_schedule.TaskKind, scope: LoopTaskListScope) void {
+        const views = switch (scope) {
+            .session => store.snapshotForSession(self.allocator, self.sessionId(), kind),
+            .all => store.snapshotAll(self.allocator, kind),
+        } catch {
             self.emitLoopMessageLocked("Out of memory.");
             return;
         };
@@ -1936,17 +2077,34 @@ pub const Session = struct {
         defer buf.deinit(self.allocator);
         const w = buf.writer(self.allocator);
         for (views) |v| {
+            const owner = taskOwnerLabel(v);
             if (kind == .loop) {
                 const iv = ai_loop_schedule.formatInterval(v.interval_ms);
-                w.print("#{d}  every {d}{c}  remaining {d}  \u{2192} {s}\n", .{
-                    v.id, iv.value, iv.unit, v.remaining, previewPrompt(v.prompt),
-                }) catch return;
+                if (scope == .all) {
+                    w.print("#{d}  [{s}]  every {d}{c}  remaining {d}  \u{2192} {s}\n", .{
+                        v.id, owner, iv.value, iv.unit, v.remaining, previewPrompt(v.prompt),
+                    }) catch return;
+                } else {
+                    w.print("#{d}  every {d}{c}  remaining {d}  \u{2192} {s}\n", .{
+                        v.id, iv.value, iv.unit, v.remaining, previewPrompt(v.prompt),
+                    }) catch return;
+                }
             } else if (v.daily) {
-                w.print("#{d}  daily {d:0>2}:{d:0>2}  \u{2192} {s}\n", .{
-                    v.id, @divTrunc(v.tod_minutes, 60), @mod(v.tod_minutes, 60), previewPrompt(v.prompt),
-                }) catch return;
+                if (scope == .all) {
+                    w.print("#{d}  [{s}]  daily {d:0>2}:{d:0>2}  \u{2192} {s}\n", .{
+                        v.id, owner, @divTrunc(v.tod_minutes, 60), @mod(v.tod_minutes, 60), previewPrompt(v.prompt),
+                    }) catch return;
+                } else {
+                    w.print("#{d}  daily {d:0>2}:{d:0>2}  \u{2192} {s}\n", .{
+                        v.id, @divTrunc(v.tod_minutes, 60), @mod(v.tod_minutes, 60), previewPrompt(v.prompt),
+                    }) catch return;
+                }
             } else {
-                w.print("#{d}  once  \u{2192} {s}\n", .{ v.id, previewPrompt(v.prompt) }) catch return;
+                if (scope == .all) {
+                    w.print("#{d}  [{s}]  once  \u{2192} {s}\n", .{ v.id, owner, previewPrompt(v.prompt) }) catch return;
+                } else {
+                    w.print("#{d}  once  \u{2192} {s}\n", .{ v.id, previewPrompt(v.prompt) }) catch return;
+                }
             }
         }
         self.emitLoopMessageLocked(buf.items);
@@ -2124,6 +2282,127 @@ pub const Session = struct {
             return;
         };
 
+        self.mutex.lock();
+        self.request_thread = thread;
+        self.mutex.unlock();
+    }
+
+    /// Run a `$websearch <query>` command on a background thread. Mirrors
+    /// `startDistillRequest`: reuses `request_thread`/`request_inflight` so the
+    /// existing submit-guard and `deinit` join cover lifetime. Called AFTER the
+    /// caller has unlocked `self.mutex`.
+    fn startWebSearchRequest(self: *Session, query_in: []const u8) void {
+        self.mutex.lock();
+        if (self.request_thread) |thread| {
+            if (self.request_inflight) {
+                self.clearSubmittedInputLocked();
+                self.appendLocalToolMessageLocked("Wait for the current request to finish.") catch {};
+                self.setStatusLocked("Ready");
+                self.mutex.unlock();
+                return;
+            }
+            self.request_thread = null;
+            self.mutex.unlock();
+            thread.join();
+            self.mutex.lock();
+        }
+
+        const query = std.mem.trim(u8, query_in, " \t\r\n");
+        if (query.len == 0) {
+            self.clearSubmittedInputLocked();
+            self.appendLocalToolMessageLocked("Usage: $websearch <query>") catch self.setStatusLocked("Out of memory");
+            self.setStatusLocked("Ready");
+            self.mutex.unlock();
+            return;
+        }
+        if (!web_search.jinaApiKeySet()) {
+            self.clearSubmittedInputLocked();
+            self.appendLocalToolMessageLocked("Jina API key not set — add `jina-api-key = <key>` to your WispTerm config.") catch self.setStatusLocked("Out of memory");
+            self.setStatusLocked("Ready");
+            self.mutex.unlock();
+            return;
+        }
+
+        const req = WebSearchRequest.create(self.allocator, self, query) catch {
+            self.clearSubmittedInputLocked();
+            self.appendLocalToolMessageLocked("Out of memory.") catch {};
+            self.setStatusLocked("Ready");
+            self.mutex.unlock();
+            return;
+        };
+        self.clearSubmittedInputLocked();
+        self.stop_requested.store(false, .release);
+        self.request_stopping = false;
+        self.request_inflight = true;
+        self.setStatusLocked("Searching the web…");
+        self.mutex.unlock();
+
+        const thread = std.Thread.spawn(.{}, ai_chat_request.webSearchThreadMain, .{req}) catch {
+            req.deinit();
+            self.mutex.lock();
+            self.request_inflight = false;
+            self.appendLocalToolMessageLocked("Failed to start web search thread.") catch {};
+            self.setStatusLocked("Ready");
+            self.mutex.unlock();
+            return;
+        };
+        self.mutex.lock();
+        self.request_thread = thread;
+        self.mutex.unlock();
+    }
+
+    /// Run a `$webread <target>` command on a background thread. Mirrors
+    /// `startWebSearchRequest` but does not require a Jina key (anonymous read is
+    /// allowed). Called AFTER the caller has unlocked `self.mutex`.
+    fn startWebReadRequest(self: *Session, target_in: []const u8) void {
+        self.mutex.lock();
+        if (self.request_thread) |thread| {
+            if (self.request_inflight) {
+                self.clearSubmittedInputLocked();
+                self.appendLocalToolMessageLocked("Wait for the current request to finish.") catch {};
+                self.setStatusLocked("Ready");
+                self.mutex.unlock();
+                return;
+            }
+            self.request_thread = null;
+            self.mutex.unlock();
+            thread.join();
+            self.mutex.lock();
+        }
+
+        const target = std.mem.trim(u8, target_in, " \t\r\n");
+        if (target.len == 0) {
+            self.clearSubmittedInputLocked();
+            self.appendLocalToolMessageLocked("Usage: $webread <url | file path>") catch self.setStatusLocked("Out of memory");
+            self.setStatusLocked("Ready");
+            self.mutex.unlock();
+            return;
+        }
+
+        const wd = self.effectiveWorkingDirLocked() orelse "";
+        const req = WebReadRequest.create(self.allocator, self, target, wd) catch {
+            self.clearSubmittedInputLocked();
+            self.appendLocalToolMessageLocked("Out of memory.") catch {};
+            self.setStatusLocked("Ready");
+            self.mutex.unlock();
+            return;
+        };
+        self.clearSubmittedInputLocked();
+        self.stop_requested.store(false, .release);
+        self.request_stopping = false;
+        self.request_inflight = true;
+        self.setStatusLocked("Reading…");
+        self.mutex.unlock();
+
+        const thread = std.Thread.spawn(.{}, ai_chat_request.webReadThreadMain, .{req}) catch {
+            req.deinit();
+            self.mutex.lock();
+            self.request_inflight = false;
+            self.appendLocalToolMessageLocked("Failed to start web read thread.") catch {};
+            self.setStatusLocked("Ready");
+            self.mutex.unlock();
+            return;
+        };
         self.mutex.lock();
         self.request_thread = thread;
         self.mutex.unlock();
@@ -2685,13 +2964,24 @@ pub const Session = struct {
                 continue;
             }
 
-            if (copilot_target_idx != null and idx == copilot_target_idx.? and copilot_ctx != null) {
-                const combined = try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ msg.content, copilot_ctx.? });
-                defer self.allocator.free(combined);
-                messages[written] = try ai_chat_request.requestMessageWithClonedFields(self.allocator, msg.role, combined, msg.reasoning, null, null, msg.images);
-            } else {
-                messages[written] = try ai_chat_request.requestMessageWithClonedFields(self.allocator, msg.role, msg.content, msg.reasoning, null, null, msg.images);
+            const append_copilot_ctx = copilot_target_idx != null and idx == copilot_target_idx.? and copilot_ctx != null;
+            const model_ctx = msg.model_context;
+            var request_content: []const u8 = msg.content;
+            var combined_owned: ?[]u8 = null;
+            defer if (combined_owned) |combined| self.allocator.free(combined);
+
+            if (model_ctx != null and append_copilot_ctx) {
+                combined_owned = try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}\n\n{s}", .{ msg.content, model_ctx.?, copilot_ctx.? });
+                request_content = combined_owned.?;
+            } else if (model_ctx != null) {
+                combined_owned = try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ msg.content, model_ctx.? });
+                request_content = combined_owned.?;
+            } else if (append_copilot_ctx) {
+                combined_owned = try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ msg.content, copilot_ctx.? });
+                request_content = combined_owned.?;
             }
+
+            messages[written] = try ai_chat_request.requestMessageWithClonedFields(self.allocator, msg.role, request_content, msg.reasoning, null, null, msg.images);
             written += 1;
         }
 
@@ -3401,6 +3691,23 @@ pub fn appendAssistantResult(session: *Session, result: ApiResult, started_ms: i
     session.setCompletionStatusLocked(started_ms, result.usage);
     session.maybeAppendDistillSuggestionLocked();
     history_change = session.captureHistoryChangeLocked();
+}
+
+/// Append a `$websearch` result (or error text) as a local tool message and
+/// finish the in-flight request. Called from the web-search worker thread with
+/// no lock held. Mirrors the closing-guarded shape of `appendAssistantResult`.
+pub fn appendWebSearchResult(session: *Session, text: []const u8) void {
+    if (session.closing.load(.acquire)) return;
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    if (session.closing.load(.acquire)) return;
+    session.appendLocalToolMessageLocked(text) catch {
+        session.request_inflight = false;
+        session.setStatusLocked("Out of memory");
+        return;
+    };
+    session.request_inflight = false;
+    session.setStatusLocked("Ready");
 }
 
 pub fn applyDistillCandidate(session: *Session, candidate: *ai_skill_distill.Candidate) void {
@@ -4679,6 +4986,7 @@ test "ai chat default system prompt comes from platform agent prompt" {
     try std.testing.expect(std.mem.indexOf(u8, DEFAULT_SYSTEM_PROMPT, "Python") != null);
     try std.testing.expect(std.mem.indexOf(u8, DEFAULT_SYSTEM_PROMPT, platform_process.localCommandToolName()) != null);
     try std.testing.expect(std.mem.indexOf(u8, DEFAULT_SYSTEM_PROMPT, "terminal_list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, DEFAULT_SYSTEM_PROMPT, "terminal_context") != null);
     try std.testing.expect(std.mem.indexOf(u8, DEFAULT_SYSTEM_PROMPT, "terminal_select") != null);
     try std.testing.expect(std.mem.indexOf(u8, DEFAULT_SYSTEM_PROMPT, "ssh_session_exec") != null);
     try std.testing.expect(std.mem.indexOf(u8, DEFAULT_SYSTEM_PROMPT, "ssh_profile_save") != null);
@@ -4697,6 +5005,7 @@ test "ai chat default system prompt comes from platform agent prompt" {
 test "copilot prompt keeps tool guidance and adds the binding clause" {
     try std.testing.expect(std.mem.indexOf(u8, COPILOT_SYSTEM_PROMPT, "CURRENTLY FOCUSED") != null);
     try std.testing.expect(std.mem.indexOf(u8, COPILOT_SYSTEM_PROMPT, "ssh_session_exec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, COPILOT_SYSTEM_PROMPT, "terminal_context") != null);
     try std.testing.expect(std.mem.indexOf(u8, COPILOT_SYSTEM_PROMPT, "terminal_select") != null);
 }
 
@@ -5026,6 +5335,33 @@ test "ai chat buildRequestMessages clones user image blocks into the request" {
     try std.testing.expect(reqs[0].images.?[0].data_b64.ptr != images[0].data_b64.ptr);
 }
 
+test "ai chat model context is request-only and hidden from visible history" {
+    const allocator = std.testing.allocator;
+    const session = try Session.init(allocator, "test", "", "", "", "", "", "", "", "");
+    defer session.deinit();
+
+    try session.messages.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "用户通过微信发送了文件：a.pdf"),
+        .model_context = try allocator.dupe(u8, "本地文件路径：/work/weixin_inbound/a.pdf"),
+    });
+
+    const reqs = try session.buildRequestMessagesLocked(null, null);
+    defer {
+        for (reqs) |m| m.deinit(allocator);
+        allocator.free(reqs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), reqs.len);
+    try std.testing.expect(std.mem.indexOf(u8, session.messages.items[0].content, "/work/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reqs[0].content, "用户通过微信发送了文件：a.pdf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reqs[0].content, "/work/weixin_inbound/a.pdf") != null);
+
+    var record = try session.toHistoryRecord(allocator);
+    defer agent_history.freeOwnedRecord(allocator, &record);
+    try std.testing.expectEqual(@as(usize, 1), record.messages.len);
+    try std.testing.expectEqualStrings("用户通过微信发送了文件：a.pdf", record.messages[0].content);
+}
+
 test "ai chat input cursor supports insertion and deletion in the middle" {
     const allocator = std.testing.allocator;
     var session = Session{ .allocator = allocator };
@@ -5305,6 +5641,62 @@ test "ai chat remote snapshot still includes reasoning when it fits" {
 
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "all good") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "checked the state first") != null);
+}
+
+test "ai chat remote snapshot includes a pending approval section" {
+    const allocator = std.testing.allocator;
+    var session = Session{ .allocator = allocator };
+    defer {
+        for (session.messages.items) |msg| msg.deinit(allocator);
+        session.messages.deinit(allocator);
+    }
+    try session.messages.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "clean up"),
+    });
+
+    const tool = "terminal_repl_exec";
+    const command = "rm -rf /tmp/x";
+    @memcpy(session.approval_tool_buf[0..tool.len], tool);
+    session.approval_tool_len = tool.len;
+    @memcpy(session.approval_command_buf[0..command.len], command);
+    session.approval_command_len = command.len;
+    session.approval_pending = true;
+    session.approval_resolved = false;
+
+    const with = try session.allocRemoteSnapshot(allocator);
+    defer allocator.free(with);
+    try std.testing.expect(std.mem.indexOf(u8, with, "Approval:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with, "terminal_repl_exec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with, "rm -rf /tmp/x") != null);
+
+    // Once resolved, the section disappears.
+    try std.testing.expect(session.resolveApprovalExternal(true));
+    const without = try session.allocRemoteSnapshot(allocator);
+    defer allocator.free(without);
+    try std.testing.expect(std.mem.indexOf(u8, without, "Approval:") == null);
+}
+
+test "ai chat remote snapshot approval section omits the command line when empty" {
+    const allocator = std.testing.allocator;
+    var session = Session{ .allocator = allocator };
+    defer {
+        for (session.messages.items) |msg| msg.deinit(allocator);
+        session.messages.deinit(allocator);
+    }
+
+    const tool = "weather_lookup";
+    @memcpy(session.approval_tool_buf[0..tool.len], tool);
+    session.approval_tool_len = tool.len;
+    session.approval_command_len = 0; // no command argument
+    session.approval_pending = true;
+    session.approval_resolved = false;
+
+    const snapshot = try session.allocRemoteSnapshot(allocator);
+    defer allocator.free(snapshot);
+    // The tool-only approval still emits a section naming the tool, with no
+    // trailing command line (the `\n<command>` branch is skipped).
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Approval:\r\nweather_lookup") != null);
 }
 
 test "ai chat clipboard text exports transcript when input is empty" {
@@ -6328,4 +6720,49 @@ test "runLoopCommandLocked creates, lists, and stops a loop task" {
     const snap2 = try store.snapshotForSession(a, "session-test", .loop);
     defer ai_loop_store.freeSnapshot(a, snap2);
     try std.testing.expectEqual(@as(usize, 0), snap2.len);
+}
+
+test "copilot loop command lists and stops tasks from other sessions" {
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir_path);
+    const path = try std.fs.path.join(a, &.{ dir_path, "loop_tasks.json" });
+    defer a.free(path);
+
+    var store = ai_loop_store.Store.init(a, path);
+    defer store.deinit();
+    ai_loop_store.setActive(&store);
+    defer ai_loop_store.clearActive();
+
+    _ = try store.registerLoop(
+        "30m 3 legacy copilot task",
+        .{ .session_id = "old-copilot-session", .model = "model", .title = "Old Copilot" },
+        1000,
+        0,
+    );
+
+    const copilot = try Session.init(a, "Copilot", "", "", "", "", "", "", "", "");
+    defer copilot.deinit();
+    copilot.copilot = true;
+    copilot.copySessionId("new-copilot-session");
+
+    copilot.mutex.lock();
+    _ = copilot.runBuiltinCommandLocked(.loop, "all");
+    copilot.mutex.unlock();
+
+    try std.testing.expect(copilot.messages.items.len > 0);
+    const list_msg = copilot.messages.items[copilot.messages.items.len - 1].content;
+    try std.testing.expect(std.mem.indexOf(u8, list_msg, "legacy copilot task") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_msg, "Old Copilot") != null);
+
+    copilot.mutex.lock();
+    _ = copilot.runBuiltinCommandLocked(.loop, "stop 1");
+    copilot.mutex.unlock();
+
+    const remaining = try store.snapshotForSession(a, "old-copilot-session", .loop);
+    defer ai_loop_store.freeSnapshot(a, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }

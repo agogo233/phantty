@@ -9,6 +9,8 @@ const ChatRequest = ai_chat.ChatRequest;
 const ai_chat_protocol = @import("ai_chat_protocol.zig");
 const ai_skill_distill = @import("ai_skill_distill.zig");
 const ai_chat_tools = @import("ai_chat_tools.zig");
+const web_search = @import("web_search.zig");
+const web_read = @import("web_read.zig");
 const ai_chat_types = @import("ai_chat_types.zig");
 
 // Type aliases from ai_chat_protocol
@@ -123,6 +125,78 @@ pub fn distillThreadMain(request: *ChatRequest) void {
         return;
     };
     ai_chat.applyDistillCandidate(request.session, &candidate);
+}
+
+/// Background worker for one `$websearch` command. Owns `req`; frees it on exit.
+/// Re-fetches the Jina key on this thread, runs the search (snippets only), and
+/// appends the formatted results to the transcript.
+pub fn webSearchThreadMain(req: *ai_chat.WebSearchRequest) void {
+    defer req.deinit();
+    const allocator = req.allocator;
+    const session = req.session;
+    if (session.closing.load(.acquire)) return;
+
+    const key = (web_search.jinaApiKeyAlloc(allocator) catch null) orelse {
+        ai_chat.appendWebSearchResult(session, web_search.errorText(error.MissingApiKey));
+        return;
+    };
+    defer allocator.free(key);
+
+    var results = web_search.executeSearch(allocator, req.query, .{
+        .engine = .jina,
+        .api_key = key,
+        .with_content = false,
+        .max_results = 10,
+    }) catch |err| {
+        const text = web_search.formatErrorText(allocator, err) catch {
+            ai_chat.appendWebSearchResult(session, web_search.errorText(err));
+            return;
+        };
+        defer allocator.free(text);
+        ai_chat.appendWebSearchResult(session, text);
+        return;
+    };
+    defer results.deinit();
+
+    const text = web_search.formatForUser(allocator, req.query, results.items) catch {
+        ai_chat.appendWebSearchResult(session, "Out of memory formatting results.");
+        return;
+    };
+    defer allocator.free(text);
+    ai_chat.appendWebSearchResult(session, text);
+}
+
+/// Background worker for one `$webread` command. Owns `req`; frees it on exit.
+/// Reuses the Jina key when configured (optional — anonymous read works), reads the
+/// target, and appends the formatted content to the transcript.
+pub fn webReadThreadMain(req: *ai_chat.WebReadRequest) void {
+    defer req.deinit();
+    const allocator = req.allocator;
+    const session = req.session;
+    if (session.closing.load(.acquire)) return;
+
+    const key_opt = web_search.jinaApiKeyAlloc(allocator) catch null;
+    defer if (key_opt) |k| allocator.free(k);
+    const key = key_opt orelse "";
+
+    const cache_dir: ?[]const u8 = if (req.working_dir.len > 0) req.working_dir else null;
+    var result = web_read.executeRead(allocator, req.target, .{ .api_key = key, .cache_dir = cache_dir }) catch |err| {
+        const text = web_read.formatErrorText(allocator, err) catch {
+            ai_chat.appendWebSearchResult(session, web_read.errorText(err));
+            return;
+        };
+        defer allocator.free(text);
+        ai_chat.appendWebSearchResult(session, text);
+        return;
+    };
+    defer result.deinit();
+
+    const text = web_read.formatForUser(allocator, req.target, &result) catch {
+        ai_chat.appendWebSearchResult(session, "Out of memory formatting content.");
+        return;
+    };
+    defer allocator.free(text);
+    ai_chat.appendWebSearchResult(session, text);
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +575,11 @@ fn toolCancelled(ctx: *anyopaque) bool {
     return ai_chat.sessionCancelled(session);
 }
 
+fn toolNote(ctx: *anyopaque, text: []const u8) void {
+    const session: *Session = @ptrCast(@alignCast(ctx));
+    session.appendLocalToolMessage(text);
+}
+
 fn toolContextFromRequest(request: *ChatRequest) ai_chat_types.ToolContext {
     var settings = ai_chat.currentAgentSettings();
     // Per-conversation override beats the global default.
@@ -517,6 +596,7 @@ fn toolContextFromRequest(request: *ChatRequest) ai_chat_types.ToolContext {
         .write_context_surface_id_len = request.write_context_surface_id_len,
         .approve = toolApprove,
         .cancelled = toolCancelled,
+        .note = toolNote,
     };
 }
 
@@ -600,6 +680,7 @@ test "ai chat agent request json includes tool schemas" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tools\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"terminal_list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"terminal_context\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"terminal_select\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"ssh_session_exec\"") != null);
     if (@import("platform/pty_command.zig").wslSessionToolsEnabled()) {
@@ -664,6 +745,7 @@ test "ai chat responses request json uses input and response tool schemas" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"input\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"messages\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function\",\"name\":\"terminal_list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function\",\"name\":\"terminal_context\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function_call\",\"call_id\":\"call_1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"surface=1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"reasoning\":{\"effort\":\"high\"}") != null);

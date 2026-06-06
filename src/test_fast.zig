@@ -25,6 +25,7 @@ test {
     _ = @import("input/hit_test.zig");
     _ = @import("input/mouse_report.zig");
     _ = @import("input/preview_path.zig");
+    _ = @import("input/ls_path_context.zig");
     _ = @import("input/terminal_link_action.zig");
     _ = @import("input/file_drop_path.zig");
     _ = @import("renderer/overlays/profile_codec.zig");
@@ -40,7 +41,9 @@ test {
     _ = @import("config.zig");
     _ = @import("ai_agent_config.zig");
     _ = @import("ai_agent_access.zig");
+    _ = @import("agent_file_edit.zig");
     _ = @import("ssh_connection.zig");
+    _ = @import("openssh_config_import.zig");
     _ = @import("appwindow/active_tab.zig");
     _ = @import("scp.zig");
     _ = @import("file_backend.zig");
@@ -50,6 +53,9 @@ test {
     _ = @import("ai_chat_composer_layout.zig");
     _ = @import("ai_chat_input_text.zig");
     _ = @import("ai_chat_composer.zig");
+    _ = @import("web_search.zig");
+    _ = @import("web_read.zig");
+    _ = @import("web_read_cache.zig");
     _ = @import("ai_loop_schedule.zig");
     _ = @import("ai_skill_distill.zig");
     _ = @import("ai_history_types.zig");
@@ -84,6 +90,7 @@ test {
     _ = @import("weixin/ilink_client.zig");
     _ = @import("weixin/media.zig");
     _ = @import("weixin/binding.zig");
+    _ = @import("weixin/approval_reply.zig");
     _ = @import("ai_chat_title.zig");
     _ = @import("command_registry.zig");
     _ = @import("jupyter_detect.zig");
