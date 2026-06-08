@@ -577,6 +577,9 @@ fn executeCommand(action: CommandAction) void {
                 showStatusToast(i18n.s().toast_update_skills_unavailable);
             }
         },
+        .open_skill_center => {
+            _ = AppWindow.spawnSkillCenterTab();
+        },
     }
 }
 
@@ -2347,6 +2350,25 @@ pub fn aiHistorySshConnection(identifier: []const u8) ?ssh_connection.SshConnect
     conn.password_auth = password.len > 0;
     conn.legacy_algorithms = AppWindow.g_ssh_legacy_algorithms;
     return conn;
+}
+
+/// Enumerate the saved SSH profile names (UI thread; loads the threadlocal
+/// store on demand). Returns an owned slice of owned name strings — the caller
+/// frees each name and then the slice. Used by the Skill Center to build one
+/// scan column per SSH profile. Empty/unsafe names are skipped.
+pub fn sshProfileNames(allocator: std.mem.Allocator) ![][]u8 {
+    loadSshProfiles();
+    var out: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (out.items) |n| allocator.free(n);
+        out.deinit(allocator);
+    }
+    for (0..g_ssh_profile_count) |idx| {
+        const name = profileField(&g_ssh_profiles[idx], .name);
+        if (name.len == 0) continue;
+        try out.append(allocator, try allocator.dupe(u8, name));
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 const copySshProfileField = profile_codec.copySshProfileField;
@@ -5401,6 +5423,25 @@ pub fn anyBlockingOverlayVisible() bool {
         windowCloseConfirmVisible() or
         restoreDefaultsConfirmVisible() or
         transferCancelConfirmVisible();
+}
+
+/// 脏门控用：是否有任何 overlay 时间动画处于活动状态。
+/// 与 `anyBlockingOverlayVisible`（仅模态遮挡 webview）不同 —— 这里要尽量全，
+/// 漏判会导致 overlay 动画卡住，所以宁可多列。静态打开态 overlay 不放这里；
+/// 打开/输入/关闭时已有 g_force_rebuild 触发一帧。`now` = std.time.milliTimestamp()。
+pub fn anyOverlayActive(now: i64) bool {
+    // 时间动画：到期前每帧需持续渲染
+    if (now < g_copy_toast_until_ms) return true;
+    if (now < g_transfer_toast_until_ms) return true;
+    if (now < g_update_prompt_until_ms) return true;
+    if (now < g_close_shortcut_confirm_until_ms) return true;
+    if (now < g_remote_key_copied_until_ms) return true;
+    if (now < resize.g_split_resize_overlay_until) return true;
+
+    // FPS 叠层开启时每秒刷新
+    if (g_debug_fps) return true;
+
+    return false;
 }
 
 pub fn whatsNewHandleKey(ev: input_key.KeyEvent) void {
