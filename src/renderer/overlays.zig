@@ -516,10 +516,10 @@ fn transferCancelConfirmExecuteAtForTest(xpos: f32, ypos: f32, window_width: f32
 
 fn executeCommand(action: CommandAction) void {
     switch (action) {
-        .new_tab => sessionLauncherOpen(),
+        .new_tab => sessionLauncherOpenFromCommandPalette(),
         .load_openssh_config => loadOpenSshConfigDefault(),
         .new_agent => openDefaultAgentSessionFromCommandCenter(),
-        .manage_ai_profiles => openAiList(),
+        .manage_ai_profiles => openAiListFromCommandPalette(),
         .select_agent_history => commandPaletteOpenAgentHistory(),
         .split_right => AppWindow.splitFocused(.right),
         .split_down => AppWindow.splitFocused(.down),
@@ -579,6 +579,9 @@ fn executeCommand(action: CommandAction) void {
         },
         .open_skill_center => {
             _ = AppWindow.spawnSkillCenterTab();
+        },
+        .open_port_forwarding => {
+            _ = AppWindow.spawnPortForwardingTab();
         },
     }
 }
@@ -1706,6 +1709,7 @@ const SessionLayout = struct {
 
 pub threadlocal var g_session_launcher_visible: bool = false;
 threadlocal var g_session_launcher_selected: usize = 0;
+threadlocal var g_session_launcher_return_to_command_palette: bool = false;
 threadlocal var g_ssh_list_visible: bool = false;
 threadlocal var g_ssh_form_visible: bool = false;
 threadlocal var g_ai_list_visible: bool = false;
@@ -1763,6 +1767,7 @@ fn commandCenterStateSnapshot() command_center_state.State {
         .startup_shortcuts_visible = startup_shortcuts.g_startup_shortcuts_visible,
         .session_launcher_visible = g_session_launcher_visible,
         .session_launcher_selected = g_session_launcher_selected,
+        .session_launcher_return_to_command_palette = g_session_launcher_return_to_command_palette,
         .ssh_list_visible = g_ssh_list_visible,
         .ssh_form_visible = g_ssh_form_visible,
         .ai_list_visible = g_ai_list_visible,
@@ -1789,6 +1794,7 @@ fn commandCenterStateApply(state: command_center_state.State) void {
     startup_shortcuts.g_startup_shortcuts_visible = state.startup_shortcuts_visible;
     g_session_launcher_visible = state.session_launcher_visible;
     g_session_launcher_selected = state.session_launcher_selected;
+    g_session_launcher_return_to_command_palette = state.session_launcher_return_to_command_palette;
     g_ssh_list_visible = state.ssh_list_visible;
     g_ssh_form_visible = state.ssh_form_visible;
     g_ai_list_visible = state.ai_list_visible;
@@ -1801,6 +1807,17 @@ pub fn sessionLauncherOpen() void {
     var state = commandCenterStateSnapshot();
     state.sessionLauncherOpen();
     commandCenterStateCommit(state);
+    resetSessionLauncherTransientModes();
+}
+
+pub fn sessionLauncherOpenFromCommandPalette() void {
+    var state = commandCenterStateSnapshot();
+    state.sessionLauncherOpenFromCommandPalette();
+    commandCenterStateCommit(state);
+    resetSessionLauncherTransientModes();
+}
+
+fn resetSessionLauncherTransientModes() void {
     g_ssh_list_mode = .manage;
     g_ai_list_mode = .manage;
     g_ai_history_source_selected = 0;
@@ -1810,9 +1827,34 @@ pub fn sessionLauncherClose() void {
     var state = commandCenterStateSnapshot();
     state.sessionLauncherClose();
     commandCenterStateCommit(state);
-    g_ssh_list_mode = .manage;
-    g_ai_list_mode = .manage;
-    g_ai_history_source_selected = 0;
+    resetSessionLauncherTransientModes();
+}
+
+fn sessionLauncherBackOrClose() void {
+    var state = commandCenterStateSnapshot();
+    if (!state.sessionLauncherBackToCommandPalette()) {
+        state.sessionLauncherClose();
+    }
+    commandCenterStateCommit(state);
+    resetSessionLauncherTransientModes();
+}
+
+fn sessionLauncherCancelLabel() []const u8 {
+    return if (g_session_launcher_return_to_command_palette) i18n.s().sl_back else i18n.s().sl_cancel;
+}
+
+fn markSessionLauncherReturnToCommandPalette() void {
+    g_session_launcher_return_to_command_palette = true;
+}
+
+fn openAiListFromCommandPalette() void {
+    openAiList();
+    markSessionLauncherReturnToCommandPalette();
+}
+
+fn openAiFormNewFromCommandPalette() void {
+    openAiFormNew();
+    markSessionLauncherReturnToCommandPalette();
 }
 
 pub fn sessionLauncherInsertChar(codepoint: u21) void {
@@ -1900,7 +1942,7 @@ pub fn sessionLauncherHandleKey(ev: input_key.KeyEvent) void {
             openAiHistorySourcePicker();
             return;
         }
-        cancelAiFormOrLauncher();
+        sessionLauncherBackOrClose();
         return;
     }
 
@@ -2012,7 +2054,7 @@ pub fn sessionLauncherExecuteAt(xpos: f64, ypos: f64, window_width: f32, window_
         .save => saveSshFormOnly(),
         .connect_ai => connectAiFromForm(),
         .save_ai => saveAiFormOnly(),
-        .cancel => sessionLauncherClose(),
+        .cancel => sessionLauncherBackOrClose(),
     }
     return true;
 }
@@ -2837,7 +2879,7 @@ fn openDefaultAiSession() void {
 fn openDefaultAgentSessionFromCommandCenter() void {
     loadAiProfiles();
     switch (command_center_state.resolveNewAgentLaunch(g_ai_profile_count != 0)) {
-        .open_form => openAiFormNew(),
+        .open_form => openAiFormNewFromCommandPalette(),
         .connect_default_profile_as_agent => connectAiProfileWithAgentOverride(defaultAiProfileIndex(), "true"),
     }
 }
@@ -3162,7 +3204,7 @@ fn saveAiFormOnly() void {
 }
 
 fn cancelAiFormOrLauncher() void {
-    sessionLauncherClose();
+    sessionLauncherBackOrClose();
 }
 
 fn runAiFormFocusAction() void {
@@ -3595,7 +3637,7 @@ fn sessionDesiredBoxWidth() f32 {
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ai_vision, aiVisionDisplay()));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_save_open, i18n.s().sl_v_agent));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_save, i18n.s().sl_v_profile));
-        desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_cancel, "Esc"));
+        desired = @max(desired, sessionTwoColumnWidth(sessionLauncherCancelLabel(), "Esc"));
         return desired;
     }
 
@@ -3608,7 +3650,7 @@ fn sessionDesiredBoxWidth() f32 {
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_jump_host, sshField(.proxy_jump)));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_save_connect, platform_pty_command.sshLauncherDetail()));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_save, i18n.s().sl_v_profile));
-        desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_cancel, "Esc"));
+        desired = @max(desired, sessionTwoColumnWidth(sessionLauncherCancelLabel(), "Esc"));
         return desired;
     }
 
@@ -3630,7 +3672,7 @@ fn sessionDesiredBoxWidth() f32 {
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_new_llm_provider, i18n.s().sl_v_add));
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_edit_llm_provider, if (g_ai_profile_count > 0) i18n.s().sl_v_choose else i18n.s().sl_v_no_profile));
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_delete_llm_provider, if (g_ai_profile_count > 0) i18n.s().sl_v_choose else i18n.s().sl_v_no_profile));
-                desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_cancel, "Esc"));
+                desired = @max(desired, sessionTwoColumnWidth(sessionLauncherCancelLabel(), "Esc"));
             },
             .edit_select, .delete_select => {
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_back, i18n.s().sl_v_manage));
@@ -3660,7 +3702,7 @@ fn sessionDesiredBoxWidth() f32 {
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_new_ssh_server, i18n.s().sl_v_add));
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_edit_ssh_server, if (g_ssh_profile_count > 0) i18n.s().sl_v_choose else i18n.s().sl_v_no_server));
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_delete_ssh_server, if (g_ssh_profile_count > 0) i18n.s().sl_v_choose else i18n.s().sl_v_no_server));
-                desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_cancel, "Esc"));
+                desired = @max(desired, sessionTwoColumnWidth(sessionLauncherCancelLabel(), "Esc"));
             },
             .edit_select, .delete_select => {
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_back, i18n.s().sl_v_manage));
@@ -3678,7 +3720,7 @@ fn sessionDesiredBoxWidth() f32 {
             desired = @max(desired, sessionTwoColumnWidth("WSL", "Default distro"));
         }
         desired = @max(desired, sessionTwoColumnWidth("SSH Profile...", "Choose server"));
-        desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_cancel, "Esc"));
+        desired = @max(desired, sessionTwoColumnWidth(sessionLauncherCancelLabel(), "Esc"));
         return desired;
     }
 
@@ -3936,7 +3978,7 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
             }
             renderSessionRow(layout, window_height, row, "SSH Profile...", "Choose server", g_ai_history_source_selected == row);
             row += 1;
-            renderSessionRow(layout, window_height, row, i18n.s().sl_cancel, "Esc", g_ai_history_source_selected == row);
+            renderSessionRow(layout, window_height, row, sessionLauncherCancelLabel(), "Esc", g_ai_history_source_selected == row);
             return;
         }
         if (g_ai_list_visible) {
@@ -3952,7 +3994,7 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
                     row += 1;
                     renderSessionRow(layout, window_height, row, i18n.s().sl_delete_llm_provider, if (g_ai_profile_count > 0) i18n.s().sl_v_choose else i18n.s().sl_v_no_profile, g_ai_list_selected == row);
                     row += 1;
-                    renderSessionRow(layout, window_height, row, i18n.s().sl_cancel, "Esc", g_ai_list_selected == row);
+                    renderSessionRow(layout, window_height, row, sessionLauncherCancelLabel(), "Esc", g_ai_list_selected == row);
                 },
                 .edit_select, .delete_select => {
                     renderSessionRow(layout, window_height, row, i18n.s().sl_back, i18n.s().sl_v_manage, g_ai_list_selected == row);
@@ -3979,7 +4021,7 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
                     row += 1;
                     renderSessionRow(layout, window_height, row, i18n.s().sl_delete_ssh_server, if (g_ssh_profile_count > 0) i18n.s().sl_v_choose else i18n.s().sl_v_no_server, g_ssh_list_selected == row);
                     row += 1;
-                    renderSessionRow(layout, window_height, row, i18n.s().sl_cancel, "Esc", g_ssh_list_selected == row);
+                    renderSessionRow(layout, window_height, row, sessionLauncherCancelLabel(), "Esc", g_ssh_list_selected == row);
                 },
                 .edit_select, .delete_select => {
                     renderSessionRow(layout, window_height, row, i18n.s().sl_back, i18n.s().sl_v_manage, g_ssh_list_selected == row);
@@ -4020,7 +4062,7 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
         renderAiSessionField(layout, window_height, @intFromEnum(AiField.vision), i18n.s().sl_ai_vision, aiVisionDisplay(), false);
         renderSessionRow(layout, window_height, AI_FIELD_COUNT, i18n.s().sl_save_open, i18n.s().sl_v_agent, g_ai_focus == AI_FIELD_COUNT);
         renderSessionRow(layout, window_height, AI_FIELD_COUNT + 1, i18n.s().sl_save, i18n.s().sl_v_profile, g_ai_focus == AI_FIELD_COUNT + 1);
-        renderSessionRow(layout, window_height, AI_FIELD_COUNT + 2, i18n.s().sl_cancel, "Esc", g_ai_focus == AI_FIELD_COUNT + 2);
+        renderSessionRow(layout, window_height, AI_FIELD_COUNT + 2, sessionLauncherCancelLabel(), "Esc", g_ai_focus == AI_FIELD_COUNT + 2);
         return;
     }
 
@@ -4032,7 +4074,7 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
     renderSessionField(layout, window_height, @intFromEnum(SshField.proxy_jump), i18n.s().sl_ssh_jump_host, sshField(.proxy_jump), false);
     renderSessionRow(layout, window_height, SSH_FIELD_COUNT, i18n.s().sl_save_connect, platform_pty_command.sshLauncherDetail(), g_ssh_focus == SSH_FIELD_COUNT);
     renderSessionRow(layout, window_height, SSH_FIELD_COUNT + 1, i18n.s().sl_save, i18n.s().sl_v_profile, g_ssh_focus == SSH_FIELD_COUNT + 1);
-    renderSessionRow(layout, window_height, SSH_FIELD_COUNT + 2, i18n.s().sl_cancel, "Esc", g_ssh_focus == SSH_FIELD_COUNT + 2);
+    renderSessionRow(layout, window_height, SSH_FIELD_COUNT + 2, sessionLauncherCancelLabel(), "Esc", g_ssh_focus == SSH_FIELD_COUNT + 2);
 }
 
 // ============================================================================
@@ -4055,7 +4097,7 @@ const SETTINGS_THEME_PRESETS = [_]ThemePreset{
 
 const SETTINGS_THEME_ROW = 1;
 const SETTINGS_CONTROL_ROW_START = SETTINGS_THEME_ROW + 1;
-const SETTINGS_ROW_COUNT = SETTINGS_CONTROL_ROW_START + 11;
+const SETTINGS_ROW_COUNT = SETTINGS_CONTROL_ROW_START + 12;
 
 const SettingsAction = enum {
     font_size_minus,
@@ -4070,6 +4112,7 @@ const SettingsAction = enum {
     toggle_weixin_direct,
     cycle_language,
     toggle_restore_tabs,
+    toggle_distill_suggest,
     open_raw_config,
     restore_defaults,
     close,
@@ -4212,9 +4255,10 @@ fn settingsHitTest(xpos: f64, ypos: f64, window_width: f32, window_height: f32, 
         5 => .toggle_weixin_direct,
         6 => .cycle_language,
         7 => .toggle_restore_tabs,
-        8 => .open_raw_config,
-        9 => .restore_defaults,
-        10 => .close,
+        8 => .toggle_distill_suggest,
+        9 => .open_raw_config,
+        10 => .restore_defaults,
+        11 => .close,
         else => null,
     };
 }
@@ -4243,6 +4287,7 @@ fn executeSettingsAction(action: SettingsAction) void {
         .toggle_weixin_direct => Config.setConfigValue(allocator, "weixin-direct-enabled", if (cfg.@"weixin-direct-enabled") "false" else "true") catch {},
         .cycle_language => Config.setConfigValue(allocator, "language", nextLanguageSetting(cfg.language)) catch {},
         .toggle_restore_tabs => Config.setConfigValue(allocator, "restore-tabs-on-startup", if (cfg.@"restore-tabs-on-startup") "false" else "true") catch {},
+        .toggle_distill_suggest => Config.setConfigValue(allocator, "ai-distill-suggest", if (cfg.@"ai-distill-suggest") "false" else "true") catch {},
         .open_raw_config => Config.openConfigInEditor(allocator),
         .restore_defaults => restoreDefaultsConfirmOpen(),
         .close => settingsPageClose(),
@@ -4269,9 +4314,10 @@ fn runSettingsFocusPrimary() void {
         SETTINGS_CONTROL_ROW_START + 5 => executeSettingsAction(.toggle_weixin_direct),
         SETTINGS_CONTROL_ROW_START + 6 => executeSettingsAction(.cycle_language),
         SETTINGS_CONTROL_ROW_START + 7 => executeSettingsAction(.toggle_restore_tabs),
-        SETTINGS_CONTROL_ROW_START + 8 => executeSettingsAction(.open_raw_config),
-        SETTINGS_CONTROL_ROW_START + 9 => executeSettingsAction(.restore_defaults),
-        SETTINGS_CONTROL_ROW_START + 10 => executeSettingsAction(.close),
+        SETTINGS_CONTROL_ROW_START + 8 => executeSettingsAction(.toggle_distill_suggest),
+        SETTINGS_CONTROL_ROW_START + 9 => executeSettingsAction(.open_raw_config),
+        SETTINGS_CONTROL_ROW_START + 10 => executeSettingsAction(.restore_defaults),
+        SETTINGS_CONTROL_ROW_START + 11 => executeSettingsAction(.close),
         else => {},
     }
 }
@@ -4487,9 +4533,10 @@ pub fn renderSettingsPage(window_width: f32, window_height: f32, top_offset: f32
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 5, i18n.s().settings_weixin_direct, boolText(cfg.@"weixin-direct-enabled"), "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 5);
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 6, i18n.s().settings_language, languageSettingText(cfg.language), i18n.s().settings_hint_restart, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 6);
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 7, i18n.s().settings_restore_tabs, boolText(cfg.@"restore-tabs-on-startup"), "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 7);
-    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 8, i18n.s().settings_raw_config, i18n.s().settings_value_open, i18n.s().settings_hint_advanced_editor, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 8);
-    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 9, i18n.s().settings_restore_defaults, "Enter", "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 9);
-    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 10, i18n.s().settings_close, "Esc", "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 10);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 8, i18n.s().settings_distill_suggest, boolText(cfg.@"ai-distill-suggest"), "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 8);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 9, i18n.s().settings_raw_config, i18n.s().settings_value_open, i18n.s().settings_hint_advanced_editor, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 9);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 10, i18n.s().settings_restore_defaults, "Enter", "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 10);
+    renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 11, i18n.s().settings_close, "Esc", "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 11);
 }
 
 // ============================================================================

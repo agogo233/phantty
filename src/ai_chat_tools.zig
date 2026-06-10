@@ -21,6 +21,7 @@ const SavedSshProfile = types.SavedSshProfile;
 const AgentSettings = types.AgentSettings;
 const AgentPermission = types.AgentPermission;
 const agent_detector = @import("agent_detector.zig");
+const agent_prompt_answer = @import("agent_prompt_answer.zig");
 const skill_registry = @import("skill_registry.zig");
 const wispterm_docs = @import("wispterm_docs.zig");
 const weixin_types = @import("weixin/types.zig");
@@ -32,6 +33,7 @@ const platform_agent_prompt = @import("platform/agent_prompt.zig");
 const ai_agent_access = @import("ai_agent_access.zig");
 const web_search = @import("web_search.zig");
 const web_read = @import("web_read.zig");
+const pubmed = @import("pubmed.zig");
 const agent_memory = @import("agent_memory.zig");
 
 /// Number of output lines included in a copilot context block.
@@ -93,6 +95,13 @@ pub fn executeToolCall(ctx: *ToolContext, call: ToolCall) ![]u8 {
         const code = jsonStringArg(args.value, "code") orelse return ctx.allocator.dupe(u8, "Missing code");
         const timeout_ms = jsonIntArg(args.value, "timeout_ms") orelse ctx.settings.command_timeout_ms;
         return terminalReplExecTool(ctx, surface_id, repl, code, timeout_ms);
+    }
+    if (std.mem.eql(u8, call.name, "terminal_answer_prompt")) {
+        const args = parseArgs(ctx.allocator, call.arguments) orelse return ctx.allocator.dupe(u8, "Invalid tool arguments");
+        defer args.deinit();
+        const surface_id = jsonStringArg(args.value, "surface_id");
+        const answer = jsonStringArg(args.value, "answer") orelse return ctx.allocator.dupe(u8, "Missing answer");
+        return terminalAnswerPromptTool(ctx, surface_id, answer);
     }
     if (std.mem.eql(u8, call.name, "ssh_profile_save")) {
         const args = parseArgs(ctx.allocator, call.arguments) orelse return ctx.allocator.dupe(u8, "Invalid tool arguments");
@@ -215,6 +224,13 @@ pub fn executeToolCall(ctx: *ToolContext, call: ToolCall) ![]u8 {
         defer args.deinit();
         const url = jsonStringArg(args.value, "url") orelse return ctx.allocator.dupe(u8, "Missing url");
         return webReadTool(ctx.allocator, url, ctx.settings.working_dir);
+    }
+    if (std.mem.eql(u8, call.name, "pubmed")) {
+        const args = parseArgs(ctx.allocator, call.arguments) orelse return ctx.allocator.dupe(u8, "Invalid tool arguments");
+        defer args.deinit();
+        const query = jsonStringArg(args.value, "query") orelse return ctx.allocator.dupe(u8, "Missing query");
+        const max_results = jsonIntArg(args.value, "max_results");
+        return pubMedTool(ctx.allocator, query, max_results);
     }
     if (std.mem.startsWith(u8, call.name, "memory_") and !ctx.settings.memory_enabled) {
         return ctx.allocator.dupe(u8, "Memory is disabled (ai-memory-enabled = false).");
@@ -361,6 +377,15 @@ fn webReadTool(allocator: std.mem.Allocator, target_in: []const u8, working_dir:
         return web_read.formatErrorText(allocator, err);
     defer result.deinit();
     return web_read.formatForAgent(allocator, target, &result);
+}
+
+/// Agent `pubmed` tool: NCBI PubMed search with abstracts, formatted for the model.
+fn pubMedTool(allocator: std.mem.Allocator, query: []const u8, max_results: ?u32) ![]u8 {
+    const max: usize = if (max_results) |m| @min(@max(m, 1), 20) else 10;
+    var results = pubmed.executeSearch(allocator, query, .{ .max_results = max }) catch |err|
+        return pubmed.formatErrorText(allocator, err);
+    defer results.deinit();
+    return pubmed.formatForAgent(allocator, query, results.items);
 }
 
 // ---------------------------------------------------------------------------
@@ -536,7 +561,7 @@ fn terminalSnapshotTool(ctx: *const ToolContext, surface_id: ?[]const u8) ![]u8 
         if (surface_id) |sid| return allocNoSurfaceError(ctx.allocator, snapshot, sid);
         try out.appendSlice(ctx.allocator, "No matching terminal surface.");
     }
-    return truncateOwned(ctx.allocator, ctx.settings, try out.toOwnedSlice(ctx.allocator));
+    return truncateTailOwned(ctx.allocator, ctx.settings, try out.toOwnedSlice(ctx.allocator));
 }
 
 fn terminalSelectTool(ctx: *ToolContext, surface_id: []const u8) ![]u8 {
@@ -1109,7 +1134,7 @@ fn sendControlKey(ctx: *const ToolContext, host: ToolHost, surface: ToolSurface,
         return std.fmt.allocPrint(ctx.allocator, "Sent {s}; failed to read terminal snapshot.", .{label});
     defer ctx.allocator.free(latest);
     const out = try std.fmt.allocPrint(ctx.allocator, "Sent {s} to terminal.\nLatest snapshot:\n{s}", .{ label, latest });
-    return truncateOwned(ctx.allocator, ctx.settings, out);
+    return truncateTailOwned(ctx.allocator, ctx.settings, out);
 }
 
 fn terminalReplExecTool(ctx: *ToolContext, surface_id: []const u8, repl_name: []const u8, code: []const u8, timeout_ms: u32) ![]u8 {
@@ -1143,11 +1168,99 @@ fn terminalReplExecTool(ctx: *ToolContext, surface_id: []const u8, repl_name: []
     }
 
     return switch (repl) {
-        .r => rSessionEvalTool(ctx, host, surface, code, timeout_ms),
-        .python => pythonSessionEvalTool(ctx, host, surface, code, timeout_ms),
+        .r, .python, .plain => lineReplEvalTool(ctx, host, surface, repl, code, timeout_ms),
         .codex, .claude_code => plainReplInputTool(ctx, host, surface, repl, code, timeout_ms),
-        .plain => plainReplInputTool(ctx, host, surface, repl, code, timeout_ms),
     };
+}
+
+fn allocPromptOptionsHint(allocator: std.mem.Allocator, options: []const agent_prompt_answer.Option, screen: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "Could not map that answer to an on-screen option. Options:\n");
+    for (options) |o| {
+        try out.print(allocator, "  {d}. {s}{s}\n", .{ o.number, o.label, if (o.highlighted) " [highlighted]" else "" });
+    }
+    try out.appendSlice(allocator, "Pass answer as an explicit digit (e.g. \"1\"), or approve/approve_all/reject.\nLatest snapshot:\n");
+    try out.appendSlice(allocator, screen);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Answer a Claude Code / Codex approval menu: read the live screen, confirm a
+/// prompt is awaiting input, map the semantic `answer` to a keystroke, send it,
+/// and return the resulting live screen. Never sends a key it cannot justify
+/// from the on-screen options.
+fn terminalAnswerPromptTool(ctx: *ToolContext, surface_id: ?[]const u8, answer: []const u8) ![]u8 {
+    if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
+
+    const intent = agent_prompt_answer.parseIntent(answer) orelse
+        return std.fmt.allocPrint(ctx.allocator, "Unknown answer \"{s}\". Use approve, approve_all, reject, enter, esc, or a digit 1-9.", .{answer});
+    const option_number: u8 = if (intent == .option) (agent_prompt_answer.parseOptionNumber(answer) orelse 0) else 0;
+
+    const snapshot = collectToolSnapshot(ctx) catch return ctx.allocator.dupe(u8, "No terminal snapshot host is available.");
+    defer snapshot.deinit(ctx.allocator);
+    const host = ctx.tool_host orelse return ctx.allocator.dupe(u8, "No terminal tool host is available.");
+    const sid = surface_id orelse "focused";
+    const surface = resolveSurfaceId(snapshot, sid, selectedWriteContext(ctx)) orelse return allocNoSurfaceError(ctx.allocator, snapshot, sid);
+
+    // Read the LIVE screen (per-surface, mutex-protected, worker-safe).
+    const screen = host.surfaceSnapshot(host.ctx, ctx.allocator, surface.ptr) catch
+        return ctx.allocator.dupe(u8, "Failed to read terminal snapshot.");
+    defer ctx.allocator.free(screen);
+
+    const detection = agent_detector.detect(surface.title, screen);
+    if (detection.app == .none or (detection.state != .waiting_approval and detection.state != .needs_input)) {
+        const out = try std.fmt.allocPrint(
+            ctx.allocator,
+            "No Claude Code/Codex prompt is awaiting an answer (agent={s}:{s}). Nothing sent.\nLatest snapshot:\n{s}",
+            .{ detection.app.label(), detection.state.label(), screen },
+        );
+        return truncateTailOwned(ctx.allocator, ctx.settings, out);
+    }
+
+    var options_buf: [12]agent_prompt_answer.Option = undefined;
+    const n = agent_prompt_answer.parsePromptOptions(screen, &options_buf);
+    const keystroke = agent_prompt_answer.resolveAnswer(options_buf[0..n], screen, intent, option_number) orelse {
+        const out = try allocPromptOptionsHint(ctx.allocator, options_buf[0..n], screen);
+        return truncateTailOwned(ctx.allocator, ctx.settings, out);
+    };
+
+    // Approval gate mirrors terminal_repl_exec: the payload is a single selector
+    // key, not a destructive command, so auto runs it and confirm prompts. Note
+    // the gate sees only the keystroke, not the command the agent app would run
+    // on confirmation — like terminal_repl_exec control keys, the app's own
+    // approval prompt is the real boundary for that command.
+    const gate = accessGate(ctx, keystroke.bytes, null);
+    if (approvalRequiredForGate(ctx.settings.permission, gate)) {
+        if (!ctx.requestApproval("terminal_answer_prompt", answer, "Answer a Claude Code/Codex approval prompt")) {
+            return deniedResult(ctx.allocator, answer, "operator rejected prompt answer");
+        }
+    }
+
+    // Bind the agent write context to the resolved surface we are answering on
+    // (mirrors terminal_select). This is the explicitly-targeted prompt surface,
+    // so it is safe — and it avoids ensureWriteContext refusing when nothing is
+    // pre-selected (e.g. a non-copilot caller).
+    setWriteContext(ctx, surface.id);
+
+    if (!host.writeSurface(host.ctx, surface.ptr, keystroke.bytes)) {
+        return ctx.allocator.dupe(u8, "Failed to write to terminal surface.");
+    }
+    if (keystroke.confirm_enter) {
+        std.Thread.sleep(CODEX_SUBMIT_DELAY_MS * std.time.ns_per_ms);
+        _ = host.writeSurface(host.ctx, surface.ptr, "\r");
+    }
+
+    const deadline = std.time.milliTimestamp() + 400;
+    while (std.time.milliTimestamp() < deadline) {
+        if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+
+    const latest = host.surfaceSnapshot(host.ctx, ctx.allocator, surface.ptr) catch
+        return std.fmt.allocPrint(ctx.allocator, "Answer sent ({s}); failed to read terminal snapshot.", .{answer});
+    defer ctx.allocator.free(latest);
+    const out = try std.fmt.allocPrint(ctx.allocator, "Answered prompt ({s}).\nLatest snapshot:\n{s}", .{ answer, latest });
+    return truncateTailOwned(ctx.allocator, ctx.settings, out);
 }
 
 /// Pause between writing a Codex message body and its submit keystroke so the
@@ -1168,6 +1281,9 @@ pub fn allocPlainReplInput(allocator: std.mem.Allocator, repl: ReplKind, surface
 }
 
 pub fn plainReplInputTool(ctx: *const ToolContext, host: ToolHost, surface: ToolSurface, repl: ReplKind, text: []const u8, timeout_ms: u32) ![]u8 {
+    // Line REPLs (.r/.python/.plain) go through lineReplEvalTool instead; this
+    // tool is only for the agent TUIs, whose completion is judged by busy markers.
+    std.debug.assert(repl == .codex or repl == .claude_code);
     if (repl == .codex) {
         // Codex's TUI treats a fast input burst as a paste and folds a trailing
         // Enter into the pasted text, leaving a literal newline that never
@@ -1189,19 +1305,9 @@ pub fn plainReplInputTool(ctx: *const ToolContext, host: ToolHost, surface: Tool
         }
     }
 
-    if (repl == .codex or repl == .claude_code) {
-        return waitForAgentAppReplResult(ctx, host, surface, repl, timeout_ms);
-    }
-
-    const wait_ms = @min(@max(timeout_ms, 500), 5000);
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(wait_ms));
-    while (std.time.milliTimestamp() < deadline) {
-        if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-    }
-
-    const latest = host.surfaceSnapshot(host.ctx, ctx.allocator, surface.ptr) catch return ctx.allocator.dupe(u8, "Input sent; failed to read terminal snapshot.");
-    return truncateOwned(ctx.allocator, ctx.settings, latest);
+    // Only Codex / Claude Code reach this tool now (line REPLs use
+    // lineReplEvalTool); both settle on the busy-marker-aware waiter.
+    return waitForAgentAppReplResult(ctx, host, surface, repl, timeout_ms);
 }
 
 fn replSnapshotLooksBusy(repl: ReplKind, snapshot: []const u8) bool {
@@ -1244,7 +1350,7 @@ fn allocAgentAppReplResult(
         .{ repl.label(), note, app.label(), state.label(), confidence },
     );
     try out.appendSlice(allocator, snapshot);
-    return truncateOwned(allocator, settings, try out.toOwnedSlice(allocator));
+    return truncateTailOwned(allocator, settings, try out.toOwnedSlice(allocator));
 }
 
 fn waitForAgentAppReplResult(ctx: *const ToolContext, host: ToolHost, surface: ToolSurface, repl: ReplKind, timeout_ms: u32) ![]u8 {
@@ -1315,82 +1421,120 @@ fn waitForAgentAppReplResult(ctx: *const ToolContext, host: ToolHost, surface: T
     );
 }
 
-fn rSessionEvalTool(ctx: *const ToolContext, host: ToolHost, surface: ToolSurface, code: []const u8, timeout_ms: u32) ![]u8 {
-    const nonce = std.time.milliTimestamp();
-    const code_literal = try rStringLiteral(ctx.allocator, code);
-    defer ctx.allocator.free(code_literal);
+/// Run code in a line-oriented REPL (Python, R, Node, IPython, Julia, psql, ...)
+/// the way a human does: capture the current prompt, type the raw code + Enter,
+/// then wait until the screen settles back at a ready prompt. No sentinel wrapper
+/// is injected, so the REPL echoes the user's code verbatim and the value of a
+/// bare expression (e.g. `1+1`) is displayed normally. Errors appear as the REPL's
+/// native traceback in the returned snapshot; there is no synthetic status code.
+fn lineReplEvalTool(ctx: *const ToolContext, host: ToolHost, surface: ToolSurface, repl: ReplKind, code: []const u8, timeout_ms: u32) ![]u8 {
+    // Learn the prompt currently shown so we can recognise its return. Read the
+    // live per-surface snapshot (collectSnapshot is empty on the worker thread).
+    const before = host.surfaceSnapshot(host.ctx, ctx.allocator, surface.ptr) catch
+        try ctx.allocator.dupe(u8, surface.snapshot);
+    defer ctx.allocator.free(before);
+    const captured_prompt = try ctx.allocator.dupe(u8, extractPromptLine(before));
+    defer ctx.allocator.free(captured_prompt);
 
-    const wrapped = try std.fmt.allocPrint(
-        ctx.allocator,
-        "cat(\"\\n__WISPTERM_AGENT_START_{d}__\\n\", sep=\"\")\n.wispterm_agent_status <- 0L\n.wispterm_agent_code <- {s}\ntryCatch({{\n  eval(parse(text=.wispterm_agent_code), envir=.GlobalEnv)\n}}, error=function(e) {{\n  .wispterm_agent_status <<- 1L\n  message(\"Error: \", conditionMessage(e))\n}})\ncat(\"\\n__WISPTERM_AGENT_END_{d}__:\", .wispterm_agent_status, \"\\n\", sep=\"\")\nrm(.wispterm_agent_status, .wispterm_agent_code)\r",
-        .{ nonce, code_literal, nonce },
-    );
-    defer ctx.allocator.free(wrapped);
-
-    if (!host.writeSurface(host.ctx, surface.ptr, wrapped)) {
-        return ctx.allocator.dupe(u8, "Failed to write to R terminal surface.");
+    const input = try allocPlainReplInput(ctx.allocator, repl, surface, code);
+    defer ctx.allocator.free(input);
+    if (!host.writeSurface(host.ctx, surface.ptr, input)) {
+        return ctx.allocator.dupe(u8, "Failed to write to terminal surface.");
     }
 
-    const start_marker = try std.fmt.allocPrint(ctx.allocator, "__WISPTERM_AGENT_START_{d}__", .{nonce});
-    defer ctx.allocator.free(start_marker);
-    const end_marker = try std.fmt.allocPrint(ctx.allocator, "__WISPTERM_AGENT_END_{d}__", .{nonce});
-    defer ctx.allocator.free(end_marker);
-    return waitForSentinelResult(ctx, host, surface, "R", start_marker, end_marker, timeout_ms);
+    return waitForReplPromptReturn(ctx, host, surface, repl, captured_prompt, timeout_ms);
 }
 
-fn pythonSessionEvalTool(ctx: *const ToolContext, host: ToolHost, surface: ToolSurface, code: []const u8, timeout_ms: u32) ![]u8 {
-    const nonce = std.time.milliTimestamp();
-    const code_literal = try pythonStringLiteral(ctx.allocator, code);
-    defer ctx.allocator.free(code_literal);
+/// Poll the live per-surface snapshot until the screen has been unchanged for
+/// `quiet_ms` (after a `min_wait_ms` floor) AND a ready prompt has returned, then
+/// hand back the screen. On timeout, return the latest screen tagged as still in
+/// progress so the model does not treat a partial result as final.
+fn waitForReplPromptReturn(
+    ctx: *const ToolContext,
+    host: ToolHost,
+    surface: ToolSurface,
+    repl: ReplKind,
+    captured_prompt: []const u8,
+    timeout_ms: u32,
+) ![]u8 {
+    const wait_ms = @max(timeout_ms, 1000);
+    // Line REPLs respond faster than the agent TUIs (waitForAgentAppReplResult
+    // uses 1500/750), so settle a bit sooner. The min_wait_ms floor also defends
+    // against returning before the typed input has echoed and reset the screen.
+    const quiet_ms: i64 = 1000;
+    const min_wait_ms: i64 = 500;
+    const started = std.time.milliTimestamp();
+    const deadline = started + @as(i64, @intCast(wait_ms));
 
-    const wrapper = try std.fmt.allocPrint(
-        ctx.allocator,
-        "print(\"\\\\n__WISPTERM_AGENT_START_{d}__\")\n__wispterm_agent_status = 0\n__wispterm_agent_code = {s}\ntry:\n    exec(__wispterm_agent_code, globals())\nexcept Exception:\n    __wispterm_agent_status = 1\n    import traceback\n    traceback.print_exc()\nprint(\"\\\\n__WISPTERM_AGENT_END_{d}__:%s\" % __wispterm_agent_status)\ndel __wispterm_agent_status, __wispterm_agent_code",
-        .{ nonce, code_literal, nonce },
-    );
-    defer ctx.allocator.free(wrapper);
+    var last_text = host.surfaceSnapshot(host.ctx, ctx.allocator, surface.ptr) catch
+        try ctx.allocator.dupe(u8, surface.snapshot);
+    defer ctx.allocator.free(last_text);
+    var last_change_ms = started;
 
-    const wrapper_literal = try pythonStringLiteral(ctx.allocator, wrapper);
-    defer ctx.allocator.free(wrapper_literal);
-    const wrapped = try std.fmt.allocPrint(ctx.allocator, "exec({s})\r", .{wrapper_literal});
-    defer ctx.allocator.free(wrapped);
+    while (std.time.milliTimestamp() < deadline) {
+        if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
+        std.Thread.sleep(150 * std.time.ns_per_ms);
+        const now = std.time.milliTimestamp();
 
-    if (!host.writeSurface(host.ctx, surface.ptr, wrapped)) {
-        return ctx.allocator.dupe(u8, "Failed to write to Python terminal surface.");
-    }
+        const text = host.surfaceSnapshot(host.ctx, ctx.allocator, surface.ptr) catch continue;
+        if (std.mem.eql(u8, last_text, text)) {
+            ctx.allocator.free(text);
+        } else {
+            ctx.allocator.free(last_text);
+            last_text = text;
+            last_change_ms = now;
+        }
 
-    const start_marker = try std.fmt.allocPrint(ctx.allocator, "__WISPTERM_AGENT_START_{d}__", .{nonce});
-    defer ctx.allocator.free(start_marker);
-    const end_marker = try std.fmt.allocPrint(ctx.allocator, "__WISPTERM_AGENT_END_{d}__", .{nonce});
-    defer ctx.allocator.free(end_marker);
-    return waitForSentinelResult(ctx, host, surface, "Python", start_marker, end_marker, timeout_ms);
-}
-
-pub fn rStringLiteral(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    return doubleQuotedStringLiteral(allocator, text);
-}
-
-pub fn pythonStringLiteral(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    return doubleQuotedStringLiteral(allocator, text);
-}
-
-fn doubleQuotedStringLiteral(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    try out.append(allocator, '"');
-    for (text) |ch| {
-        switch (ch) {
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, ch),
+        const quiesced = now - started >= min_wait_ms and now - last_change_ms >= quiet_ms;
+        if (quiesced and promptReturned(last_text, captured_prompt)) {
+            return truncateOwned(ctx.allocator, ctx.settings, try ctx.allocator.dupe(u8, last_text));
         }
     }
-    try out.append(allocator, '"');
-    return out.toOwnedSlice(allocator);
+
+    const note = try std.fmt.allocPrint(
+        ctx.allocator,
+        "\n[{s} REPL still busy after {d} ms; treat this as in progress, not a final result]",
+        .{ repl.label(), wait_ms },
+    );
+    defer ctx.allocator.free(note);
+    const combined = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ last_text, note });
+    return truncateOwned(ctx.allocator, ctx.settings, combined);
+}
+
+/// The trailing prompt of a terminal snapshot: the last non-empty line, trimmed
+/// of surrounding whitespace. Returns "" when no non-empty line exists. Used to
+/// learn a REPL's prompt dynamically so completion detection is language-agnostic.
+fn extractPromptLine(snapshot: []const u8) []const u8 {
+    var it = std.mem.splitBackwardsScalar(u8, snapshot, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len != 0) return trimmed;
+    }
+    return "";
+}
+
+/// Heuristic: does a trailing line look like an interactive REPL prompt waiting
+/// for input? True for `>>>`, `>`, `In [3]:`, `julia>`, `dbname=#`, `$`, ... .
+/// Conservative on length so long output lines are not mistaken for a prompt.
+/// This is only the *fallback* signal; an exact match against the prompt captured
+/// before typing (see `promptReturned`) is the primary, precise signal.
+fn looksLikeReadyPrompt(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len > 64) return false;
+    return switch (trimmed[trimmed.len - 1]) {
+        '>', ':', '$', '#' => true,
+        else => false,
+    };
+}
+
+/// True when the snapshot's trailing line shows the REPL is back at a ready
+/// prompt: it equals the prompt captured before we typed, or it matches the
+/// generic ready-prompt heuristic. The exact match handles prompts that stayed
+/// the same; the heuristic handles prompts that changed (e.g. `$ ` -> `>>> `).
+fn promptReturned(snapshot: []const u8, captured_prompt: []const u8) bool {
+    const line = extractPromptLine(snapshot);
+    if (captured_prompt.len != 0 and std.mem.eql(u8, line, captured_prompt)) return true;
+    return looksLikeReadyPrompt(line);
 }
 
 const AGENT_START_PREFIX = "__WISPTERM_AGENT_START_";
@@ -2322,6 +2466,19 @@ fn truncateOwned(allocator: std.mem.Allocator, settings: AgentSettings, text: []
     return truncated;
 }
 
+/// Like truncateOwned, but keeps the LAST `limit` bytes (the most recent
+/// output) and marks the dropped head. Use for terminal-snapshot-bearing
+/// results, where the live interactive screen is at the tail — keeping the head
+/// would hide the current prompt.
+fn truncateTailOwned(allocator: std.mem.Allocator, settings: AgentSettings, text: []u8) ![]u8 {
+    const limit: usize = settings.output_limit;
+    if (text.len <= limit) return text;
+    const tail = text[text.len - limit ..];
+    const truncated = try std.fmt.allocPrint(allocator, "...[older output truncated to {d} bytes]\n{s}", .{ limit, tail });
+    allocator.free(text);
+    return truncated;
+}
+
 pub const DANGEROUS_COMMAND_APPROVAL_REASON = "Destructive command (delete/rename/format) - confirm to run";
 
 /// Whether a command is destructive enough to require operator approval in
@@ -2887,12 +3044,31 @@ test "shell exec refuses bare REPL launchers but allows run-and-exit invocations
     }
 }
 
-test "ai chat R string literal escapes code for REPL eval" {
-    const allocator = std.testing.allocator;
-    const literal = try rStringLiteral(allocator, "print(\"hello\")\npath <- \"C:\\\\tmp\"");
-    defer allocator.free(literal);
+test "extractPromptLine returns the trailing non-empty prompt line" {
+    try std.testing.expectEqualStrings(">>>", extractPromptLine("hello\nworld\n>>> "));
+    try std.testing.expectEqualStrings("In [3]:", extractPromptLine("Out[2]: 5\n\nIn [3]: "));
+    try std.testing.expectEqualStrings("julia>", extractPromptLine("julia> "));
+    try std.testing.expectEqualStrings("", extractPromptLine("\n  \n"));
+    try std.testing.expectEqualStrings("", extractPromptLine(""));
+}
 
-    try std.testing.expectEqualStrings("\"print(\\\"hello\\\")\\npath <- \\\"C:\\\\\\\\tmp\\\"\"", literal);
+test "looksLikeReadyPrompt accepts prompts and rejects output" {
+    try std.testing.expect(looksLikeReadyPrompt(">>>"));
+    try std.testing.expect(looksLikeReadyPrompt(">"));
+    try std.testing.expect(looksLikeReadyPrompt("In [3]:"));
+    try std.testing.expect(looksLikeReadyPrompt("julia>"));
+    try std.testing.expect(looksLikeReadyPrompt("dbname=#"));
+    try std.testing.expect(looksLikeReadyPrompt("$"));
+    try std.testing.expect(!looksLikeReadyPrompt(""));
+    try std.testing.expect(!looksLikeReadyPrompt("2"));
+    try std.testing.expect(!looksLikeReadyPrompt("TypeError: unsupported operand"));
+    try std.testing.expect(!looksLikeReadyPrompt("this is a very long line of output that should not be treated as a prompt at all"));
+}
+
+test "promptReturned matches the captured prompt or a generic prompt" {
+    try std.testing.expect(promptReturned("foo\n>>> ", ">>>"));
+    try std.testing.expect(promptReturned("$ python\nPython 3.12\n>>> ", "$"));
+    try std.testing.expect(!promptReturned("computing...\n42", ">>>"));
 }
 
 test "ai chat REPL kind parses Python Codex and Claude Code aliases" {
@@ -2969,12 +3145,42 @@ test "codex repl input submits the Enter keystroke separately from the message b
     try std.testing.expectEqualStrings("hello codex\r", host_ctx.all_writes[0..host_ctx.all_len]);
 }
 
-test "ai chat Python string literal escapes code for REPL eval" {
+test "line REPL eval types raw code and settles on the returned prompt" {
     const allocator = std.testing.allocator;
-    const literal = try pythonStringLiteral(allocator, "print(\"hello\")\npath = \"C:\\\\tmp\"");
-    defer allocator.free(literal);
+    var host_ctx = ReplWaitTestHost.Ctx{ .busy_until = 2, .settled_text = ">>> 1+1\n2\n>>> " };
+    var dummy: u8 = 0;
+    const ctx = ToolContext{
+        .allocator = allocator,
+        .ctx = &dummy,
+        .tool_host = ReplWaitTestHost.host(&host_ctx),
+        .tool_snapshot = null,
+        .settings = .{},
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    const surface = ToolSurface{
+        .id = @constCast("surface-py"),
+        .title = @constCast("python"),
+        .cwd = @constCast("/home/xzg"),
+        .snapshot = @constCast(">>> "),
+        .tab_index = 0,
+        .focused = true,
+        .is_ssh = false,
+        .is_wsl = false,
+        .agent_app = .none,
+        .agent_state = .none,
+        .agent_confidence = 0,
+        .ptr = @ptrCast(&host_ctx),
+    };
 
-    try std.testing.expectEqualStrings("\"print(\\\"hello\\\")\\npath = \\\"C:\\\\\\\\tmp\\\"\"", literal);
+    const result = try lineReplEvalTool(&ctx, ReplWaitTestHost.host(&host_ctx), surface, .python, "1+1", 5000);
+    defer allocator.free(result);
+
+    // Raw code typed (code + Enter), NOT an exec()-wrapped sentinel blob.
+    try std.testing.expectEqualStrings("1+1\r", host_ctx.all_writes[0..host_ctx.all_len]);
+    try std.testing.expect(std.mem.indexOf(u8, result, "__WISPTERM_AGENT_START_") == null);
+    // The REPL's own output is handed back for the model to read.
+    try std.testing.expect(std.mem.indexOf(u8, result, "2") != null);
 }
 
 test "agent control-key tokens parse to raw bytes, plain text is unaffected" {
@@ -3755,4 +3961,178 @@ test "executeToolCall reports memory disabled when ai-memory-enabled is off" {
     });
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "disabled") != null);
+}
+
+test "truncateTailOwned keeps the tail and marks the dropped head" {
+    const a = std.testing.allocator;
+    const settings = AgentSettings{ .output_limit = 8 };
+    const text = try a.dupe(u8, "ABCDEFGHIJKLMNOP"); // 16 bytes, limit 8
+    const out = try truncateTailOwned(a, settings, text);
+    defer a.free(out);
+    try std.testing.expect(std.mem.endsWith(u8, out, "IJKLMNOP"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "older output truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ABCD") == null);
+}
+
+test "truncateTailOwned returns short text unchanged" {
+    const a = std.testing.allocator;
+    const settings = AgentSettings{ .output_limit = 1024 };
+    const text = try a.dupe(u8, "small");
+    const out = try truncateTailOwned(a, settings, text);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("small", out);
+}
+
+test "terminal_snapshot keeps the live screen tail when output exceeds the limit" {
+    const a = std.testing.allocator;
+    // A long screen whose only prompt marker is at the very bottom.
+    var big: std.ArrayListUnmanaged(u8) = .empty;
+    defer big.deinit(a);
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) try big.appendSlice(a, "old scrollback line\n");
+    try big.appendSlice(a, "Do you want to proceed? PROMPT_AT_BOTTOM");
+
+    var host_ctx = ReplWaitTestHost.Ctx{ .busy_until = 0, .settled_text = big.items };
+    var dummy: u8 = 0;
+
+    const surfaces = try a.alloc(ToolSurface, 1);
+    surfaces[0] = .{
+        .id = @constCast("surface-claude"),
+        .title = @constCast("Claude Code"),
+        .cwd = @constCast("/home/xzg"),
+        .snapshot = @constCast(""),
+        .tab_index = 0,
+        .focused = true,
+        .is_ssh = false,
+        .is_wsl = false,
+        .agent_app = .claude_code,
+        .agent_state = .waiting_approval,
+        .agent_confidence = 90,
+        .ptr = @ptrCast(&host_ctx),
+    };
+    var ctx = ToolContext{
+        .allocator = a,
+        .ctx = &dummy,
+        .tool_host = ReplWaitTestHost.host(&host_ctx),
+        .tool_snapshot = .{ .surfaces = surfaces, .active_tab = 0 },
+        .settings = .{ .output_limit = 4096 },
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    // Free only the slice we allocated; the surface string fields are literals,
+    // so do NOT call snap.deinit (it would free static memory). The tool operates
+    // on a clone internally, so the literal-backed originals are never freed.
+    defer if (ctx.tool_snapshot) |snap| a.free(snap.surfaces);
+
+    const result = try terminalSnapshotTool(&ctx, @as(?[]const u8, "surface-claude"));
+    defer a.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "PROMPT_AT_BOTTOM") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "older output truncated") != null);
+}
+
+test "terminal_answer_prompt sends the Yes digit for an approve answer" {
+    const a = std.testing.allocator;
+    const screen =
+        \\Do you want to make this edit to index.html?
+        \\  1. Yes
+        \\  2. Yes, allow all edits during this session (shift+tab)
+        \\  3. No
+    ;
+    var host_ctx = ReplWaitTestHost.Ctx{ .busy_until = 0, .settled_text = screen };
+    var dummy: u8 = 0;
+
+    const surfaces = try a.alloc(ToolSurface, 1);
+    surfaces[0] = .{
+        .id = @constCast("surface-claude"),
+        .title = @constCast("Claude Code"),
+        .cwd = @constCast("/home/xzg"),
+        .snapshot = @constCast(""),
+        .tab_index = 0,
+        .focused = true,
+        .is_ssh = false,
+        .is_wsl = false,
+        .agent_app = .claude_code,
+        .agent_state = .waiting_approval,
+        .agent_confidence = 90,
+        .ptr = @ptrCast(&host_ctx),
+    };
+    var ctx = ToolContext{
+        .allocator = a,
+        .ctx = &dummy,
+        .tool_host = ReplWaitTestHost.host(&host_ctx),
+        .tool_snapshot = .{ .surfaces = surfaces, .active_tab = 0 },
+        .settings = .{ .permission = .full },
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    // Free only the slice we allocated; the surface string fields are literals,
+    // so do NOT call snap.deinit (it would free static memory). The tool operates
+    // on a clone internally, so the literal-backed originals are never freed.
+    defer if (ctx.tool_snapshot) |snap| a.free(snap.surfaces);
+
+    const result = try terminalAnswerPromptTool(&ctx, @as(?[]const u8, "surface-claude"), "approve");
+    defer a.free(result);
+
+    try std.testing.expectEqualStrings("1", host_ctx.all_writes[0..host_ctx.all_len]);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Answered prompt") != null);
+}
+
+test "terminal_answer_prompt sends nothing when no prompt is awaiting" {
+    const a = std.testing.allocator;
+    var host_ctx = ReplWaitTestHost.Ctx{ .busy_until = 0, .settled_text = "Claude Code\nthinking… (esc to interrupt)" };
+    var dummy: u8 = 0;
+
+    const surfaces = try a.alloc(ToolSurface, 1);
+    surfaces[0] = .{
+        .id = @constCast("surface-claude"),
+        .title = @constCast("Claude Code"),
+        .cwd = @constCast("/home/xzg"),
+        .snapshot = @constCast(""),
+        .tab_index = 0,
+        .focused = true,
+        .is_ssh = false,
+        .is_wsl = false,
+        .agent_app = .claude_code,
+        .agent_state = .running,
+        .agent_confidence = 82,
+        .ptr = @ptrCast(&host_ctx),
+    };
+    var ctx = ToolContext{
+        .allocator = a,
+        .ctx = &dummy,
+        .tool_host = ReplWaitTestHost.host(&host_ctx),
+        .tool_snapshot = .{ .surfaces = surfaces, .active_tab = 0 },
+        .settings = .{ .permission = .full },
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    defer if (ctx.tool_snapshot) |snap| a.free(snap.surfaces);
+
+    const result = try terminalAnswerPromptTool(&ctx, @as(?[]const u8, "surface-claude"), "approve");
+    defer a.free(result);
+
+    try std.testing.expectEqual(@as(usize, 0), host_ctx.all_len);
+    try std.testing.expect(std.mem.indexOf(u8, result, "awaiting an answer") != null);
+}
+
+test "executeToolCall pubmed reports missing query" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    var ctx = ToolContext{
+        .allocator = a,
+        .ctx = &dummy,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .settings = .{},
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    const out = try executeToolCall(&ctx, .{
+        .id = @constCast("1"),
+        .name = @constCast("pubmed"),
+        .arguments = @constCast("{}"),
+    });
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Missing query") != null);
 }
