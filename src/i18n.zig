@@ -58,6 +58,7 @@ pub const Strings = struct {
     pf_title: []const u8,
     pf_detail: []const u8,
     pf_legend: []const u8,
+    pf_form_legend: []const u8,
 
     // —— Skill Center 面板 ——
     sc_local: []const u8,
@@ -247,6 +248,7 @@ const en = Strings{
     .pf_title = "Port Forwarding",
     .pf_detail = "Manage SSH port forwarding rules",
     .pf_legend = "[n] new   [e] edit   [space] start/stop   [r] restart   [a] auto   [d] delete   [esc] close/cancel",
+    .pf_form_legend = "[up/down] move   [left/right/space] change   [enter] save   [esc] cancel",
 
     .sc_local = "Local",
     .sc_scanning = "No skills found. Scanning…",
@@ -430,6 +432,7 @@ const zh_CN = Strings{
     .pf_title = "端口转发",
     .pf_detail = "管理 SSH 端口转发规则",
     .pf_legend = "[n] 新建   [e] 编辑   [space] 启停   [r] 重启   [a] 自动启动   [d] 删除   [esc] 关闭/取消",
+    .pf_form_legend = "[上/下] 切换字段   [左/右 或 空格] 切换选项   [enter] 保存   [esc] 取消",
 
     .sc_local = "本地",
     .sc_scanning = "未发现技能，扫描中…",
@@ -713,6 +716,7 @@ pub fn commandTitle(action: CommandAction) ?[]const u8 {
         .update_skills => "更新技能",
         .open_skill_center => "技能中心",
         .open_port_forwarding => "端口转发",
+        .split_preview => "分屏预览",
     };
 }
 
@@ -762,6 +766,7 @@ pub fn commandDetail(action: CommandAction) ?[]const u8 {
         .update_skills => "从 GitHub 下载最新技能",
         .open_skill_center => "盘点各服务器上的 Claude Code / Codex 技能",
         .open_port_forwarding => "管理 SSH 端口转发规则",
+        .split_preview => "在右侧打开预览面板",
     };
 }
 
