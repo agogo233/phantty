@@ -42,6 +42,7 @@ const Config = @import("config.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("split_tree.zig");
 const PreviewPane = @import("preview_pane.zig");
+const PreviewImageDrag = @import("input/preview_image_drag.zig");
 const selection_unit = @import("selection_unit.zig");
 const Selection = Surface.Selection;
 const CellPos = struct { col: usize, row: usize };
@@ -54,6 +55,7 @@ const ls_path_context = @import("input/ls_path_context.zig");
 const terminal_link_action = @import("input/terminal_link_action.zig");
 const underline_span = @import("input/underline_span.zig");
 const mouse_report = @import("input/mouse_report.zig");
+const mouse_wheel_scroll = @import("input/mouse_wheel_scroll.zig");
 const close_confirm = @import("close_confirm.zig");
 const jupyter_picker = @import("jupyter_picker.zig");
 const jupyter_detect = @import("jupyter_detect.zig");
@@ -305,6 +307,83 @@ test "input: port forwarding arrow navigation requests a repaint" {
     try std.testing.expect(!AppWindow.g_cells_valid);
 }
 
+test "input: terminal viewport mouse wheel scroll requests a repaint" {
+    const allocator = std.testing.allocator;
+    const ghostty_vt = @import("ghostty-vt");
+    const renderer = @import("renderer.zig");
+
+    const previous_tabs = tab.g_tabs;
+    const previous_count = tab.g_tab_count;
+    const previous_active = active_tab_state.g_active_tab;
+    const previous_sidebar = tab.g_sidebar_visible;
+    const previous_split_rect_count = split_layout.g_split_rect_count;
+    const previous_file_visible = file_explorer.g_visible;
+    const previous_file_owner = file_explorer.g_owner_tab;
+    const previous_browser_visible = browser_panel.g_visible;
+    const previous_browser_owner = browser_panel.g_owner_tab;
+    const previous_selecting = g_selecting;
+    const previous_whats_new_visible = overlays.whatsNewVisible();
+    defer {
+        tab.g_tabs = previous_tabs;
+        tab.g_tab_count = previous_count;
+        active_tab_state.g_active_tab = previous_active;
+        tab.g_sidebar_visible = previous_sidebar;
+        split_layout.g_split_rect_count = previous_split_rect_count;
+        file_explorer.g_visible = previous_file_visible;
+        file_explorer.g_owner_tab = previous_file_owner;
+        browser_panel.g_visible = previous_browser_visible;
+        browser_panel.g_owner_tab = previous_browser_owner;
+        g_selecting = previous_selecting;
+        if (previous_whats_new_visible) overlays.showWhatsNew() else overlays.hideWhatsNew();
+    }
+
+    var surface: Surface = undefined;
+    surface.terminal = try ghostty_vt.Terminal.init(allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback = 1024,
+        .default_modes = .{ .grapheme_cluster = true },
+    });
+    defer surface.terminal.deinit(allocator);
+    surface.render_state = renderer.State.init(&surface.terminal);
+    surface.selection = .{};
+    surface.ref_count = 1;
+    surface.scrollbar_opacity = 0;
+    surface.scrollbar_show_time = 0;
+
+    var tab_state = tab.TabState{
+        .kind = .terminal,
+        .tree = try SplitTree.init(allocator, &surface),
+        .focused = .root,
+        .ai_chat_session = null,
+        .ai_history_session = null,
+        .skill_center_session = null,
+        .port_forwarding_session = null,
+        .copilot_session = null,
+        .copilot_visible = false,
+    };
+    defer tab_state.tree.deinit();
+
+    tab.g_tabs = .{null} ** tab.MAX_TABS;
+    tab.g_tabs[0] = &tab_state;
+    tab.g_tab_count = 1;
+    active_tab_state.g_active_tab = 0;
+    tab.g_sidebar_visible = false;
+    split_layout.g_split_rect_count = 0;
+    file_explorer.g_visible = false;
+    browser_panel.g_visible = false;
+    g_selecting = false;
+    overlays.hideWhatsNew();
+
+    AppWindow.g_force_rebuild = false;
+    AppWindow.g_cells_valid = true;
+
+    handleMouseWheel(.{ .delta = 120, .xpos = 20, .ypos = 40 });
+
+    try std.testing.expect(AppWindow.g_force_rebuild);
+    try std.testing.expect(!AppWindow.g_cells_valid);
+}
+
 test "input: port forwarding form left/right arrows toggle Direction and request a repaint" {
     const allocator = std.testing.allocator;
     AppWindow.setSshHostsContentForTest("");
@@ -534,6 +613,11 @@ pub threadlocal var g_panel_swap_source: ?SplitTree.Node.Handle = null;
 pub threadlocal var g_panel_swap_target: ?SplitTree.Node.Handle = null;
 threadlocal var g_panel_swap_start_x: f64 = 0;
 threadlocal var g_panel_swap_start_y: f64 = 0;
+
+// Left-drag pan of a ready image preview pane (the pane-world successor of the
+// old right-dock image drag). All state and the drag-lifetime pane ref live in
+// the tested state machine; input.zig only routes press/move/release into it.
+threadlocal var g_preview_image_drag: PreviewImageDrag = .{};
 threadlocal var g_scrollbar_drag_surface: ?*Surface = null;
 threadlocal var g_scrollbar_drag_view_y: f32 = 0;
 threadlocal var g_scrollbar_drag_view_h: f32 = 0;
@@ -686,6 +770,7 @@ pub fn cancelTransientMouseState(win: anytype) void {
     g_selecting = false;
     plus_btn_pressed = false;
     tab.g_tab_close_pressed = null;
+    releasePreviewImageDrag();
     resetPanelSwapState();
     resetSidebarTabDragState();
     overlays.scrollbar.g_scrollbar_dragging = false;
@@ -831,10 +916,10 @@ fn closeAiCopilotPanel() void {
 }
 
 pub fn closePanelOrTab() void {
-    // A preview pane closes first, mirroring the old right-dock behavior:
-    // opening a preview keeps the terminal focused, so without this the
-    // shortcut would close the focused terminal instead of the preview.
-    if (AppWindow.closeActivePreviewPane()) return;
+    // Close the FOCUSED pane, preview or terminal alike — click a preview (or
+    // Ctrl+1-9) to select it, then Ctrl+Shift+W closes it. The browser panel
+    // still closes first: it is an unfocusable side dock, so this shortcut is
+    // its only keyboard close.
     if (browser_panel.isVisibleForActiveTab()) {
         closeBrowserPanel();
         return;
@@ -1100,6 +1185,12 @@ fn resetPanelSwapState() void {
     g_panel_swap_target = null;
     g_panel_swap_start_x = 0;
     g_panel_swap_start_y = 0;
+}
+
+/// End an image-preview pan drag, dropping the drag's pane reference.
+fn releasePreviewImageDrag() void {
+    const gpa = AppWindow.g_allocator orelse return; // drag only starts when set
+    g_preview_image_drag.release(gpa);
 }
 
 /// Begin a potential Alt-drag panel swap if the active terminal tab is split and
@@ -3228,7 +3319,7 @@ fn openPreviewAsync(kind: markdown_preview.Kind, title: []const u8, path: []cons
 
     const t = tab.activeTab() orelse return false;
     const gpa = AppWindow.g_allocator orelse return false;
-    const pane: *PreviewPane = if (tab.firstPreviewForReuse(gpa, t)) |h|
+    const pane: *PreviewPane = if (tab.previewForReuse(gpa, t, kind)) |h|
         switch (t.tree.nodes[h.idx()]) {
             .leaf => |pn| switch (pn) {
                 .preview => |p| p,
@@ -3237,7 +3328,7 @@ fn openPreviewAsync(kind: markdown_preview.Kind, title: []const u8, path: []cons
             .split => return false,
         }
     else
-        (tab.splitIntoPreview(gpa) orelse return false);
+        (tab.splitIntoPreviewStacked(gpa) orelse return false);
     if (!pane.beginAsyncLoad(kind, title, path, source_kind)) {
         file_explorer.setTransferStatus(.failed, "Preview failed");
         return true;
@@ -3252,7 +3343,7 @@ fn openPreviewNew(kind: markdown_preview.Kind, title: []const u8, path: []const 
     defer perf.end();
 
     const gpa = AppWindow.g_allocator orelse return false;
-    const pane = tab.splitIntoPreview(gpa) orelse return false;
+    const pane = tab.splitIntoPreviewStacked(gpa) orelse return false;
     if (!pane.beginAsyncLoad(kind, title, path, source_kind)) {
         file_explorer.setTransferStatus(.failed, "Preview failed");
         return true;
@@ -4069,14 +4160,19 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             // route there) and consumes the event — previews have no terminal
             // grid to select into. Terminal leaves fall through to the surface
             // focus + selection path below, so non-preview clicks are unchanged.
+            // A ready image preview additionally starts a drag-to-pan.
             if (split_layout.paneAtPoint(ev.x, ev.y)) |hit| {
                 switch (hit.pane) {
-                    .preview => {
+                    .preview => |p| {
                         const tb = AppWindow.activeTab() orelse return;
                         if (tb.focused != hit.handle) {
                             tb.focused = hit.handle;
                             AppWindow.g_force_rebuild = true;
                             AppWindow.g_cells_valid = false;
+                        }
+                        if (AppWindow.g_allocator) |gpa| {
+                            if (g_preview_image_drag.begin(gpa, p, xpos, ypos))
+                                platform_cursor.set(.size_all);
                         }
                         return;
                     },
@@ -4148,6 +4244,11 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             }
         } else {
             // Mouse up
+            if (g_preview_image_drag.active()) {
+                releasePreviewImageDrag();
+                platform_cursor.set(.arrow);
+                return;
+            }
             overlays.scrollbar.g_scrollbar_dragging = false;
             g_scrollbar_drag_surface = null;
             g_ai_input_scroll_dragging = false;
@@ -4436,6 +4537,13 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
     if (g_ai_transcript_selecting) {
         if (g_ai_transcript_select_chat) |chat| updateAiTranscriptSelectionDrag(chat, xpos, ypos);
         platform_cursor.set(.ibeam);
+        return;
+    }
+    // Left-drag pans a ready image preview (the renderer clamps the pan to the
+    // image's overflow each frame).
+    if (g_preview_image_drag.active()) {
+        if (g_preview_image_drag.move(xpos, ypos)) AppWindow.g_force_rebuild = true;
+        platform_cursor.set(.size_all);
         return;
     }
     // Alt-drag panel swap: track the drop target / dim the source. Owns the move
@@ -5006,6 +5114,10 @@ fn handleMouseWheel(ev: platform_input.MouseWheelEvent) void {
         const notches = @as(f64, @floatFromInt(ev.delta)) / 120.0;
         const delta: isize = @intFromFloat(-notches * 3);
         surface.terminal.scrollViewport(.{ .delta = delta });
+        if (mouse_wheel_scroll.repaintFlagsForViewportScroll(delta)) |flags| {
+            AppWindow.g_force_rebuild = flags.force_rebuild;
+            AppWindow.g_cells_valid = flags.cells_valid;
+        }
 
         // Show scrollbar for the scrolled surface
         surface.scrollbar_opacity = 1.0;

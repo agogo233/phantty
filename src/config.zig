@@ -22,6 +22,7 @@ const builtin = @import("builtin");
 const ai_agent_config = @import("ai_agent_config.zig");
 const keybind = @import("keybind.zig");
 const link_open = @import("link_open.zig");
+const console_host_policy = @import("platform/console_host_policy.zig");
 const platform_dirs = @import("platform/dirs.zig");
 const platform_editor = @import("platform/editor.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
@@ -319,6 +320,13 @@ theme: ?[]const u8 = null,
 /// `$webread` (r.jina.ai). Optional for `$webread` (anonymous read works). Empty = unset.
 @"jina-api-key": []const u8 = "",
 
+/// Which Windows pseudo console host services terminal sessions: `auto`
+/// prefers a bundled modern ConPTY (conpty.dll + OpenConsole.exe next to
+/// wispterm.exe, shipped in the portable-compat package) with fallback to
+/// the OS inbox implementation; `system` always uses the inbox one.
+/// Ignored on non-Windows platforms.
+@"windows-conpty": console_host_policy.Preference = .auto,
+
 /// The shell to run in the terminal. Platform aliases are resolved by
 /// platform/pty_command.zig; any other value is treated as a raw command path.
 shell: []const u8 = platform_pty_command.default_shell_name,
@@ -327,6 +335,10 @@ shell: []const u8 = platform_pty_command.default_shell_name,
 /// remote auto-open, and the "New Agent" command. Empty falls back to the
 /// first saved profile.
 @"ai-default-profile": []const u8 = "",
+
+/// Name of the saved AI profile the Copilot `subagent` tool runs on. Empty =
+/// the subagent uses the main conversation's profile.
+@"ai-subagent-profile": []const u8 = "",
 
 /// UI language. auto follows the system locale. Restart required.
 language: i18n.LanguageSetting = .auto,
@@ -385,8 +397,12 @@ language: i18n.LanguageSetting = .auto,
 /// SwapBuffers (Windows only). The legacy BLT present goes through the DWM
 /// redirection surface, which on some iGPU drivers (Intel Arc, AMD) produces
 /// ghosting/black regions on cross-DPI drags and resizes (#46/#47/#88). Set to
-/// false to force the legacy path; machines where DXGI/interop is unavailable
-/// fall back automatically. Read at startup.
+/// false to force the legacy path. Machines where the D3D path can't work
+/// revert to the legacy path automatically: at init (no interop / no DXGI
+/// adapter matching the GL context's GPU), at runtime (first-frames content
+/// probe + sustained-slow-present watchdog, both latch GDI for the session),
+/// and across launches (a bring-up that crashed the process trips a
+/// state-file fuse for that app version). Read at startup.
 @"wispterm-d3d-present": bool = true,
 
 // ============================================================================
@@ -858,10 +874,18 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
         self.@"ai-agent-working-dir" = self.dupeString(allocator, value) orelse return;
     } else if (std.mem.eql(u8, key, "jina-api-key")) {
         self.@"jina-api-key" = self.dupeString(allocator, value) orelse return;
+    } else if (std.mem.eql(u8, key, "windows-conpty")) {
+        if (console_host_policy.parsePreference(value)) |pref| {
+            self.@"windows-conpty" = pref;
+        } else {
+            log.warn("invalid windows-conpty: {s}", .{value});
+        }
     } else if (std.mem.eql(u8, key, "shell")) {
         self.shell = self.dupeString(allocator, value) orelse return;
     } else if (std.mem.eql(u8, key, "ai-default-profile")) {
         self.@"ai-default-profile" = self.dupeString(allocator, value) orelse return;
+    } else if (std.mem.eql(u8, key, "ai-subagent-profile")) {
+        self.@"ai-subagent-profile" = self.dupeString(allocator, value) orelse return;
     } else if (std.mem.eql(u8, key, "remote-enabled")) {
         if (std.mem.eql(u8, value, "true")) {
             self.@"remote-enabled" = true;
@@ -1334,6 +1358,7 @@ pub fn writeHelp(writer: anytype) !void {
         \\  --ai-agent-output-limit <bytes> Max bytes returned by each tool
         \\  --ai-agent-working-dir <path> Default working directory for agent local commands
         \\  --jina-api-key <key>         API key for Jina web search/read ($websearch, $webread)
+        \\  --windows-conpty <mode>      Windows pseudo console host: auto | system
         \\  --auto-update-check <bool>  Check GitHub Releases after startup
         \\  --config-file <path>         Include another config file (prefix ? for optional)
         \\  --keybind <binding>          Configure a shortcut, e.g. global:ctrl+backquote=toggle_quake
@@ -1584,6 +1609,7 @@ pub const settings_reset_keys = [_][]const u8{
     "focus-follows-mouse",
     "shell",
     "ai-default-profile",
+    "ai-subagent-profile",
     "weixin-direct-enabled",
     "language",
     "restore-tabs-on-startup",
@@ -1704,6 +1730,10 @@ const default_config_template =
     \\# Jina API key — used by $websearch / websearch and $webread / webread
     \\# (optional for $webread: r.jina.ai reads anonymously)
     \\# jina-api-key =
+    \\
+    \\# Windows pseudo console host: auto prefers a bundled conpty.dll +
+    \\# OpenConsole.exe next to wispterm.exe; system forces the OS inbox one
+    \\# windows-conpty = auto
     \\
     \\# Updates
     \\# auto-update-check = true
@@ -2088,6 +2118,15 @@ test "config: ai-default-profile parses" {
     try std.testing.expectEqualStrings("GPT-4o", cfg.@"ai-default-profile");
 }
 
+test "config: ai-subagent-profile parses" {
+    const allocator = std.testing.allocator;
+    var cfg: Config = .{};
+    defer cfg.deinit(allocator);
+    try std.testing.expectEqualStrings("", cfg.@"ai-subagent-profile");
+    cfg.applyKeyValue(allocator, "ai-subagent-profile", "cheap-fast", ".");
+    try std.testing.expectEqualStrings("cheap-fast", cfg.@"ai-subagent-profile");
+}
+
 test "config: language parses auto/en/zh-CN and rejects invalid" {
     const allocator = std.testing.allocator;
     var cfg = Config{};
@@ -2132,6 +2171,17 @@ test "config: jina-api-key parses from a config line" {
     defer cfg.deinit(allocator);
     cfg.applyKeyValue(allocator, "jina-api-key", "jina_abc", ".");
     try std.testing.expectEqualStrings("jina_abc", cfg.@"jina-api-key");
+}
+
+test "config: windows-conpty parses and rejects invalid values" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{};
+    defer cfg.deinit(allocator);
+    try std.testing.expectEqual(console_host_policy.Preference.auto, cfg.@"windows-conpty");
+    cfg.applyKeyValue(allocator, "windows-conpty", "system", ".");
+    try std.testing.expectEqual(console_host_policy.Preference.system, cfg.@"windows-conpty");
+    cfg.applyKeyValue(allocator, "windows-conpty", "bundled-only", ".");
+    try std.testing.expectEqual(console_host_policy.Preference.system, cfg.@"windows-conpty");
 }
 
 test "ai-memory-enabled parses true/false" {

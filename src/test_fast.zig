@@ -23,6 +23,7 @@ test {
     _ = @import("input/command_dispatch.zig");
     _ = @import("input/click_tracker.zig");
     _ = @import("input/hit_test.zig");
+    _ = @import("input/mouse_wheel_scroll.zig");
     _ = @import("input/mouse_report.zig");
     _ = @import("input/preview_path.zig");
     _ = @import("input/ls_path_context.zig");
@@ -41,6 +42,7 @@ test {
     _ = @import("command_center_state.zig");
     _ = @import("platform/window_state_codec.zig");
     _ = @import("platform/dxgi_core.zig");
+    _ = @import("platform/console_host_policy.zig");
     _ = @import("whats_new_gate.zig");
     _ = @import("startup_tabs.zig");
     _ = @import("config.zig");
@@ -115,6 +117,7 @@ test {
     _ = @import("ai_sidebar.zig");
     _ = @import("appwindow/flush_scheduler.zig");
     _ = @import("appwindow/resize_throttle.zig");
+    _ = @import("termio/read_coalesce.zig");
     _ = @import("ai_chat_protocol.zig");
     _ = @import("weixin/types.zig");
     _ = @import("weixin/ilink_codec.zig");

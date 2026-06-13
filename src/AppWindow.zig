@@ -192,7 +192,10 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
         .distill_suggest_enabled = app.ai_distill_suggest,
     });
     ai_chat.setDefaultWorkingDir(app.ai_agent_working_dir);
+    overlays.setSubagentProfileName(app.ai_subagent_profile);
+    ai_chat.setSubagentProfileResolver(overlays.resolveSubagentProfileOverride);
     @import("web_search.zig").setJinaApiKey(app.jina_api_key);
+    @import("pty.zig").setConsoleHostPreference(app.console_host_preference);
     // Copy shell command from App
     @memcpy(tab.g_shell_cmd_buf[0..app.shell_cmd_len], app.shell_cmd_buf[0..app.shell_cmd_len]);
     tab.g_shell_cmd_buf[app.shell_cmd_len] = 0;
@@ -3488,21 +3491,6 @@ pub fn splitFocusedReturningSurface(direction: SplitTree.Split.Direction) ?*Surf
     return surface;
 }
 
-/// Close the active tab's preview pane if it has one (the focused preview, else
-/// the first in reading order), keeping the focused terminal focused. Returns
-/// false when there is no preview pane — or the preview is the tab's only pane —
-/// so the caller falls through to the standard split/tab close path. This is the
-/// pane-world successor of the right-dock close that Ctrl+Shift+W used to do
-/// first: opening a preview deliberately keeps the terminal focused, so a plain
-/// focused-split close would silently kill the terminal instead.
-pub fn closeActivePreviewPane() bool {
-    const allocator = g_allocator orelse return false;
-    if (!tab.closePreviewPane(allocator)) return false;
-    handleActiveSurfaceChangeWithinTab();
-    requestImmediateLayoutResize();
-    return true;
-}
-
 pub fn closeFocusedSplit() void {
     const allocator = g_allocator orelse return;
     const closing_tab_idx = active_tab_state.g_active_tab;
@@ -3588,6 +3576,11 @@ pub threadlocal var term_rows: u16 = 24;
 // Dirty tracking — skip rebuildCells when nothing changed
 pub threadlocal var g_cells_valid: bool = false;
 pub threadlocal var g_force_rebuild: bool = true;
+/// One-shot per window thread: the first present that returns settles the
+/// D3D bring-up crash fuse (the process survived presenter bring-up, so the
+/// "probing" state-file marker can be removed). No-op off-Windows and when
+/// no marker exists.
+threadlocal var g_present_bringup_settled: bool = false;
 
 pub threadlocal var window_focused: bool = true; // Track window focus state
 
@@ -3976,7 +3969,7 @@ fn pollSkillUpdate(app: *App) void {
 /// Open a SKILL.md preview in a reused-or-new preview leaf. UI thread.
 fn openSkillMdInPreviewLeaf(allocator: std.mem.Allocator, title: []const u8, content: []const u8) void {
     const at = tab.activeTab() orelse return;
-    const pane = if (tab.firstPreviewForReuse(allocator, at)) |h|
+    const pane = if (tab.previewForReuse(allocator, at, .markdown)) |h|
         switch (at.tree.nodes[h.idx()]) {
             .leaf => |pn| switch (pn) {
                 .preview => |p| p,
@@ -3985,7 +3978,7 @@ fn openSkillMdInPreviewLeaf(allocator: std.mem.Allocator, title: []const u8, con
             .split => return,
         }
     else
-        (tab.splitIntoPreview(allocator) orelse return);
+        (tab.splitIntoPreviewStacked(allocator) orelse return);
     pane.open(.markdown, title, "SKILL.md", content);
 }
 
@@ -4081,7 +4074,9 @@ fn applyReloadedConfig(allocator: std.mem.Allocator, cfg: *const Config) void {
         .distill_suggest_enabled = cfg.@"ai-distill-suggest",
     });
     ai_chat.setDefaultWorkingDir(cfg.@"ai-agent-working-dir");
+    overlays.setSubagentProfileName(cfg.@"ai-subagent-profile");
     @import("web_search.zig").setJinaApiKey(cfg.@"jina-api-key");
+    @import("pty.zig").setConsoleHostPreference(cfg.@"windows-conpty");
 
     if (g_window == null) return;
     g_quake_mode = cfg.@"quake-mode";
@@ -4719,6 +4714,7 @@ const WeixinRequest = struct {
     out_surface_id: [16]u8 = [_]u8{0} ** 16,
     open_result: weixin_control.OpenResult = .failed,
     sent: bool = false,
+    busy: bool = false, // send_input: AI chat rejected the prompt (request inflight)
     transcript: []u8 = &.{},
     dir: []u8 = &.{}, // inbound_file_dir (heap, page_allocator)
 };
@@ -4804,7 +4800,7 @@ fn handleWeixinControlRequest(req: *WeixinRequest) void {
                 if (tab_state.kind != .ai_chat) return;
                 const session = tab_state.ai_chat_session orelse return;
                 if (req.reply_context) |ctx| {
-                    session.applyWeixinInput(req.bytes, ctx);
+                    req.busy = !session.applyWeixinInput(req.bytes, ctx);
                 } else {
                     session.applyRemoteInput(req.bytes);
                 }
@@ -4894,10 +4890,10 @@ fn wxOpenAiAgent(_: *anyopaque, _: u32) weixin_control.OpenResult {
     return req.open_result;
 }
 
-fn wxSendInput(_: *anyopaque, surface_id: [16]u8, bytes: []const u8, reply_context: ?weixin_types.ReplyContext) bool {
+fn wxSendInput(_: *anyopaque, surface_id: [16]u8, bytes: []const u8, reply_context: ?weixin_types.ReplyContext) weixin_control.SendResult {
     var req = WeixinRequest{ .op = .send_input, .surface_id = surface_id, .bytes = bytes, .reply_context = reply_context };
-    if (!weixinDispatch(&req)) return false;
-    return req.sent;
+    if (!weixinDispatch(&req) or !req.sent) return .offline;
+    return if (req.busy) .busy else .ok;
 }
 
 fn wxTranscript(_: *anyopaque) []const u8 {
@@ -7130,10 +7126,35 @@ fn runMainLoop(self: *AppWindow) !void {
         forceOpaqueBackbufferForPresent();
         gpu.state.endFrame();
         window_backend.swapBuffers(win);
+        if (!g_present_bringup_settled) {
+            g_present_bringup_settled = true;
+            platform_window_state.settleD3dBringup(allocator);
+        }
         recordFrameLatencyIfInputDriven();
         clearVisibleSurfaceDirty();
         g_force_rebuild = false;
         g_cells_valid = true;
+        if (window_backend.takePresentFallbackEvent(win)) {
+            // The DXGI present path was just latched off mid-session. While
+            // it was broken the GPU may have dropped glyph-atlas uploads
+            // (device reset / stalled context), leaving every glyph first
+            // seen during that window permanently blank — rebuild the atlas
+            // and re-render everything on the GDI path.
+            font.clearGlyphCache(allocator);
+            g_force_rebuild = true;
+            g_cells_valid = false;
+            // The in-session GDI switch is best-effort only: this HWND has
+            // already flip-presented, and blt presents on such a window are
+            // undefined (often blank). Persist the marker so the next launch
+            // of this version runs GDI from frame 0, which always works.
+            platform_window_state.blockD3dBringup(allocator, build_options.app_version);
+        }
+        if (window_backend.takePresentDegradedEvent(win)) {
+            // Watchdog: presents are sustained-slow but frames do reach the
+            // screen, so the session keeps the flip path (switching would
+            // blank the window). Next launch goes straight to GDI instead.
+            platform_window_state.blockD3dBringup(allocator, build_options.app_version);
+        }
     }
 
     // Save window position + size for next session
