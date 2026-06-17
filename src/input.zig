@@ -14,13 +14,16 @@ const font = AppWindow.font;
 const overlays = AppWindow.overlays;
 const split_layout = AppWindow.split_layout;
 const file_explorer = AppWindow.file_explorer;
+const file_backend = @import("file_backend.zig");
 const markdown_preview = @import("markdown_preview.zig");
 const markdown_preview_panel = AppWindow.markdown_preview_panel;
+const preview_gallery = @import("preview_gallery.zig");
 const preview_token = @import("preview_token.zig");
 const browser_panel = AppWindow.browser_panel;
 const html_server = @import("html_server.zig");
 const html_server_model = @import("html_server_model.zig");
 const ai_sidebar = @import("ai_sidebar.zig");
+const copilot_hint_gate = @import("copilot_hint_gate.zig");
 const ui_perf = AppWindow.ui_perf;
 const render_diagnostics = @import("render_diagnostics.zig");
 const link_open = @import("link_open.zig");
@@ -148,6 +151,84 @@ test "input: command palette shortcut toggles command center" {
 test "input: browser toolbar has a refresh action entrypoint" {
     const info = @typeInfo(@TypeOf(refreshBrowserPanel)).@"fn";
     try std.testing.expectEqual(@as(usize, 0), info.params.len);
+}
+
+test "input: preview gallery neighbor opens next raster sibling" {
+    const gpa = std.testing.allocator;
+    const prev_allocator = AppWindow.g_allocator;
+    defer AppWindow.g_allocator = prev_allocator;
+    AppWindow.g_allocator = gpa;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.png", .data = "a" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.pdf", .data = "b" });
+    try tmp.dir.writeFile(.{ .sub_path = "c.jpg", .data = "c" });
+
+    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root);
+    const current_path = try std.fs.path.join(gpa, &.{ root, "b.pdf" });
+    defer gpa.free(current_path);
+    const next_path = try std.fs.path.join(gpa, &.{ root, "c.jpg" });
+    defer gpa.free(next_path);
+
+    var pane = try PreviewPane.create(gpa);
+    defer pane.unref(gpa);
+    pane.open(.pdf, "b.pdf", current_path, "current");
+
+    AppWindow.g_force_rebuild = false;
+    AppWindow.g_cells_valid = true;
+    try std.testing.expect(openPreviewGalleryNeighbor(pane, true));
+    try std.testing.expectEqualStrings("c.jpg", pane.title());
+    try std.testing.expectEqualStrings(next_path, pane.path());
+    try std.testing.expect(AppWindow.g_force_rebuild);
+    try std.testing.expect(!AppWindow.g_cells_valid);
+}
+
+test "input: focused preview ignores shift-modified navigation keys" {
+    const gpa = std.testing.allocator;
+    const prev_allocator = AppWindow.g_allocator;
+    const previous_tabs = tab.g_tabs;
+    const previous_count = tab.g_tab_count;
+    const previous_active = active_tab_state.g_active_tab;
+    const previous_force_rebuild = AppWindow.g_force_rebuild;
+    const previous_cells_valid = AppWindow.g_cells_valid;
+
+    var pane = try PreviewPane.create(gpa);
+    defer pane.unref(gpa);
+    pane.open(.image, "a.png", "a.png", "current");
+
+    var tab_state = tab.TabState{
+        .tree = try SplitTree.initPane(gpa, .{ .preview = pane }),
+    };
+    defer tab_state.tree.deinit();
+
+    AppWindow.g_allocator = gpa;
+    tab.g_tabs = .{null} ** tab.MAX_TABS;
+    tab.g_tabs[0] = &tab_state;
+    tab.g_tab_count = 1;
+    active_tab_state.g_active_tab = 0;
+    defer {
+        AppWindow.g_allocator = prev_allocator;
+        tab.g_tabs = previous_tabs;
+        tab.g_tab_count = previous_count;
+        active_tab_state.g_active_tab = previous_active;
+        AppWindow.g_force_rebuild = previous_force_rebuild;
+        AppWindow.g_cells_valid = previous_cells_valid;
+    }
+
+    AppWindow.g_force_rebuild = false;
+    AppWindow.g_cells_valid = true;
+    handleKey(.{
+        .key_code = platform_input.key_right,
+        .ctrl = false,
+        .shift = true,
+        .alt = false,
+        .super = false,
+    });
+
+    try std.testing.expect(!AppWindow.g_force_rebuild);
+    try std.testing.expect(AppWindow.g_cells_valid);
 }
 
 // Regression: the event-driven render loop (PR #168) only paints a frame when
@@ -598,6 +679,10 @@ const TokenAtCell = struct {
 pub const SPLIT_DIVIDER_HIT_WIDTH: f32 = 8; // Larger hit area for easier grabbing
 
 pub threadlocal var g_divider_hover: bool = false; // Mouse is over a divider
+// Handle of the preview pane whose close (×) button the mouse is currently
+// hovering, or null. The renderer brightens that pane's button; updated on
+// mouse-move. Just a hover hint — clicks are hit-tested independently.
+pub threadlocal var g_preview_close_hover: ?SplitTree.Node.Handle = null;
 pub threadlocal var g_divider_dragging: bool = false; // Currently dragging a divider
 pub threadlocal var g_divider_drag_handle: ?SplitTree.Node.Handle = null; // Handle of the split node being resized
 pub threadlocal var g_divider_drag_layout: ?SplitTree.Split.Layout = null; // horizontal or vertical
@@ -631,8 +716,8 @@ threadlocal var g_ai_transcript_scroll_drag_offset: f32 = 0;
 threadlocal var g_ai_transcript_selecting: bool = false;
 threadlocal var g_ai_transcript_select_chat: ?*AppWindow.ai_chat.Session = null;
 threadlocal var g_ai_transcript_select_auto_copy: bool = false;
-threadlocal var g_ai_history_suppress_refresh_char: bool = false;
 threadlocal var g_port_forwarding_suppress_command_char: ?u21 = null;
+threadlocal var g_skill_center_suppress_command_char: ?u21 = null;
 pub threadlocal var g_sidebar_resize_hover: bool = false; // Mouse is over the sidebar resize edge
 pub threadlocal var g_sidebar_resize_dragging: bool = false; // Currently dragging the sidebar edge
 pub threadlocal var g_explorer_resize_hover: bool = false; // Mouse is over the file explorer resize edge
@@ -916,36 +1001,72 @@ fn closeAiCopilotPanel() void {
 }
 
 pub fn closePanelOrTab() void {
-    // Close the FOCUSED pane, preview or terminal alike — click a preview (or
-    // Ctrl+1-9) to select it, then Ctrl+Shift+W closes it. The browser panel
-    // still closes first: it is an unfocusable side dock, so this shortcut is
-    // its only keyboard close.
-    if (browser_panel.isVisibleForActiveTab()) {
-        closeBrowserPanel();
-        return;
-    }
-    if (close_confirm.shouldConfirm(AppWindow.g_confirm_close_running_program, AppWindow.activeSurfaceHasRunningProgram())) {
-        g_close_shortcut_confirm_until_ms = 0;
-        overlays.closeConfirmOpen(.focused_split, .running_program);
-        AppWindow.g_force_rebuild = true;
-        AppWindow.g_cells_valid = false;
-        return;
-    }
-    if (AppWindow.closeFocusedSplitWouldCloseWindow()) {
-        const now = std.time.milliTimestamp();
-        if (now < g_close_shortcut_confirm_until_ms) {
+    // Close the FOCUSED pane. A preview pane closes on one press; a terminal pane is
+    // guarded by a confirm so a stray Ctrl+Shift+W can't drop the terminal you are
+    // typing in (focus stays on the terminal after a preview opens). The browser
+    // panel still closes first: it is an unfocusable side dock, so this shortcut is
+    // its only keyboard close. Priority order lives in close_confirm.decideClose.
+    switch (close_confirm.decideClose(.{
+        .browser_visible = browser_panel.isVisibleForActiveTab(),
+        .confirm_running_enabled = AppWindow.g_confirm_close_running_program,
+        .has_running_program = AppWindow.activeSurfaceHasRunningProgram(),
+        .would_close_window = AppWindow.closeFocusedSplitWouldCloseWindow(),
+        .focused_is_terminal = AppWindow.focusedPaneIsTerminal(),
+    })) {
+        .close_browser => closeBrowserPanel(),
+        .confirm_running_program => {
+            g_close_shortcut_confirm_until_ms = 0;
+            overlays.closeConfirmOpen(.focused_split, .running_program);
+            AppWindow.g_force_rebuild = true;
+            AppWindow.g_cells_valid = false;
+        },
+        .window_press_again => {
+            const now = std.time.milliTimestamp();
+            if (now < g_close_shortcut_confirm_until_ms) {
+                g_close_shortcut_confirm_until_ms = 0;
+                AppWindow.closeFocusedSplit();
+                return;
+            }
+            g_close_shortcut_confirm_until_ms = now + CLOSE_SHORTCUT_CONFIRM_MS;
+            overlays.showCloseShortcutConfirm(CLOSE_SHORTCUT_CONFIRM_MS);
+            AppWindow.g_force_rebuild = true;
+            AppWindow.g_cells_valid = false;
+        },
+        .confirm_terminal => {
+            g_close_shortcut_confirm_until_ms = 0;
+            overlays.closeConfirmOpen(.focused_split, .terminal_split);
+            AppWindow.g_force_rebuild = true;
+            AppWindow.g_cells_valid = false;
+        },
+        .close_now => {
             g_close_shortcut_confirm_until_ms = 0;
             AppWindow.closeFocusedSplit();
-            return;
-        }
-        g_close_shortcut_confirm_until_ms = now + CLOSE_SHORTCUT_CONFIRM_MS;
-        overlays.showCloseShortcutConfirm(CLOSE_SHORTCUT_CONFIRM_MS);
-        AppWindow.g_force_rebuild = true;
-        AppWindow.g_cells_valid = false;
-        return;
+        },
     }
-    g_close_shortcut_confirm_until_ms = 0;
+}
+
+/// Close a specific preview pane by handle (the preview's × button). Focuses
+/// the pane, then reuses the standard close-split path, which removes it and
+/// refocuses the surviving terminal. Defensive: a no-op unless `handle` is still
+/// a live preview leaf (the tree may reshape between the cached rect and the
+/// click). Closing a preview never closes the window or hits a running program,
+/// so the close-shortcut/running-program confirmations are intentionally skipped.
+fn closePreviewPaneByHandle(handle: SplitTree.Node.Handle) void {
+    const tb = AppWindow.activeTab() orelse return;
+    if (tb.kind != .terminal) return;
+    if (handle.idx() >= tb.tree.nodes.len) return;
+    switch (tb.tree.nodes[handle.idx()]) {
+        .leaf => |pane| switch (pane) {
+            .preview => {},
+            else => return,
+        },
+        .split => return,
+    }
+    g_preview_close_hover = null;
+    tb.focused = handle;
     AppWindow.closeFocusedSplit();
+    AppWindow.g_force_rebuild = true;
+    AppWindow.g_cells_valid = false;
 }
 
 /// Close a tab via a pointer gesture (middle-click or the × button), honoring
@@ -1287,17 +1408,13 @@ pub fn processEvents(win: anytype) void {
 fn processKeyAndCharEvents(win: anytype) void {
     while (true) {
         var did_anything = false;
-        var handled_key = false;
         if (window_backend.popKeyEvent(win)) |ev| {
             handleKey(ev);
             did_anything = true;
-            handled_key = true;
         }
         if (window_backend.popCharEvent(win)) |ev| {
             handleChar(ev);
             did_anything = true;
-        } else if (handled_key) {
-            g_ai_history_suppress_refresh_char = false;
         }
         if (!did_anything) break;
         // Stamp the input→present latency clock on every handled key/char so the
@@ -1396,13 +1513,22 @@ fn handleChar(ev: platform_input.CharEvent) void {
         return;
     }
     if (AppWindow.activeAiHistory() != null) {
-        if (g_ai_history_suppress_refresh_char) {
-            const suppress = !ev.ctrl and !ev.alt and !ev.super and ev.codepoint == 'r';
-            g_ai_history_suppress_refresh_char = false;
+        // aiHistoryInsertCodepoint only consumes the codepoint while the Search box
+        // owns focus, so 'r'/Space type into the query there yet stay free to act as
+        // Scan/Preview shortcuts when another panel is focused.
+        if (!ev.ctrl and !ev.alt and !ev.super) {
+            _ = AppWindow.aiHistoryInsertCodepoint(ev.codepoint);
+        }
+        return;
+    }
+    if (AppWindow.activeSkillCenter() != null) {
+        if (g_skill_center_suppress_command_char) |codepoint| {
+            const suppress = !ev.ctrl and !ev.alt and !ev.super and ev.codepoint == codepoint;
+            g_skill_center_suppress_command_char = null;
             if (suppress) return;
         }
         if (!ev.ctrl and !ev.alt and !ev.super) {
-            _ = AppWindow.aiHistoryInsertCodepoint(ev.codepoint);
+            _ = AppWindow.skillCenterUrlInsertChar(ev.codepoint); // no-op unless url_input active
         }
         return;
     }
@@ -1415,11 +1541,6 @@ fn handleChar(ev: platform_input.CharEvent) void {
         if (!ev.ctrl and !ev.alt and !ev.super) {
             _ = AppWindow.portForwardingInsertChar(ev.codepoint);
         }
-        return;
-    }
-    // Skill Center has no text input; swallow character input so the rescan
-    // hotkey ('r') and other keys never leak to the terminal/copilot.
-    if (AppWindow.activeSkillCenter() != null) {
         return;
     }
     // AI copilot sidebar (terminal tabs): when the copilot owns focus, route
@@ -1436,11 +1557,12 @@ fn handleChar(ev: platform_input.CharEvent) void {
             return;
         }
     }
-    // A focused image preview consumes +/=/- as zoom in/out. Only image previews
-    // claim these chars (markdown previews ignore them so they reach nothing),
-    // and only when such a preview holds focus — terminals are never affected.
+    // A focused raster (image/PDF) preview consumes +/=/- as zoom in/out. Only
+    // raster previews claim these chars (markdown previews ignore them so they
+    // reach nothing), and only when such a preview holds focus — terminals are
+    // never affected.
     if (AppWindow.focusedPreviewPane()) |p| {
-        if (p.kind == .image and !ev.ctrl and !ev.alt) {
+        if (p.kind.isRaster() and !ev.ctrl and !ev.alt) {
             const zoomed = switch (ev.codepoint) {
                 '+', '=' => p.zoomImageBySteps(1, true),
                 '-', '_' => p.zoomImageBySteps(1, false),
@@ -1560,7 +1682,7 @@ fn requestNewWindowFromActiveCwd() void {
     if (AppWindow.activeSurface()) |surface| {
         if (surface.getCwd()) |guest_path| {
             std.debug.print("CWD from OSC 7: {s}\n", .{guest_path});
-            if (platform_wsl.guestPathToNativeCwd(guest_path, &cwd_buf)) |native_cwd| {
+            if (platform_wsl.nativeCwdForLaunchKind(surface.launch_kind, guest_path, &cwd_buf)) |native_cwd| {
                 cwd = native_cwd;
                 var path_u8: [260]u8 = undefined;
                 var display_buf: platform_pty_command.CwdBuffer = undefined;
@@ -1599,6 +1721,7 @@ fn executeCommand(cmd: command_dispatch.Command) bool {
         .new_window => requestNewWindowFromActiveCwd(),
         .new_session => overlays.sessionLauncherOpen(),
         .split_right => AppWindow.splitFocused(.right),
+        .split_down => AppWindow.splitFocused(.down),
         .toggle_file_explorer => toggleFileExplorer(),
         .toggle_sidebar => toggleSidebar(),
         .toggle_ai_copilot => AppWindow.toggleAiCopilot(),
@@ -1853,9 +1976,13 @@ fn handleKey(ev: platform_input.KeyEvent) void {
 
     if (AppWindow.activeAiHistory() != null) {
         const plain = !ev.ctrl and !ev.alt and !ev.super;
+        // The Search box owns plain typing while focused, so Backspace edits the
+        // query there and the single-key Scan/Preview shortcuts stand down — letting
+        // their characters fall through to the filter instead.
+        const search_focused = AppWindow.aiHistorySearchFocused();
         switch (ev.key_code) {
             platform_input.key_backspace => {
-                _ = AppWindow.aiHistoryBackspaceFilter();
+                if (search_focused) _ = AppWindow.aiHistoryBackspaceFilter();
                 return;
             },
             platform_input.key_up => {
@@ -1894,12 +2021,12 @@ fn handleKey(ev: platform_input.KeyEvent) void {
                 _ = AppWindow.aiHistoryScrollTranscript(1 << 30);
                 return;
             },
-            0x20 => if (plain) {
+            0x20 => if (plain and !search_focused) {
                 _ = AppWindow.aiHistoryPreviewSelectedTranscript();
                 return;
             },
-            0x52 => if (plain and !ev.shift) {
-                g_ai_history_suppress_refresh_char = AppWindow.aiHistoryScanLocalNow();
+            0x52 => if (plain and !ev.shift and !search_focused) {
+                _ = AppWindow.aiHistoryScanLocalNow();
                 return;
             },
             else => {},
@@ -1990,9 +2117,33 @@ fn handleKey(ev: platform_input.KeyEvent) void {
         return;
     }
 
-    // Skill Center: ↑/↓ move, space preview, ⏎ confirm (deploy in library), esc cancel, d deploy, i import, r rescan.
+    // Skill Center: ↑/↓ move, space preview/toggle, ⏎ confirm, esc cancel,
+    // d deploy, i import, g get-from-GitHub, r rescan. The URL-input overlay
+    // captures text; the checklist captures space + 'a'.
     if (AppWindow.activeSkillCenter() != null) {
+        // SKILL.md preview overlay captures all keys: esc/space/⏎ close,
+        // arrows/PgUp/PgDn/Home/End scroll.
+        if (AppWindow.skillCenterTextPreviewActive()) {
+            switch (ev.key_code) {
+                platform_input.key_escape, platform_input.key_space, platform_input.key_enter => _ = AppWindow.skillCenterPreviewClose(),
+                platform_input.key_up => _ = AppWindow.skillCenterPreviewScroll(-1),
+                platform_input.key_down => _ = AppWindow.skillCenterPreviewScroll(1),
+                platform_input.key_page_up => _ = AppWindow.skillCenterPreviewScroll(-12),
+                platform_input.key_page_down => _ = AppWindow.skillCenterPreviewScroll(12),
+                platform_input.key_home => _ = AppWindow.skillCenterPreviewScroll(-1_000_000),
+                platform_input.key_end => _ = AppWindow.skillCenterPreviewScroll(1_000_000),
+                else => {},
+            }
+            return;
+        }
         const plain = !ev.ctrl and !ev.alt and !ev.super;
+        const text_capture = AppWindow.skillCenterUrlInputActive();
+        const picking = AppWindow.skillCenterPickActive();
+        // Ctrl/Cmd+V paste into the URL field.
+        if (text_capture and (ev.ctrl or ev.super) and ev.key_code == 0x56) { // 'V'
+            _ = AppWindow.skillCenterUrlPaste();
+            return;
+        }
         switch (ev.key_code) {
             platform_input.key_up => {
                 _ = AppWindow.skillCenterMove(-1);
@@ -2014,20 +2165,38 @@ fn handleKey(ev: platform_input.KeyEvent) void {
                 _ = AppWindow.skillCenterOverlayCancel();
                 return;
             },
-            0x52 => if (plain and !ev.shift) {
+            platform_input.key_backspace => {
+                if (text_capture) {
+                    _ = AppWindow.skillCenterUrlBackspace();
+                    return;
+                }
+            },
+            0x52 => if (plain and !ev.shift and !text_capture) { // 'R'
                 _ = AppWindow.skillCenterRescan();
                 return;
             },
-            0x44 => if (plain and !ev.shift) {
+            0x44 => if (plain and !ev.shift and !text_capture and !picking) { // 'D'
                 _ = AppWindow.skillCenterDeploy();
                 return;
             },
-            0x49 => if (plain and !ev.shift) {
+            0x49 => if (plain and !ev.shift and !text_capture and !picking) { // 'I'
                 _ = AppWindow.skillCenterImport();
                 return;
             },
-            platform_input.key_space => if (plain and !ev.shift) {
-                _ = AppWindow.skillCenterSpacePreview();
+            0x47 => if (plain and !ev.shift and !text_capture and !picking) { // 'G'
+                _ = AppWindow.skillCenterOpenUrlInput();
+                // SDL text-input mode also fires a 'g' CHAR event after this
+                // key-down; suppress it so it doesn't land in the now-active
+                // URL field. (Only 'G' opens a text field, so only it suppresses.)
+                g_skill_center_suppress_command_char = 'g';
+                return;
+            },
+            0x41 => if (plain and !ev.shift and picking) { // 'A' select-all
+                _ = AppWindow.skillCenterPickSelectAll();
+                return;
+            },
+            platform_input.key_space => if (plain and !ev.shift and !text_capture) {
+                _ = AppWindow.skillCenterSpacePreview(); // toggles when picking
                 return;
             },
             else => {},
@@ -2070,26 +2239,30 @@ fn handleKey(ev: platform_input.KeyEvent) void {
     // A focused preview leaf consumes plain navigation keys for scroll/pan.
     // Only engaged when a preview actually holds focus; otherwise this block is
     // skipped entirely and terminal/copilot key handling is unchanged. Modified
-    // keys (ctrl/alt/super) are left for keybinds and the terminal.
+    // keys (ctrl/shift/alt/super) are left for keybinds and the terminal.
     if (AppWindow.focusedPreviewPane()) |p| {
-        if (!ev.ctrl and !ev.alt and !ev.super) {
+        if (!ev.ctrl and !ev.shift and !ev.alt and !ev.super) {
             var consumed = true;
             switch (ev.key_code) {
-                platform_input.key_page_up => p.scrollBy(-360),
-                platform_input.key_page_down => p.scrollBy(360),
-                platform_input.key_up => if (p.kind == .image) {
+                platform_input.key_page_up => if (p.kind == .pdf) {
+                    _ = p.flipPdfPage(false);
+                } else p.scrollBy(-360),
+                platform_input.key_page_down => if (p.kind == .pdf) {
+                    _ = p.flipPdfPage(true);
+                } else p.scrollBy(360),
+                platform_input.key_up => if (p.kind.isRaster()) {
                     _ = p.panImageBy(0, 40);
                 } else p.scrollBy(-60),
-                platform_input.key_down => if (p.kind == .image) {
+                platform_input.key_down => if (p.kind.isRaster()) {
                     _ = p.panImageBy(0, -40);
                 } else p.scrollBy(60),
-                platform_input.key_left => if (p.kind == .image) {
-                    _ = p.panImageBy(40, 0);
+                platform_input.key_left => if (p.kind.isRaster()) {
+                    _ = openPreviewGalleryNeighbor(p, false);
                 } else {
                     consumed = false;
                 },
-                platform_input.key_right => if (p.kind == .image) {
-                    _ = p.panImageBy(-40, 0);
+                platform_input.key_right => if (p.kind.isRaster()) {
+                    _ = openPreviewGalleryNeighbor(p, true);
                 } else {
                     consumed = false;
                 },
@@ -2515,6 +2688,35 @@ fn hitTestAiCopilotResizeHandle(xpos: f64, ypos: f64) bool {
     return xpos >= panel_x - half_hit and xpos <= panel_x + half_hit;
 }
 
+/// Hit-test the closed-state Copilot summon handle (valid only when Copilot is
+/// closed). Widens the click zone for comfort without a heavier visual.
+fn hitTestCopilotEdgeHandle(xpos: f64, ypos: f64) bool {
+    // Must match the render + mouse-move eligibility exactly, or this becomes an
+    // invisible click-band that steals clicks (e.g. from the scrollbar when the
+    // feature is disabled, or from a browser/Jupyter panel sharing the slot).
+    if (!copilot_hint_gate.handleEligible(
+        AppWindow.g_copilot_hint,
+        AppWindow.aiCopilotVisible(),
+        AppWindow.isActiveTabTerminal(),
+        AppWindow.anyRightDockPanelVisible(),
+    )) return false;
+    if (ypos < titlebarHeight()) return false;
+    const win = AppWindow.g_window orelse return false;
+    const fb = window_backend.framebufferSize(win);
+    const rect = ai_sidebar.closedHandleRect(
+        @floatFromInt(fb.width),
+        @floatFromInt(fb.height),
+        @floatCast(titlebarHeight()),
+        AppWindow.leftPanelsWidth(),
+    );
+    if (!rect.eligible) return false;
+    const hit_w: f64 = @max(@as(f64, @floatCast(rect.w)), 12);
+    const right: f64 = @floatFromInt(fb.width);
+    const top: f64 = @floatCast(rect.y);
+    const bottom: f64 = @floatCast(rect.y + rect.h);
+    return xpos >= right - hit_w and ypos >= top and ypos <= bottom;
+}
+
 fn applyAiCopilotWidthFromMouse(xpos: f64) void {
     const win = AppWindow.g_window orelse return;
     const fb = window_backend.framebufferSize(win);
@@ -2856,11 +3058,31 @@ fn hitTestHelpButton(xpos: f64, ypos: f64) bool {
     return xpos >= help_x and xpos < help_x + help_w;
 }
 
+fn hitTestCopilotButton(xpos: f64, ypos: f64) bool {
+    const titlebar_h = titlebarHeight();
+    if (ypos < 0 or ypos >= titlebar_h) return false;
+    if (titlebar.TITLEBAR_COPILOT_W <= 0) return false;
+    const win = AppWindow.g_window orelse return false;
+    const size = clientSize(win);
+    const window_width: f64 = @floatFromInt(size.width);
+    const caption_w: f64 = 46 * 3;
+    const config_w: f64 = @floatCast(titlebar.TITLEBAR_CONFIG_W);
+    const help_w: f64 = @floatCast(titlebar.TITLEBAR_HELP_W);
+    const copilot_w: f64 = @floatCast(titlebar.TITLEBAR_COPILOT_W);
+    const copilot_x = window_width - caption_w - config_w - help_w - copilot_w;
+    return xpos >= copilot_x and xpos < copilot_x + copilot_w;
+}
+
 fn handleTopbarPress(xpos: f64) void {
     const toggle_x: f64 = @floatCast(titlebar.titlebarLeftReserved());
     const toggle_end: f64 = toggle_x + @as(f64, titlebar.TITLEBAR_TOGGLE_W);
     if (xpos >= toggle_x and xpos < toggle_end) {
         toggleSidebar();
+        return;
+    }
+
+    if (hitTestCopilotButton(xpos, titlebarHeight() / 2)) {
+        AppWindow.toggleAiCopilot();
         return;
     }
 
@@ -3032,15 +3254,14 @@ fn selectWordAtCell(surface: *Surface, cell_pos: CellPos) bool {
     return true;
 }
 
-fn selectSentenceAtCell(surface: *Surface, cell_pos: CellPos) bool {
+fn selectLineAtCell(surface: *Surface, cell_pos: CellPos) bool {
     var row_buf: [MAX_SELECTION_COLS]u21 = undefined;
 
     surface.render_state.mutex.lock();
     defer surface.render_state.mutex.unlock();
 
     const row = readViewportRowLocked(surface, cell_pos.row, &row_buf);
-    if (cell_pos.col >= row.len) return false;
-    const range = selection_unit.sentenceRange(row, cell_pos.col) orelse return false;
+    const range = selection_unit.lineRange(row) orelse return false;
     const abs_row = viewportOffsetForSurfaceLocked(surface) + cell_pos.row;
     activateSelection(surface, range.start, abs_row, range.end, abs_row);
     return true;
@@ -3069,6 +3290,75 @@ fn selectParagraphAtCell(surface: *Surface, cell_pos: CellPos) bool {
 
     activateSelection(surface, start_col, vp_off + start_row, end_col, vp_off + end_row);
     return true;
+}
+
+/// Resolve a left-button click in terminal content into focus + selection.
+/// Shared by the normal press path and the macOS double_click fall-through:
+/// the click count comes from click_tracker (time+distance based, identical on
+/// every platform), so 1=drag-select, 2=word, 3=line, 4=paragraph.
+fn handleTerminalSelectionPress(ev: platform_input.MouseButtonEvent, xpos: f64, ypos: f64) void {
+    // Find which surface was clicked and focus it
+    const clicked_surface = split_layout.surfaceAtPoint(@intFromFloat(xpos), @intFromFloat(ypos)) orelse AppWindow.activeSurface() orelse return;
+
+    // Focus the clicked split if different from current focus
+    if (AppWindow.activeTab()) |tb| {
+        const previous_focus = tb.focused;
+        for (0..split_layout.g_split_rect_count) |i| {
+            const rect = split_layout.g_split_rects[i];
+            if (!split_layout.cachedRectIsLive(rect)) continue;
+            if (rect.surface()) |s| {
+                if (s == clicked_surface) {
+                    tb.focused = rect.handle;
+                    break;
+                }
+            }
+        }
+        if (tb.focused != previous_focus) {
+            AppWindow.handleActiveSurfaceChangeWithinTab();
+        }
+    }
+
+    const cell_pos = mouseToSurfaceCell(clicked_surface, xpos, ypos);
+    switch (terminalPathClickAction(clicked_surface.launch_kind, clicked_surface.ssh_connection != null, primaryOpenMod(ev.ctrl, ev.super), ev.shift, ev.alt)) {
+        .download_ssh_file => {
+            if (downloadTerminalFileAtCell(clicked_surface, cell_pos)) return;
+        },
+        .open_url_or_preview => {
+            if (openUrlAtCell(clicked_surface, cell_pos)) return;
+            if (openHtmlPanelForCell(clicked_surface, cell_pos)) return;
+            if (openPreviewPanelForCell(clicked_surface, cell_pos, ev.shift)) return;
+        },
+        .pass_through => {},
+    }
+
+    clearUrlUnderline();
+    const shift_range_select = ev.shift and !ev.ctrl and !ev.alt;
+    const click_count: u8 = if (shift_range_select) blk: {
+        resetLeftClickCount();
+        break :blk 1;
+    } else nextLeftClickCount(xpos, ypos);
+    switch (click_count) {
+        1 => {
+            // Shift-click extends from the last click anchor, matching
+            // document editor style range selection.
+            if (!(shift_range_select and extendSelectionAtCell(clicked_surface, cell_pos, xpos, ypos))) {
+                startSelectionAtCell(clicked_surface, cell_pos, xpos, ypos);
+            }
+        },
+        2 => {
+            g_selecting = false;
+            if (!selectWordAtCell(clicked_surface, cell_pos)) clearSelectionAtCell(clicked_surface, cell_pos);
+        },
+        3 => {
+            g_selecting = false;
+            if (!selectLineAtCell(clicked_surface, cell_pos)) clearSelectionAtCell(clicked_surface, cell_pos);
+        },
+        4 => {
+            g_selecting = false;
+            if (!selectParagraphAtCell(clicked_surface, cell_pos)) clearSelectionAtCell(clicked_surface, cell_pos);
+        },
+        else => unreachable,
+    }
 }
 
 fn extractTokenRangeAtCell(allocator: std.mem.Allocator, surface: *Surface, cell_pos: CellPos) ?TokenAtCell {
@@ -3313,7 +3603,7 @@ fn updateInteractiveUnderlineAtMouse(xpos: f64, ypos: f64, ctrl: bool, shift: bo
     setUrlUnderline(surface, vp_off + token.start_row, vp_off + token.end_row, token.start_col, token.end_col);
 }
 
-fn openPreviewAsync(kind: markdown_preview.Kind, title: []const u8, path: []const u8, source_kind: markdown_preview_panel.PreviewSourceKind) bool {
+fn openPreviewAsync(kind: markdown_preview.Kind, title: []const u8, path: []const u8, source_kind: markdown_preview_panel.PreviewSourceKind, move_focus: bool) bool {
     const perf = ui_perf.begin("input.open_preview_async");
     defer perf.end();
 
@@ -3329,6 +3619,10 @@ fn openPreviewAsync(kind: markdown_preview.Kind, title: []const u8, path: []cons
         }
     else
         (tab.splitIntoPreviewStacked(gpa) orelse return false);
+    // Only steal focus when the caller asks (file-explorer preview). A Ctrl+click
+    // from the terminal keeps focus on the terminal so typing continues there; the
+    // preview's PgUp/PgDn/close keys then require clicking it first.
+    if (move_focus) _ = tab.focusPreviewPane(pane);
     if (!pane.beginAsyncLoad(kind, title, path, source_kind)) {
         file_explorer.setTransferStatus(.failed, "Preview failed");
         return true;
@@ -3338,12 +3632,37 @@ fn openPreviewAsync(kind: markdown_preview.Kind, title: []const u8, path: []cons
     return true;
 }
 
-fn openPreviewNew(kind: markdown_preview.Kind, title: []const u8, path: []const u8, source_kind: markdown_preview_panel.PreviewSourceKind) bool {
+fn openPreviewGalleryNeighbor(p: *PreviewPane, forward: bool) bool {
+    const gpa = AppWindow.g_allocator orelse return false;
+    var target = findPreviewGalleryNeighbor(gpa, p, forward) orelse return false;
+    defer target.deinit(gpa);
+
+    if (!p.beginAsyncLoad(target.kind, target.title(), target.path, p.currentSourceKind())) {
+        file_explorer.setTransferStatus(.failed, "Preview failed");
+        return false;
+    }
+
+    AppWindow.g_force_rebuild = true;
+    AppWindow.g_cells_valid = false;
+    return true;
+}
+
+fn findPreviewGalleryNeighbor(allocator: std.mem.Allocator, p: *const PreviewPane, forward: bool) ?preview_gallery.Target {
+    return switch (p.currentSourceKind()) {
+        .local => preview_gallery.findNeighbor(allocator, @as(file_backend.Backend, .local), p.path(), forward) catch null,
+        .wsl => preview_gallery.findNeighbor(allocator, @as(file_backend.Backend, .wsl), p.path(), forward) catch null,
+        .remote => |conn| preview_gallery.findNeighbor(allocator, .{ .ssh = &conn }, p.path(), forward) catch null,
+    };
+}
+
+fn openPreviewNew(kind: markdown_preview.Kind, title: []const u8, path: []const u8, source_kind: markdown_preview_panel.PreviewSourceKind, move_focus: bool) bool {
     const perf = ui_perf.begin("input.open_preview_new");
     defer perf.end();
 
     const gpa = AppWindow.g_allocator orelse return false;
     const pane = tab.splitIntoPreviewStacked(gpa) orelse return false;
+    // Keep focus on the terminal for Ctrl+click opens; see openPreviewAsync.
+    if (move_focus) _ = tab.focusPreviewPane(pane);
     if (!pane.beginAsyncLoad(kind, title, path, source_kind)) {
         file_explorer.setTransferStatus(.failed, "Preview failed");
         return true;
@@ -3385,7 +3704,9 @@ fn openFileExplorerPreview(row_idx: usize) bool {
         return true;
     };
 
-    return openPreviewAsync(kind, title, path, source_kind);
+    // File-explorer preview keeps moving focus onto the preview so its scroll /
+    // gallery keys work straight away (the user is browsing files, not typing).
+    return openPreviewAsync(kind, title, path, source_kind, true);
 }
 
 /// Infer the `ls <dir>/` directory prefix for the clicked cell, copied into
@@ -3425,9 +3746,9 @@ fn openPreviewPanelForCell(surface: *Surface, cell_pos: CellPos, shift: bool) bo
         };
 
         if (shift) {
-            return openPreviewNew(kind, basenameForPreview(path), resolved_path, source_kind);
+            return openPreviewNew(kind, basenameForPreview(path), resolved_path, source_kind, false);
         } else {
-            return openPreviewAsync(kind, basenameForPreview(path), resolved_path, source_kind);
+            return openPreviewAsync(kind, basenameForPreview(path), resolved_path, source_kind, false);
         }
     }
 
@@ -3452,7 +3773,12 @@ fn buildRemotePathKindCommand(buf: []u8, remote_path: []const u8) ?[]const u8 {
 fn remotePathIsDirectoryForDownload(allocator: std.mem.Allocator, conn: *const @import("ssh_connection.zig").SshConnection, remote_path: []const u8) ?bool {
     var cmd_buf: [2300]u8 = undefined;
     const cmd = buildRemotePathKindCommand(cmd_buf[0..], remote_path) orelse return null;
-    const output = scp.sshExecCapped(allocator, conn, cmd, 8) orelse return null;
+    // Runs on the UI thread, so bound it: a hung remote `test -d` becomes a
+    // bounded delay + null result instead of a permanent freeze (see scp watchdog).
+    // Kept under ssh's ServerAlive give-up (~10 s) so the watchdog kill wins over
+    // the slower keepalive timeout.
+    const PROBE_TIMEOUT_MS = 5_000;
+    const output = scp.sshExecCappedOpts(allocator, conn, cmd, 8, .{ .timeout_ms = PROBE_TIMEOUT_MS }) orelse return null;
     defer allocator.free(output);
 
     const trimmed = std.mem.trim(u8, output, " \t\r\n");
@@ -3705,7 +4031,10 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
         if (beginTerminalMouseReport(ev)) return;
     }
 
-    // Double-click on tab text to rename, elsewhere to maximize
+    // A natively-reported double-click (macOS backend) targets UI chrome:
+    // double-click a tab to rename, the bare titlebar to zoom, or a file-
+    // explorer entry to open it. If it hits none of those, it is a terminal
+    // content double-click and falls through to selection below.
     if (ev.button == .left and ev.action == .double_click) {
         const xpos: f64 = @floatFromInt(ev.x);
         const titlebar_h: f64 = titlebarHeight();
@@ -3722,10 +4051,23 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                 // on the macOS traffic-light strip) zooms / unzooms.
                 toggleMaximize();
             }
-        } else if (hitTestSidebarTab(xpos, ypos)) |tab_idx| {
+            return;
+        }
+        if (hitTestSidebarTab(xpos, ypos)) |tab_idx| {
             if (shouldStartSidebarTabRename(xpos, ypos, tab_idx)) {
                 tab.startTabRename(tab_idx);
             }
+            return;
+        }
+        // No chrome hit — this is a double-click in terminal content. The macOS
+        // backend reports the 2nd/3rd/4th click of a multi-click as
+        // double_click (clickCount > 1) rather than press, so they never reach
+        // the press-path selection. Route terminal-content double-clicks
+        // through the same click_tracker path: the opening press already
+        // registered count=1, so this registers 2/3/4 → word/line/paragraph.
+        // Windows/Linux never emit double_click, so their behavior is unchanged.
+        if (split_layout.surfaceAtPoint(ev.x, ev.y) != null) {
+            handleTerminalSelectionPress(ev, xpos, ypos);
         }
         return;
     }
@@ -3832,6 +4174,10 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                 g_ai_copilot_resize_dragging = true;
                 g_ai_copilot_resize_hover = true;
                 platform_cursor.set(.size_we);
+                return;
+            }
+            if (!AppWindow.aiCopilotVisible() and hitTestCopilotEdgeHandle(xpos, ypos)) {
+                AppWindow.toggleAiCopilot();
                 return;
             }
 
@@ -3951,6 +4297,20 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                             }
                             return;
                         }
+                        if (AppWindow.ai_chat_renderer.modelLabelHitTest(
+                            chat,
+                            xpos,
+                            ypos,
+                            @floatFromInt(fb.width),
+                            @floatCast(titlebarHeight()),
+                            chat_x,
+                            chat_w,
+                        )) {
+                            overlays.openSwitchModelPicker(chat);
+                            AppWindow.g_force_rebuild = true;
+                            AppWindow.g_cells_valid = false;
+                            return;
+                        }
                         if (AppWindow.ai_chat_renderer.permissionChipHitTest(
                             xpos,
                             ypos,
@@ -4028,6 +4388,20 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                             AppWindow.g_cells_valid = false;
                         },
                     }
+                    return;
+                }
+                if (AppWindow.ai_chat_renderer.modelLabelHitTest(
+                    chat,
+                    xpos,
+                    ypos,
+                    @floatFromInt(fb.width),
+                    @floatCast(titlebarHeight()),
+                    AppWindow.leftPanelsWidth(),
+                    @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
+                )) {
+                    overlays.openSwitchModelPicker(chat);
+                    AppWindow.g_force_rebuild = true;
+                    AppWindow.g_cells_valid = false;
                     return;
                 }
                 if (AppWindow.ai_chat_renderer.permissionChipHitTest(
@@ -4156,6 +4530,15 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                 return;
             }
 
+            // A click on a preview's top-right × button closes that preview, so
+            // users who don't know the close-split keybind can dismiss it with
+            // the mouse. Checked before the focus/drag path below (the button
+            // sits inside the pane rect).
+            if (split_layout.previewCloseButtonAtPoint(ev.x, ev.y)) |close_handle| {
+                closePreviewPaneByHandle(close_handle);
+                return;
+            }
+
             // A click on a preview leaf focuses it (so keyboard/wheel scroll-zoom
             // route there) and consumes the event — previews have no terminal
             // grid to select into. Terminal leaves fall through to the surface
@@ -4180,68 +4563,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                 }
             }
 
-            // Find which surface was clicked and focus it
-            const clicked_surface = split_layout.surfaceAtPoint(@intFromFloat(xpos), @intFromFloat(ypos)) orelse AppWindow.activeSurface() orelse return;
-
-            // Focus the clicked split if different from current focus
-            if (AppWindow.activeTab()) |tb| {
-                const previous_focus = tb.focused;
-                for (0..split_layout.g_split_rect_count) |i| {
-                    const rect = split_layout.g_split_rects[i];
-                    if (!split_layout.cachedRectIsLive(rect)) continue;
-                    if (rect.surface()) |s| {
-                        if (s == clicked_surface) {
-                            tb.focused = rect.handle;
-                            break;
-                        }
-                    }
-                }
-                if (tb.focused != previous_focus) {
-                    AppWindow.handleActiveSurfaceChangeWithinTab();
-                }
-            }
-
-            const cell_pos = mouseToSurfaceCell(clicked_surface, xpos, ypos);
-            switch (terminalPathClickAction(clicked_surface.launch_kind, clicked_surface.ssh_connection != null, primaryOpenMod(ev.ctrl, ev.super), ev.shift, ev.alt)) {
-                .download_ssh_file => {
-                    if (downloadTerminalFileAtCell(clicked_surface, cell_pos)) return;
-                },
-                .open_url_or_preview => {
-                    if (openUrlAtCell(clicked_surface, cell_pos)) return;
-                    if (openHtmlPanelForCell(clicked_surface, cell_pos)) return;
-                    if (openPreviewPanelForCell(clicked_surface, cell_pos, ev.shift)) return;
-                },
-                .pass_through => {},
-            }
-
-            clearUrlUnderline();
-            const shift_range_select = ev.shift and !ev.ctrl and !ev.alt;
-            const click_count: u8 = if (shift_range_select) blk: {
-                resetLeftClickCount();
-                break :blk 1;
-            } else nextLeftClickCount(xpos, ypos);
-            switch (click_count) {
-                1 => {
-                    // Shift-click extends from the last click anchor, matching
-                    // document editor style range selection.
-                    if (!(shift_range_select and extendSelectionAtCell(clicked_surface, cell_pos, xpos, ypos))) {
-                        startSelectionAtCell(clicked_surface, cell_pos, xpos, ypos);
-                    }
-                },
-                2 => {
-                    g_selecting = false;
-                    if (!selectWordAtCell(clicked_surface, cell_pos)) clearSelectionAtCell(clicked_surface, cell_pos);
-                },
-                3 => {
-                    g_selecting = false;
-                    if (!selectSentenceAtCell(clicked_surface, cell_pos)) clearSelectionAtCell(clicked_surface, cell_pos);
-                },
-                4 => {
-                    g_selecting = false;
-                    if (!selectParagraphAtCell(clicked_surface, cell_pos)) clearSelectionAtCell(clicked_surface, cell_pos);
-                },
-                else => unreachable,
-            }
+            handleTerminalSelectionPress(ev, xpos, ypos);
         } else {
             // Mouse up
             if (g_preview_image_drag.active()) {
@@ -4672,6 +4994,41 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
             platform_cursor.set(.arrow);
             g_ai_copilot_resize_hover = false;
         }
+        // Closed-state Copilot summon handle: reveal as the cursor nears the edge.
+        if (!AppWindow.aiCopilotVisible()) {
+            const handle_eligible = copilot_hint_gate.handleEligible(
+                AppWindow.g_copilot_hint,
+                AppWindow.aiCopilotVisible(),
+                AppWindow.isActiveTabTerminal(),
+                AppWindow.anyRightDockPanelVisible(),
+            );
+            if (handle_eligible) {
+                if (AppWindow.g_window) |handle_win| {
+                    const handle_fb = window_backend.framebufferSize(handle_win);
+                    const tgt = copilot_hint_gate.handleRevealTarget(
+                        @floatCast(xpos),
+                        @floatCast(ypos),
+                        @floatFromInt(handle_fb.width),
+                        @floatCast(titlebarHeight()),
+                        overlays.copilot_edge_handle.REVEAL_ZONE_W,
+                        overlays.copilot_edge_handle.REVEALED_ALPHA,
+                    );
+                    overlays.copilotEdgeHandleSetTarget(tgt);
+                    const handle_hovered = hitTestCopilotEdgeHandle(xpos, ypos);
+                    overlays.copilotEdgeHandleSetHovered(handle_hovered);
+                    // Only repaint while the handle is actually near/visible — avoids a
+                    // full rebuild on every mouse move across the terminal when it is hidden.
+                    if (tgt > 0 or handle_hovered) AppWindow.g_force_rebuild = true;
+                    if (handle_hovered) {
+                        platform_cursor.set(.arrow);
+                        return;
+                    }
+                }
+            } else {
+                overlays.copilotEdgeHandleSetTarget(0);
+                overlays.copilotEdgeHandleSetHovered(false);
+            }
+        }
     }
 
     if (hitTestBrowserPanel(xpos, ypos)) {
@@ -4725,6 +5082,15 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
             platform_cursor.set(.arrow);
             g_divider_hover = false;
         }
+    }
+
+    // Track which preview's × button (if any) the mouse is over, so the renderer
+    // can brighten it. Re-render only when the hovered button changes.
+    const new_close_hover = if (!g_selecting) split_layout.previewCloseButtonAtPoint(ev.x, ev.y) else null;
+    if (new_close_hover != g_preview_close_hover) {
+        g_preview_close_hover = new_close_hover;
+        AppWindow.g_force_rebuild = true;
+        AppWindow.g_cells_valid = false;
     }
 
     // Normal selection handling
@@ -4972,6 +5338,29 @@ fn handleMouseWheel(ev: platform_input.MouseWheelEvent) void {
         AppWindow.g_force_rebuild = true;
         return;
     }
+    if (overlays.settingsPageVisible()) {
+        overlays.settingsPageHandleScroll(@floatFromInt(ev.delta));
+        AppWindow.g_force_rebuild = true;
+        return;
+    }
+    if (overlays.commandPaletteVisible()) {
+        overlays.commandPaletteHandleScroll(@floatFromInt(ev.delta));
+        AppWindow.g_force_rebuild = true;
+        AppWindow.g_cells_valid = false;
+        return;
+    }
+    if (overlays.sessionLauncherVisible()) {
+        overlays.sessionLauncherHandleScroll(@floatFromInt(ev.delta));
+        AppWindow.g_force_rebuild = true;
+        AppWindow.g_cells_valid = false;
+        return;
+    }
+    if (jupyter_picker.isVisible()) {
+        jupyter_picker.move(if (ev.delta > 0) -1 else 1);
+        AppWindow.g_force_rebuild = true;
+        AppWindow.g_cells_valid = false;
+        return;
+    }
     if (tab.g_sidebar_visible and ev.xpos >= 0 and ev.xpos < @as(i32, @intFromFloat(titlebar.sidebarWidth()))) return;
     if (hitTestBrowserPanel(@floatFromInt(ev.xpos), @floatFromInt(ev.ypos))) return;
     // Scroll in file explorer
@@ -5083,8 +5472,11 @@ fn handleMouseWheel(ev: platform_input.MouseWheelEvent) void {
     if (split_layout.paneAtPoint(ev.xpos, ev.ypos)) |hit| {
         if (hit.pane == .preview) {
             const p = hit.pane.preview;
-            if (p.kind == .image) {
-                _ = p.zoomImageBySteps(mouseWheelUnits(ev.delta), ev.delta > 0);
+            if (p.kind.isRaster()) {
+                // Continuous, per-event-bounded zoom: mouseWheelUnits is tuned
+                // for line-scrolling and turns macOS precise/trackpad deltas
+                // into a runaway 1.2^N zoom (see zoomImageByWheel).
+                _ = p.zoomImageByWheel(ev.delta);
             } else {
                 const delta: f32 = -@as(f32, @floatFromInt(ev.delta)) * 72.0 / 120.0;
                 p.scrollBy(delta);

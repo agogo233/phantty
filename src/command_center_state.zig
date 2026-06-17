@@ -6,6 +6,7 @@ pub const CommandAction = enum {
     new_tab,
     load_openssh_config,
     new_agent,
+    toggle_ai_copilot,
     manage_ai_profiles,
     select_agent_history,
     split_right,
@@ -40,7 +41,8 @@ pub const CommandAction = enum {
     download_update,
     open_latest_release,
     show_whats_new,
-    update_skills,
+    install_claude_code_integration,
+    remove_claude_code_integration,
     open_skill_center,
     open_port_forwarding,
     split_preview,
@@ -56,8 +58,10 @@ pub const CommandEntry = struct {
 pub const command_entries = [_]CommandEntry{
     .{ .title = "New Session", .detail = platform_pty_command.session_launcher_detail, .shortcut = "", .action = .new_tab },
     .{ .title = "New Copilot", .detail = "Open a new Copilot tab with the default AI config", .shortcut = "", .action = .new_agent },
+    .{ .title = "Toggle Copilot", .detail = "Open or close the Copilot sidebar on the current terminal", .shortcut = "", .action = .toggle_ai_copilot },
     .{ .title = "Manage AI Profiles", .detail = "Create, edit, or delete saved AI profiles", .shortcut = "", .action = .manage_ai_profiles },
     .{ .title = "Select Copilot History", .detail = "Open the command-center Copilot history picker", .shortcut = "", .action = .select_agent_history },
+    .{ .title = "Skill Center", .detail = "Inventory Claude Code / Codex skills across servers", .shortcut = "", .action = .open_skill_center },
     .{ .title = "Split Right", .detail = "Create a panel to the right", .shortcut = "", .action = .split_right },
     .{ .title = "Split Down", .detail = "Create a panel below", .shortcut = "", .action = .split_down },
     .{ .title = "Split Left", .detail = "Create a panel to the left", .shortcut = "", .action = .split_left },
@@ -91,9 +95,9 @@ pub const command_entries = [_]CommandEntry{
     .{ .title = "Download Update", .detail = "Download the latest update to your Downloads folder", .shortcut = "", .action = .download_update },
     .{ .title = "Open Latest Release", .detail = "Open the latest WispTerm GitHub Release", .shortcut = "", .action = .open_latest_release },
     .{ .title = "What's New", .detail = "Show what changed in this version of WispTerm", .shortcut = app_metadata.version, .action = .show_whats_new },
-    .{ .title = "Update Skills", .detail = "Download the latest skills from GitHub", .shortcut = "", .action = .update_skills },
+    .{ .title = "Install Claude Code Integration", .detail = "Add WispTerm agent hooks to ~/.claude/settings.json", .shortcut = "", .action = .install_claude_code_integration },
+    .{ .title = "Remove Claude Code Integration", .detail = "Remove WispTerm agent hooks from ~/.claude/settings.json", .shortcut = "", .action = .remove_claude_code_integration },
     .{ .title = "Port Forwarding", .detail = "Manage SSH port forwarding rules", .shortcut = "", .action = .open_port_forwarding },
-    .{ .title = "Skill Center", .detail = "Inventory Claude Code / Codex skills across servers", .shortcut = "", .action = .open_skill_center },
     .{ .title = "Split Preview", .detail = "Open a preview panel on the right", .shortcut = "", .action = .split_preview },
 };
 
@@ -108,6 +112,7 @@ pub const NewAgentLaunchAction = enum {
 };
 
 pub const SESSION_LAUNCHER_ROW_COUNT: usize = platform_pty_command.session_launcher_row_count;
+pub const SESSION_LAUNCHER_ROW_TMUX: usize = platform_pty_command.session_launcher_tmux_row;
 pub const SESSION_LAUNCHER_ROW_AI_AGENT: usize = platform_pty_command.session_launcher_ai_agent_row;
 pub const SESSION_LAUNCHER_ROW_AI_HISTORY: usize = platform_pty_command.session_launcher_ai_history_row;
 
@@ -285,6 +290,10 @@ test "command center includes New Copilot action" {
     try std.testing.expectEqual(CommandAction.new_agent, findCommandAction("New Copilot"));
 }
 
+test "command center exposes Toggle Copilot" {
+    try std.testing.expectEqual(CommandAction.toggle_ai_copilot, findCommandAction("Toggle Copilot"));
+}
+
 test "command center includes Manage AI Profiles action" {
     try std.testing.expectEqual(CommandAction.manage_ai_profiles, findCommandAction("Manage AI Profiles"));
 }
@@ -305,6 +314,17 @@ test "findCommandAction resolves What's New" {
 
 test "command center includes Skill Center action" {
     try std.testing.expectEqual(CommandAction.open_skill_center, findCommandAction("Skill Center"));
+}
+
+test "Skill Center is on the default first command center page" {
+    const default_first_page_rows: usize = 14;
+    for (command_entries, 0..) |entry, idx| {
+        if (entry.action == .open_skill_center) {
+            try std.testing.expect(idx < default_first_page_rows);
+            return;
+        }
+    }
+    return error.MissingSkillCenterCommand;
 }
 
 test "command center includes Port Forwarding action" {

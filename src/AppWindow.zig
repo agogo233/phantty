@@ -20,6 +20,7 @@ const remote = @import("remote_client.zig");
 const remote_snapshot = @import("remote_snapshot.zig");
 const weixin_control = @import("weixin/control.zig");
 const weixin_types = @import("weixin/types.zig");
+const ctl_control = @import("ctl/control.zig");
 const memory_debug = @import("memory_debug.zig");
 const surface_registry = @import("surface_registry.zig");
 const agent_detector = @import("agent_detector.zig");
@@ -34,6 +35,7 @@ const platform_menu = @import("platform/menu.zig");
 const platform_notifications = @import("platform/notifications.zig");
 const notif_mod = @import("notification.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
+const copilot_hint_gate = @import("copilot_hint_gate.zig");
 const platform_window_state = @import("platform/window_state.zig");
 const platform_wsl = @import("platform/wsl.zig");
 const startup_tabs = @import("startup_tabs.zig");
@@ -52,11 +54,15 @@ const ai_history_types = @import("ai_history_types.zig");
 pub const ai_history_session = @import("ai_history_session.zig");
 pub const ai_history_source = @import("ai_history_source.zig");
 pub const skill_center = @import("skill_center.zig");
+const skill_install = @import("skill_install.zig");
+const update_install = @import("update_install.zig");
+const clipboard = @import("input/clipboard.zig");
 pub const port_forwarding = @import("port_forwarding.zig");
 const port_forward_manager = @import("port_forward_manager.zig");
 const port_forward_rule = @import("port_forward_rule.zig");
 const ssh_profile_store = @import("ssh_profile_store.zig");
 const skill_scan = @import("skill_scan.zig");
+const skill_local_fs = @import("skill_local_fs.zig");
 const skill_transfer_cmd = @import("skill_transfer_cmd.zig");
 const remote_file = @import("platform/remote_file.zig");
 const ssh_connection = @import("ssh_connection.zig");
@@ -67,6 +73,7 @@ const ssh_error = @import("ssh_error.zig");
 const i18n = @import("i18n.zig");
 pub const tab = @import("appwindow/tab.zig");
 const active_tab_state = @import("appwindow/active_tab.zig");
+const tmux_controller = @import("appwindow/tmux_controller.zig");
 pub const font = @import("font/manager.zig");
 pub const cell_renderer = @import("renderer/cell_renderer.zig");
 pub const cell_pipeline = @import("renderer/cell_pipeline.zig");
@@ -126,7 +133,6 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
 
     // Store app pointer globally for requestNewWindow
     g_app = app;
-    ai_chat.setSkillUpdateTrigger(triggerSkillUpdate);
     // `/resume` opens the existing command-center agent history picker (the same
     // entry point the Command Palette uses for the "Select Agent History" action).
     ai_chat.setSessionResumeTrigger(struct {
@@ -138,6 +144,18 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
     ai_chat.setMarkdownExportTrigger(struct {
         fn cb(mode: ai_chat.MarkdownExportMode) void {
             exportActiveAiChatMarkdown(mode);
+        }
+    }.cb);
+    // `/model [name]` switches the active session's profile (and summarizes the
+    // prior context with the new model). Empty pending name => open the picker.
+    ai_chat.setModelSwitchTrigger(struct {
+        fn cb(chat: *ai_chat.Session) void {
+            const name = chat.takePendingModelSwitchName();
+            if (name.len > 0) {
+                overlays.switchModelByName(chat, name);
+            } else {
+                overlays.openSwitchModelPicker(chat);
+            }
         }
     }.cb);
     app.maybeStartStartupUpdateCheck();
@@ -170,6 +188,7 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
     overlays.g_unfocused_split_opacity = app.unfocused_split_opacity;
     g_focus_follows_mouse = app.focus_follows_mouse;
     g_copy_on_select = app.copy_on_select;
+    g_copilot_hint = app.copilot_hint;
     g_right_click_action = app.right_click_action;
     input.g_url_open_mode = app.url_open_mode;
     g_ssh_legacy_algorithms = app.ssh_legacy_algorithms;
@@ -202,9 +221,12 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
     tab.g_shell_cmd_len = app.shell_cmd_len;
 
     // Store config values we need for init
-    g_requested_font = app.font_family;
-    font.g_cjk_font_family = app.font_family_cjk;
-    font.g_fallback_font_families = app.font_family_fallback;
+    setRequestedFont(app.font_family);
+    // Copy into the font module's own buffers rather than aliasing App's
+    // strings: App frees and reallocates these on every config reload (see
+    // App.replaceOptStr), which would leave the globals dangling.
+    font.setCjkFontFamily(app.font_family_cjk);
+    font.setFallbackFontFamilies(app.font_family_fallback);
     g_requested_weight = app.font_weight;
     font.g_font_size = app.font_size;
     g_shader_path = app.shader_path;
@@ -283,6 +305,16 @@ pub fn deinit(self: *AppWindow) void {
         }
     }
 
+    // Tear down this thread's tmux control-mode controllers. They are
+    // thread-local and persist across transport drops (reconnect-with-backoff,
+    // no auto-teardown), so quit is the only place they are freed — closing
+    // each transport PTY detaches (not kills) the remote tmux session, the
+    // persistence we want. Must run AFTER dumpSessionToFile above, which reads
+    // the live controllers' profile names to persist them, and BEFORE the tab
+    // cleanup below: destroy closes every pane's virtual controller (EOF'ing the
+    // Surfaces) without freeing the Surfaces, which the tab teardown then owns.
+    tmux_controller.shutdownAll(self.allocator);
+
     // Clean up all tabs
     for (0..tab.g_tab_count) |ti| {
         if (tab.g_tabs[ti]) |t| {
@@ -340,6 +372,17 @@ test "AppWindow: current backend window handle is exposed through platform facad
 test "AppWindow: native handle bit conversion stays in platform backend" {
     const source = @embedFile("AppWindow.zig");
     try std.testing.expect(std.mem.indexOf(u8, source, "builtin." ++ "os.tag") == null);
+}
+
+// deinit runs on the same thread as runMainLoop (first window → main thread,
+// spawned window → its worker thread), so it is the only place the thread-local
+// tmux controller list can be freed. A restored persistent tmux session
+// allocates a TmuxController/TmuxBridge/Session there; without this teardown
+// call they leak at clean exit (GPA reports ~14 leaks). Guard the wiring.
+test "AppWindow: deinit tears down tmux controllers so restored sessions don't leak" {
+    const source = @embedFile("AppWindow.zig");
+    // Split the needle so this assertion does not match its own literal.
+    try std.testing.expect(std.mem.indexOf(u8, source, "tmux_controller." ++ "shutdownAll") != null);
 }
 
 test "AppWindow: platform window callbacks use backend-neutral names" {
@@ -496,6 +539,11 @@ var g_session_restore_attempted: std.atomic.Value(bool) = .init(false);
 
 // Stored config values for deferred initialization
 threadlocal var g_requested_font: []const u8 = "";
+// Backing buffer for g_requested_font. The configured family must be copied
+// here rather than aliasing App.font_family: App frees and reallocates that
+// string on every config reload (App.replaceStr), and g_requested_font is read
+// later in the event loop (handleWindowDpiChanged), which would dangle.
+threadlocal var g_requested_font_buf: [256]u8 = undefined;
 threadlocal var g_requested_weight: font_backend.FontWeight = .NORMAL;
 threadlocal var g_shader_path: ?[]const u8 = null;
 threadlocal var g_start_maximize: bool = false;
@@ -882,6 +930,23 @@ fn renderSkillCenterFrame(active_tab: *TabState, fb_width: c_int, fb_height: c_i
                 .sel = il.sel,
             } },
             .confirm => |*c| .{ .confirm = c.text },
+            .url_input => |*u| .{ .input = .{ .prompt = i18n.s().sc_url_prompt, .text = u.text() } },
+            .install_pick => |*p| .{ .list = .{
+                .title = i18n.s().sc_pick_install,
+                .len = p.entries.len,
+                .ctx = @ptrCast(p),
+                .itemAt = scInstallPickItemAt,
+                .sel = p.sel,
+            } },
+            // scroll_out lets the renderer clamp `scroll` against the wrapped
+            // height and write it back — safe here under the session lock.
+            .text_preview => |*tp| .{ .text = .{
+                .title = tp.title,
+                .content = tp.content,
+                .hint = i18n.s().sc_preview_hint,
+                .scroll = tp.scroll,
+                .scroll_out = &tp.scroll,
+            } },
         };
         const view: skill_center_renderer.View = .{
             .skills_len = lib_len,
@@ -890,7 +955,11 @@ fn renderSkillCenterFrame(active_tab: *TabState, fb_width: c_int, fb_height: c_i
             .sel_row = m.sel_row,
             .scroll = m.scroll,
             .title = i18n.s().sl_skill_center,
-            .legend = if (std.meta.activeTag(m.overlay) == .import_list) i18n.s().sc_legend_import else i18n.s().sc_legend_v2,
+            .legend = switch (m.overlay) {
+                .import_list => i18n.s().sc_legend_import,
+                .install_pick => i18n.s().sc_pick_install,
+                else => i18n.s().sc_legend_v2,
+            },
             .status = session.status,
             .overlay = overlay,
         };
@@ -1019,6 +1088,17 @@ fn scImportItemAt(ctx: *anyopaque, i: usize) skill_center_renderer.ListItem {
         .differ => .{ .label = il.names[i], .marker = t.sc_marker_differ, .marker_color = .{ 0.86, 0.70, 0.28 } },
     };
 }
+fn scInstallPickItemAt(ctx: *anyopaque, i: usize) skill_center_renderer.ListItem {
+    const p: *const skill_center.InstallPickState = @ptrCast(@alignCast(ctx));
+    if (i >= p.entries.len) return .{ .label = "", .marker = "" };
+    // Static buffers keyed off a small ring so labels survive the frame draw.
+    const checked = i < p.checked.len and p.checked[i];
+    const box = if (checked) "[x] " else "[ ] ";
+    const slot = &g_sc_pick_label_buf[i % g_sc_pick_label_buf.len];
+    const label = std.fmt.bufPrint(slot, "{s}{s}", .{ box, p.entries[i].name }) catch p.entries[i].name;
+    return .{ .label = label, .marker = "" };
+}
+var g_sc_pick_label_buf: [64][256]u8 = undefined;
 
 fn renderAiCopilotPanel(fb_width: c_int, fb_height: c_int, titlebar_offset: f32) void {
     if (!aiCopilotVisible()) return;
@@ -1084,6 +1164,13 @@ fn surfaceOnAltScreen(s: *const Surface) bool {
 pub fn activeSurfaceHasRunningProgram() bool {
     const s = activeSurface() orelse return false;
     return surfaceOnAltScreen(s);
+}
+
+/// True when the focused pane in the active tab is a terminal surface (rather than
+/// a preview pane, a split node, or a non-terminal tab). Used to guard terminal
+/// closes behind a confirm while preview panes still close on a single press.
+pub fn focusedPaneIsTerminal() bool {
+    return activeSurface() != null;
 }
 
 fn tabStateHasRunningProgram(t: *const TabState) bool {
@@ -1427,6 +1514,8 @@ pub fn skillCenterMove(delta: isize) bool {
     switch (session.model.overlay) {
         .picker => |*p| scMoveSel(&p.sel, p.labels.len, delta),
         .import_list => |*il| scMoveSel(&il.sel, il.names.len, delta),
+        .install_pick => |*p| scMoveSel(&p.sel, p.entries.len, delta),
+        .url_input => {},
         else => {
             const n = if (session.model.library) |l| l.len else 0;
             scMoveSel(&session.model.sel_row, n, delta);
@@ -1454,17 +1543,326 @@ pub fn skillCenterOverlayCancel() bool {
     return true;
 }
 
+/// True when the URL-input overlay is capturing text. UI thread.
+pub fn skillCenterUrlInputActive() bool {
+    const session = activeSkillCenter() orelse return false;
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    return session.model.overlay == .url_input;
+}
+
+/// 'g': open the URL-input overlay, prefilled from the clipboard if it looks
+/// like a GitHub URL. UI thread.
+pub fn skillCenterOpenUrlInput() bool {
+    const session = activeSkillCenter() orelse return false;
+    const allocator = g_allocator orelse return false;
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    if (session.model.overlay != .none) return false;
+    var st: skill_center.UrlInputState = .{};
+    if (clipboard.readClipboardTextOwned(allocator)) |clip| {
+        defer allocator.free(clip);
+        const trimmed = std.mem.trim(u8, clip, " \t\r\n");
+        if (std.mem.indexOf(u8, trimmed, "github.com/") != null and trimmed.len < 512)
+            st.insertSlice(allocator, trimmed);
+    }
+    session.model.setOverlay(.{ .url_input = st });
+    markUiDirty();
+    return true;
+}
+
+/// Append a typed codepoint to the URL buffer (no-op unless url_input active).
+pub fn skillCenterUrlInsertChar(codepoint: u21) bool {
+    if (codepoint < 0x20 or codepoint == 0x7f) return false;
+    const session = activeSkillCenter() orelse return false;
+    const allocator = g_allocator orelse return false;
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    switch (session.model.overlay) {
+        .url_input => |*u| {
+            var buf: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(codepoint, &buf) catch return false;
+            u.insertSlice(allocator, buf[0..len]);
+            markUiDirty();
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Backspace in the URL buffer. UI thread.
+pub fn skillCenterUrlBackspace() bool {
+    const session = activeSkillCenter() orelse return false;
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    switch (session.model.overlay) {
+        .url_input => |*u| {
+            u.backspace();
+            markUiDirty();
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Ctrl/Cmd+V: append clipboard text to the URL buffer. UI thread.
+pub fn skillCenterUrlPaste() bool {
+    const session = activeSkillCenter() orelse return false;
+    const allocator = g_allocator orelse return false;
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    switch (session.model.overlay) {
+        .url_input => |*u| {
+            if (clipboard.readClipboardTextOwned(allocator)) |clip| {
+                defer allocator.free(clip);
+                const trimmed = std.mem.trim(u8, clip, " \t\r\n");
+                u.insertSlice(allocator, trimmed);
+            }
+            markUiDirty();
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Enter in the URL-input overlay: snapshot the URL, clear the overlay, start
+/// the enumerate op. UI thread.
+fn skillCenterStartEnumerate(session: *skill_center.Session, allocator: std.mem.Allocator) void {
+    var url_owned: ?[]u8 = null;
+    {
+        session.mutex.lock();
+        defer session.mutex.unlock();
+        switch (session.model.overlay) {
+            .url_input => |*u| {
+                const t = std.mem.trim(u8, u.text(), " \t\r\n");
+                if (t.len > 0) url_owned = allocator.dupe(u8, t) catch null;
+                session.model.clearOverlay();
+            },
+            else => return,
+        }
+    }
+    const url = url_owned orelse {
+        markUiDirty();
+        return;
+    };
+    // Validate the URL on the UI thread so a parse error gets a precise toast
+    // (a worker-thread .failed can't distinguish bad-URL from network error).
+    if (skill_install.parseGithubUrl(allocator, url)) |rr| {
+        var probe = rr;
+        probe.deinit(allocator);
+    } else |_| {
+        allocator.free(url);
+        overlays.showStatusToast(i18n.s().sc_toast_bad_url);
+        markUiDirty();
+        return;
+    }
+    const job = allocator.create(SkillInstallEnumerateJob) catch {
+        allocator.free(url);
+        return;
+    };
+    job.* = .{ .url = url };
+    if (!session.startOp(.{ .ctx = job, .run = SkillInstallEnumerateJob.run, .destroy = SkillInstallEnumerateJob.destroy }, window_backend.postWakeup, i18n.s().sc_busy_fetching)) {
+        SkillInstallEnumerateJob.destroy(@ptrCast(job), allocator);
+        overlays.showStatusToast(i18n.s().sc_toast_op_busy);
+    }
+    markUiDirty();
+}
+
+/// True when the install checklist is active. UI thread.
+pub fn skillCenterPickActive() bool {
+    const session = activeSkillCenter() orelse return false;
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    return session.model.overlay == .install_pick;
+}
+
+/// Space: toggle the highlighted checklist row. UI thread.
+pub fn skillCenterPickToggle() bool {
+    const session = activeSkillCenter() orelse return false;
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    switch (session.model.overlay) {
+        .install_pick => |*p| {
+            p.toggle();
+            markUiDirty();
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// 'a': toggle select-all in the checklist. UI thread.
+pub fn skillCenterPickSelectAll() bool {
+    const session = activeSkillCenter() orelse return false;
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    switch (session.model.overlay) {
+        .install_pick => |*p| {
+            p.setAll(!p.anyChecked());
+            markUiDirty();
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Enter in the checklist: snapshot the selection + repo, clear the overlay,
+/// start the download op. UI thread.
+fn skillCenterStartInstall(session: *skill_center.Session, allocator: std.mem.Allocator) void {
+    var repo_owned: ?skill_install.RepoRef = null;
+    var entries_owned: ?[]skill_install.SkillEntry = null;
+    var empty = false;
+    {
+        session.mutex.lock();
+        defer session.mutex.unlock();
+        switch (session.model.overlay) {
+            .install_pick => |*p| {
+                if (!p.anyChecked()) {
+                    empty = true;
+                } else {
+                    repo_owned = p.repo.clone(allocator) catch null;
+                    entries_owned = p.selectedEntries(allocator) catch null;
+                    session.model.clearOverlay();
+                }
+            },
+            else => return,
+        }
+    }
+    if (empty) {
+        overlays.showStatusToast(i18n.s().sc_toast_no_skills);
+        markUiDirty();
+        return;
+    }
+    const repo = repo_owned orelse {
+        if (entries_owned) |e| skill_install.freeEntries(allocator, e);
+        markUiDirty();
+        return;
+    };
+    const entries = entries_owned orelse {
+        var rr = repo;
+        rr.deinit(allocator);
+        markUiDirty();
+        return;
+    };
+    const job = allocator.create(SkillInstallDownloadJob) catch {
+        var rr = repo;
+        rr.deinit(allocator);
+        skill_install.freeEntries(allocator, entries);
+        return;
+    };
+    job.* = .{ .repo = repo, .entries = entries };
+    if (!session.startOp(.{ .ctx = job, .run = SkillInstallDownloadJob.run, .destroy = SkillInstallDownloadJob.destroy }, window_backend.postWakeup, i18n.s().sc_busy_installing)) {
+        SkillInstallDownloadJob.destroy(@ptrCast(job), allocator);
+        overlays.showStatusToast(i18n.s().sc_toast_op_busy);
+    }
+    markUiDirty();
+}
+
 /// Library root `<config>/skills`. Caller frees.
 fn skillCenterLibraryDir(allocator: std.mem.Allocator) ?[]const u8 {
     return platform_dirs.pathInConfigDir(allocator, "skills") catch null;
 }
 
-/// ExecHost over a location: local POSIX, or SSH when a conn is present.
+/// Download every selected skill's files into a temp staging dir under the
+/// library, then per-skill atomically replace `<config>/skills/<name>`. Returns
+/// {installed, overwritten, failed}. A skill whose download fails is skipped
+/// (counted in `failed`); others still install. Staging dir is always removed.
+fn downloadSelectedSkillsToLibrary(
+    allocator: std.mem.Allocator,
+    repo: skill_install.RepoRef,
+    entries: []const skill_install.SkillEntry,
+) struct { installed: usize, overwritten: usize, failed: usize } {
+    var installed: usize = 0;
+    var overwritten: usize = 0;
+    var failed: usize = 0;
+
+    const lib_dir = skillCenterLibraryDir(allocator) orelse return .{ .installed = 0, .overwritten = 0, .failed = entries.len };
+    defer allocator.free(lib_dir);
+    const ref = repo.ref orelse "main";
+
+    const tmp_dir = std.fs.path.join(allocator, &.{ lib_dir, ".install-tmp" }) catch
+        return .{ .installed = 0, .overwritten = 0, .failed = entries.len };
+    defer allocator.free(tmp_dir);
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    for (entries) |entry| {
+        // Defense-in-depth: never let a downloaded skill name escape the library dir.
+        if (entry.name.len == 0 or
+            std.mem.eql(u8, entry.name, ".") or
+            std.mem.eql(u8, entry.name, "..") or
+            std.mem.indexOfScalar(u8, entry.name, '/') != null or
+            std.mem.indexOfScalar(u8, entry.name, '\\') != null)
+        {
+            failed += 1;
+            continue;
+        }
+        var ok = true;
+        for (entry.files) |file_path| {
+            const rel = skill_install.relInstallPath(entry.root_path, file_path) orelse continue;
+            // Fetch via the GitHub Contents API (api.github.com) rather than
+            // raw.githubusercontent.com: the same host that enumeration used and
+            // proved reachable. `Accept: application/vnd.github.raw` returns the
+            // file's raw bytes.
+            const url = skill_install.contentsApiUrl(allocator, repo.owner, repo.repo, file_path, ref) catch {
+                ok = false;
+                break;
+            };
+            defer allocator.free(url);
+            const dest = std.fs.path.join(allocator, &.{ tmp_dir, rel }) catch {
+                ok = false;
+                break;
+            };
+            defer allocator.free(dest);
+            update_install.downloadAssetAccept(allocator, url, dest, "application/vnd.github.raw") catch {
+                ok = false;
+                break;
+            };
+        }
+        if (!ok) {
+            failed += 1;
+            continue;
+        }
+
+        const final = std.fs.path.join(allocator, &.{ lib_dir, entry.name }) catch {
+            failed += 1;
+            continue;
+        };
+        defer allocator.free(final);
+        const staged = std.fs.path.join(allocator, &.{ tmp_dir, entry.name }) catch {
+            failed += 1;
+            continue;
+        };
+        defer allocator.free(staged);
+
+        const existed = blk: {
+            std.fs.accessAbsolute(final, .{}) catch break :blk false;
+            break :blk true;
+        };
+        std.fs.deleteTreeAbsolute(final) catch {
+            failed += 1;
+            continue;
+        };
+        std.fs.renameAbsolute(staged, final) catch {
+            failed += 1;
+            continue;
+        };
+        installed += 1;
+        if (existed) overwritten += 1;
+    }
+
+    return .{ .installed = installed, .overwritten = overwritten, .failed = failed };
+}
+
+/// ExecHost over a location: local POSIX, SSH when a conn is present, or the
+/// default WSL distro (`wsl.exe --exec sh -lc`) when `is_wsl` is set.
 const SkillLocExec = struct {
     conn: ?ssh_connection.SshConnection,
+    is_wsl: bool = false,
     fn exec(ctx: *anyopaque, allocator: std.mem.Allocator, command: []const u8) anyerror![]u8 {
         const self: *SkillLocExec = @ptrCast(@alignCast(ctx));
         if (self.conn) |c| return remote_file.sshExecCapture(allocator, c, command);
+        if (self.is_wsl) return remote_file.wslExec(allocator, command) orelse error.RemoteExecFailed;
         return remote_file.localPosixExec(allocator, command, 4 * 1024 * 1024);
     }
     fn host(self: *SkillLocExec) skill_scan.ExecHost {
@@ -1481,10 +1879,58 @@ fn skillCenterTargetConn(target: skill_center.Target) ?ssh_connection.SshConnect
     return null;
 }
 
-/// Adapts skill_transfer.Ops onto local/ssh/scp. conn null → a local-only target.
+/// Absolute path of a local target software's skills root (`~/.claude/skills`).
+/// Used by the native (non-POSIX) scan/transfer path where `$HOME` can't be
+/// expanded by a shell. Null if the home dir can't be resolved. Caller frees.
+fn skillCenterLocalRootPath(allocator: std.mem.Allocator, software: skill_center.Software) ?[]u8 {
+    const home = platform_dirs.homeDir(allocator) catch return null;
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, software.rootRel() }) catch null;
+}
+
+/// Scan a skills endpoint, picking the right backend:
+///   - remote (conn set): the POSIX `find`/`sha256sum` command over SSH.
+///   - WSL (`is_wsl`): the same command via `wsl.exe --exec sh -lc`.
+///   - local on a POSIX host: the same command via `sh -c` (preserves the
+///     existing Linux/macOS hashes).
+///   - local on a non-POSIX host (Windows, no WSL): a native `std.fs` scan whose
+///     aggregate hash matches the POSIX recipe byte-for-byte.
+/// `root_expr` is the shell root expression (for the SSH/POSIX/WSL paths);
+/// `local_path` is the raw absolute root (for the native path; null when remote).
+fn skillCenterScanOutcome(
+    allocator: std.mem.Allocator,
+    root_expr: []const u8,
+    local_path: ?[]const u8,
+    conn: ?ssh_connection.SshConnection,
+    is_wsl: bool,
+) skill_scan.ScanOutcome {
+    if (conn) |c| {
+        var le = SkillLocExec{ .conn = c };
+        return skill_scan.scanLocation(allocator, root_expr, le.host()) catch
+            return .{ .reachable = false, .rows = &.{} };
+    }
+    if (is_wsl) {
+        var le = SkillLocExec{ .conn = null, .is_wsl = true };
+        return skill_scan.scanLocation(allocator, root_expr, le.host()) catch
+            return .{ .reachable = false, .rows = &.{} };
+    }
+    if (remote_file.localPosixExecSupported()) {
+        var le = SkillLocExec{ .conn = null };
+        return skill_scan.scanLocation(allocator, root_expr, le.host()) catch
+            return .{ .reachable = false, .rows = &.{} };
+    }
+    const lp = local_path orelse return .{ .reachable = false, .rows = &.{} };
+    return skill_local_fs.scanOutcome(allocator, lp);
+}
+
+/// Adapts skill_transfer.Ops onto local/ssh/scp/WSL. conn null + !is_wsl → a
+/// local-only target; is_wsl → both endpoints reached via `wsl.exe` (see
+/// `wslSkillTransfer`, where the library lives under /mnt/<drive> and the target
+/// under $HOME, so the copy primitive is never invoked).
 /// `err_buf`/`err_len` capture the last ssh error summary for the UI toast.
 const SkillTransferCtx = struct {
     conn: ?ssh_connection.SshConnection,
+    is_wsl: bool = false,
     // Sized off ssh_error.MAX (+ margin) so a summary never gets re-truncated here.
     err_buf: [ssh_error.MAX + 40]u8 = undefined,
     err_len: usize = 0,
@@ -1499,11 +1945,22 @@ const SkillTransferCtx = struct {
     }
 
     fn localExec(ctx: *anyopaque, allocator: std.mem.Allocator, command: []const u8) bool {
-        _ = ctx;
+        const self: *SkillTransferCtx = @ptrCast(@alignCast(ctx));
+        // A WSL transfer runs every step (tar/extract/cleanup) over `wslExec`;
+        // skill_transfer only calls localExec for the LOCAL_TMP cleanup, whose
+        // path lives in the WSL /tmp and is already removed by the remoteExec
+        // `rm`. A no-op keeps that ignored cleanup from spuriously failing.
+        if (self.is_wsl) return true;
         return remote_file.localPosixExecOk(allocator, command);
     }
     fn remoteExec(ctx: *anyopaque, allocator: std.mem.Allocator, command: []const u8) bool {
         const self: *SkillTransferCtx = @ptrCast(@alignCast(ctx));
+        if (self.is_wsl) {
+            // Default WSL distro; stdout discarded (only exit status matters).
+            const out = remote_file.wslExec(allocator, command) orelse return false;
+            allocator.free(out);
+            return true;
+        }
         const c = self.conn orelse return false;
         // stdout is discarded; remoteExec only cares about exit status + stderr.
         var cap = remote_file.sshExecCaptureFull(allocator, c, command) catch return false;
@@ -1573,7 +2030,7 @@ fn skillCenterMakeImportState(allocator: std.mem.Allocator, model: *const skill_
     };
 }
 
-fn skillCenterAddMachine(allocator: std.mem.Allocator, labels: *std.ArrayListUnmanaged([]u8), targets: *std.ArrayListUnmanaged(skill_center.Target), machine_id: []const u8, machine_label: []const u8, is_local: bool) !void {
+fn skillCenterAddMachine(allocator: std.mem.Allocator, labels: *std.ArrayListUnmanaged([]u8), targets: *std.ArrayListUnmanaged(skill_center.Target), machine_id: []const u8, machine_label: []const u8, is_local: bool, is_wsl: bool) !void {
     const sws = [_]skill_center.Software{ .claude, .codex };
     for (sws) |sw| {
         const sw_label = switch (sw) {
@@ -1588,6 +2045,7 @@ fn skillCenterAddMachine(allocator: std.mem.Allocator, labels: *std.ArrayListUnm
             return e;
         };
         var tgt = try skill_center.Target.dupe(allocator, machine_id, machine_label, sw, is_local);
+        tgt.is_wsl = is_wsl;
         targets.append(allocator, tgt) catch |e| {
             tgt.deinit(allocator);
             return e;
@@ -1595,7 +2053,7 @@ fn skillCenterAddMachine(allocator: std.mem.Allocator, labels: *std.ArrayListUnm
     }
 }
 
-/// Build a target picker over {local, ssh profiles} × {claude, codex}.
+/// Build a target picker over {local, WSL (Windows), ssh profiles} × {claude, codex}.
 fn skillCenterBuildPicker(allocator: std.mem.Allocator, purpose: skill_center.Purpose, skill_name: []const u8) !skill_center.PickerState {
     var labels: std.ArrayListUnmanaged([]u8) = .empty;
     var targets: std.ArrayListUnmanaged(skill_center.Target) = .empty;
@@ -1605,7 +2063,13 @@ fn skillCenterBuildPicker(allocator: std.mem.Allocator, purpose: skill_center.Pu
         for (targets.items) |*t| t.deinit(allocator);
         targets.deinit(allocator);
     }
-    try skillCenterAddMachine(allocator, &labels, &targets, "local", i18n.s().sc_local, true);
+    try skillCenterAddMachine(allocator, &labels, &targets, "local", i18n.s().sc_local, true, false);
+    // The default WSL distro, only when one is actually installed (registry
+    // probe — never spawns wsl.exe, so a WSL-less machine never pops the
+    // "install WSL" window). Hidden on non-Windows hosts (wslAvailable false).
+    if (platform_pty_command.wslAvailable()) {
+        try skillCenterAddMachine(allocator, &labels, &targets, "wsl", i18n.s().sc_wsl, false, true);
+    }
     const names = overlays.sshProfileNames(allocator) catch &[_][]u8{};
     defer {
         for (names) |n| allocator.free(n);
@@ -1614,7 +2078,7 @@ fn skillCenterBuildPicker(allocator: std.mem.Allocator, purpose: skill_center.Pu
     for (names) |nm| {
         const id = try std.fmt.allocPrint(allocator, "ssh:{s}", .{nm});
         defer allocator.free(id);
-        try skillCenterAddMachine(allocator, &labels, &targets, id, nm, false);
+        try skillCenterAddMachine(allocator, &labels, &targets, id, nm, false, false);
     }
     const name_copy = try allocator.dupe(u8, skill_name);
     errdefer allocator.free(name_copy);
@@ -1654,23 +2118,27 @@ pub fn skillCenterImport() bool {
 fn skillCenterOpenImportList(allocator: std.mem.Allocator, target: skill_center.Target) void {
     const session = activeSkillCenter() orelse return;
     const conn = skillCenterTargetConn(target);
-    if (!target.is_local and conn == null) {
+    if (target.requiresSshConn() and conn == null) {
         overlays.showStatusToast(i18n.s().sc_toast_no_conn);
         return;
     }
     const root_expr = skill_transfer_cmd.homeRootExpr(allocator, target.software.rootRel()) catch return;
-    // ownership of root_expr moves into the job on success
+    // Raw root for the native (non-POSIX) path; null when remote or unresolvable.
+    const local_path: ?[]u8 = if (target.is_local) skillCenterLocalRootPath(allocator, target.software) else null;
+    // ownership of root_expr + local_path moves into the job on success
     const tgt = target.clone(allocator) catch {
         allocator.free(root_expr);
+        if (local_path) |p| allocator.free(p);
         return;
     };
     const job = allocator.create(SkillImportScanJob) catch {
         allocator.free(root_expr);
+        if (local_path) |p| allocator.free(p);
         var t = tgt;
         t.deinit(allocator);
         return;
     };
-    job.* = .{ .target = tgt, .conn = conn, .root_expr = root_expr };
+    job.* = .{ .target = tgt, .conn = conn, .root_expr = root_expr, .local_path = local_path };
     if (!session.startOp(.{ .ctx = job, .run = SkillImportScanJob.run, .destroy = SkillImportScanJob.destroy }, window_backend.postWakeup, i18n.s().sc_busy_syncing)) {
         SkillImportScanJob.destroy(@ptrCast(job), allocator);
         overlays.showStatusToast(i18n.s().sc_toast_op_busy);
@@ -1682,7 +2150,7 @@ fn skillCenterOpenImportList(allocator: std.mem.Allocator, target: skill_center.
 fn skillCenterRunTransfer(allocator: std.mem.Allocator, is_import: bool, target: skill_center.Target, name: []const u8) void {
     const session = activeSkillCenter() orelse return;
     const conn = skillCenterTargetConn(target);
-    if (!target.is_local and conn == null) {
+    if (target.requiresSshConn() and conn == null) {
         overlays.showStatusToast(i18n.s().sc_toast_no_conn);
         return;
     }
@@ -1693,24 +2161,39 @@ fn skillCenterRunTransfer(allocator: std.mem.Allocator, is_import: bool, target:
         allocator.free(lib_root);
         return;
     };
+    const lib_path = allocator.dupe(u8, lib_dir) catch {
+        allocator.free(lib_root);
+        allocator.free(tgt_root);
+        return;
+    };
+    // Raw target root for the native (non-POSIX) path; null when remote.
+    const tgt_path: ?[]u8 = if (target.is_local) skillCenterLocalRootPath(allocator, target.software) else null;
     const name_dup = allocator.dupe(u8, name) catch {
         allocator.free(lib_root);
         allocator.free(tgt_root);
+        allocator.free(lib_path);
+        if (tgt_path) |p| allocator.free(p);
         return;
     };
     const job = allocator.create(SkillTransferJob) catch {
         allocator.free(lib_root);
         allocator.free(tgt_root);
+        allocator.free(lib_path);
+        if (tgt_path) |p| allocator.free(p);
         allocator.free(name_dup);
         return;
     };
     job.* = .{
         .is_import = is_import,
         .conn = conn,
+        .is_wsl = target.is_wsl,
         .lib_root = lib_root,
         .tgt_root = tgt_root,
         .tgt_is_local = target.is_local,
         .name = name_dup,
+        .lib_path = lib_path,
+        .tgt_path = tgt_path,
+        .tgt_software = target.software,
     };
     if (!session.startOp(.{ .ctx = job, .run = SkillTransferJob.run, .destroy = SkillTransferJob.destroy }, window_backend.postWakeup, i18n.s().sc_busy_syncing)) {
         SkillTransferJob.destroy(@ptrCast(job), allocator);
@@ -1748,7 +2231,7 @@ fn skillCenterPreviewServerSkill(allocator: std.mem.Allocator) void {
     defer target.deinit(allocator); // only need conn + software here
 
     const conn = skillCenterTargetConn(target);
-    if (!target.is_local and conn == null) {
+    if (target.requiresSshConn() and conn == null) {
         overlays.showStatusToast(i18n.s().sc_toast_no_conn);
         allocator.free(name);
         return;
@@ -1762,12 +2245,20 @@ fn skillCenterPreviewServerSkill(allocator: std.mem.Allocator) void {
         allocator.free(name);
         return;
     };
+    // Absolute SKILL.md path for a LOCAL target so the worker can read it
+    // natively on a non-POSIX host; null for remote (uses the ssh cat cmd).
+    const local_md_path: ?[]u8 = if (target.is_local) blk: {
+        const root = skillCenterLocalRootPath(allocator, target.software) orelse break :blk null;
+        defer allocator.free(root);
+        break :blk std.fs.path.join(allocator, &.{ root, name, "SKILL.md" }) catch null;
+    } else null;
     const job = allocator.create(SkillPreviewJob) catch {
         allocator.free(name);
         allocator.free(cmd);
+        if (local_md_path) |p| allocator.free(p);
         return;
     };
-    job.* = .{ .conn = conn, .name = name, .cmd = cmd };
+    job.* = .{ .conn = conn, .is_wsl = target.is_wsl, .name = name, .cmd = cmd, .local_md_path = local_md_path };
     if (!session.startOp(.{ .ctx = job, .run = SkillPreviewJob.run, .destroy = SkillPreviewJob.destroy }, window_backend.postWakeup, i18n.s().sc_busy_loading)) {
         SkillPreviewJob.destroy(@ptrCast(job), allocator);
         overlays.showStatusToast(i18n.s().sc_toast_op_busy);
@@ -1803,17 +2294,21 @@ fn skillCenterArmConfirm(allocator: std.mem.Allocator, is_import: bool, target: 
 fn skillCenterDeployDecide(allocator: std.mem.Allocator, target: skill_center.Target, name: []const u8, src_hash: ?[]const u8) void {
     const session = activeSkillCenter() orelse return;
     const conn = skillCenterTargetConn(target);
-    if (!target.is_local and conn == null) {
+    if (target.requiresSshConn() and conn == null) {
         overlays.showStatusToast(i18n.s().sc_toast_no_conn);
         return;
     }
     const root_expr = skill_transfer_cmd.homeRootExpr(allocator, target.software.rootRel()) catch return;
+    // Raw root for the native (non-POSIX) path; null when remote or unresolvable.
+    const local_path: ?[]u8 = if (target.is_local) skillCenterLocalRootPath(allocator, target.software) else null;
     const tgt = target.clone(allocator) catch {
         allocator.free(root_expr);
+        if (local_path) |p| allocator.free(p);
         return;
     };
     const name_dup = allocator.dupe(u8, name) catch {
         allocator.free(root_expr);
+        if (local_path) |p| allocator.free(p);
         var t = tgt;
         t.deinit(allocator);
         return;
@@ -1822,6 +2317,7 @@ fn skillCenterDeployDecide(allocator: std.mem.Allocator, target: skill_center.Ta
     if (src_hash) |h| {
         hash_dup = allocator.dupe(u8, h) catch {
             allocator.free(root_expr);
+            if (local_path) |p| allocator.free(p);
             var t = tgt;
             t.deinit(allocator);
             allocator.free(name_dup);
@@ -1830,13 +2326,14 @@ fn skillCenterDeployDecide(allocator: std.mem.Allocator, target: skill_center.Ta
     }
     const job = allocator.create(SkillDeployScanJob) catch {
         allocator.free(root_expr);
+        if (local_path) |p| allocator.free(p);
         var t = tgt;
         t.deinit(allocator);
         allocator.free(name_dup);
         if (hash_dup) |h| allocator.free(h);
         return;
     };
-    job.* = .{ .target = tgt, .conn = conn, .root_expr = root_expr, .name = name_dup, .src_hash = hash_dup };
+    job.* = .{ .target = tgt, .conn = conn, .root_expr = root_expr, .local_path = local_path, .name = name_dup, .src_hash = hash_dup };
     if (!session.startOp(.{ .ctx = job, .run = SkillDeployScanJob.run, .destroy = SkillDeployScanJob.destroy }, window_backend.postWakeup, i18n.s().sc_busy_syncing)) {
         SkillDeployScanJob.destroy(@ptrCast(job), allocator);
         overlays.showStatusToast(i18n.s().sc_toast_op_busy);
@@ -1857,6 +2354,16 @@ fn skillCenterImportAct(allocator: std.mem.Allocator, target: skill_center.Targe
 pub fn skillCenterOverlaySelect() bool {
     const session = activeSkillCenter() orelse return false;
     const allocator = g_allocator orelse return false;
+    // URL input submits to the enumerate op (manages its own lock).
+    if (skillCenterUrlInputActive()) {
+        skillCenterStartEnumerate(session, allocator);
+        return true;
+    }
+    // The install checklist submits to the download op (manages its own lock).
+    if (skillCenterPickActive()) {
+        skillCenterStartInstall(session, allocator);
+        return true;
+    }
     const Act = enum { none, deploy_picked, import_picked, import_item, confirm };
     var act: Act = .none;
     var target: ?skill_center.Target = null;
@@ -1903,6 +2410,10 @@ pub fn skillCenterOverlaySelect() bool {
                 act = .confirm;
                 session.model.clearOverlay();
             },
+            // Handled by the early guards above; safety no-ops here.
+            .url_input => {},
+            .install_pick => {},
+            .text_preview => {},
             .none, .busy => {},
         }
     }
@@ -1960,12 +2471,16 @@ pub fn skillCenterPreviewSelected() bool {
     defer allocator.free(lib_dir);
     const abs = std.fs.path.join(allocator, &.{ lib_dir, rp }) catch return true;
     defer allocator.free(abs);
-    const command = skill_center.catCommand(allocator, abs) catch return true;
-    defer allocator.free(command);
-    const text = remote_file.localPosixExec(allocator, command, 1024 * 1024) catch null;
+    // Read the library file directly (no shell): the library is always a local
+    // absolute path, and `cat` via localPosixExec is unavailable on Windows.
+    const text = skill_local_fs.readFileAllocAbsolute(allocator, abs, 1024 * 1024) catch null;
     if (text) |t| {
         defer allocator.free(t);
-        openSkillMdInPreviewLeaf(allocator, name_buf[0..name_len], t);
+        var title_buf: [160]u8 = undefined;
+        const title = std.fmt.bufPrint(&title_buf, "{s} / SKILL.md", .{name_buf[0..name_len]}) catch name_buf[0..name_len];
+        session.mutex.lock();
+        session.model.openTextPreview(title, t) catch {};
+        session.mutex.unlock();
         markUiDirty();
     } else {
         overlays.showStatusToast(i18n.s().sc_toast_read_failed);
@@ -1973,10 +2488,39 @@ pub fn skillCenterPreviewSelected() bool {
     return true;
 }
 
+/// True when the scrollable SKILL.md preview overlay is showing.
+pub fn skillCenterTextPreviewActive() bool {
+    const session = activeSkillCenter() orelse return false;
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    return session.model.isTextPreview();
+}
+
+/// Scroll the open SKILL.md preview by `delta` wrapped lines (renderer clamps).
+pub fn skillCenterPreviewScroll(delta: isize) bool {
+    const session = activeSkillCenter() orelse return false;
+    session.mutex.lock();
+    session.model.scrollTextPreview(delta);
+    session.mutex.unlock();
+    markUiDirty();
+    return true;
+}
+
+/// Close the SKILL.md preview overlay.
+pub fn skillCenterPreviewClose() bool {
+    const session = activeSkillCenter() orelse return false;
+    session.mutex.lock();
+    session.model.clearOverlay();
+    session.mutex.unlock();
+    markUiDirty();
+    return true;
+}
+
 /// Space key in the Skill Center: preview the selected item by overlay kind.
 /// import_list → server skill (async); main library / deploy picker → local
 /// library skill; import picker / confirm → no-op. UI thread.
 pub fn skillCenterSpacePreview() bool {
+    if (skillCenterPickActive()) return skillCenterPickToggle();
     const session = activeSkillCenter() orelse return false;
     const allocator = g_allocator orelse return false;
     const Kind = enum { lib, server, none };
@@ -1989,6 +2533,9 @@ pub fn skillCenterSpacePreview() bool {
             .import_list => kind = .server,
             .picker => |*p| kind = if (p.purpose == .deploy) .lib else .none,
             .confirm => kind = .none,
+            .url_input => kind = .none,
+            .install_pick => kind = .none,
+            .text_preview => kind = .none, // input intercepts Space while previewing
         }
     }
     switch (kind) {
@@ -2001,15 +2548,19 @@ pub fn skillCenterSpacePreview() bool {
 
 pub fn aiHistoryInsertCodepoint(codepoint: u21) bool {
     const session = activeAiHistory() orelse return false;
-    if (codepoint == ' ') return aiHistoryPreviewSelectedTranscript();
-    if (codepoint < 0x20 or codepoint == 0x7f) return false;
-    var buf: [4]u8 = undefined;
-    const len = std.unicode.utf8Encode(codepoint, &buf) catch return false;
     session.mutex.lock();
-    session.appendFilterBytes(buf[0..len]);
+    const consumed = session.typeIntoSearch(codepoint);
     session.mutex.unlock();
-    markUiDirty();
-    return true;
+    if (consumed) markUiDirty();
+    return consumed;
+}
+
+/// True while the Sessions panel's Search box has keyboard focus. The input layer
+/// uses this to decide whether 'r'/Space type into the query or fire the
+/// Scan/Preview shortcuts.
+pub fn aiHistorySearchFocused() bool {
+    const session = activeAiHistory() orelse return false;
+    return session.focus == .search;
 }
 
 pub fn aiHistoryBackspaceFilter() bool {
@@ -2052,7 +2603,9 @@ pub fn aiHistoryNav(delta: isize) bool {
             session.ensureFilterCursorVisible(aiHistoryDateDaySlotsForWindow());
             session.ensureSelectionVisible(aiHistoryListVisibleRowsForWindow());
         },
-        .sessions => {
+        // While typing in the Search box, ↑/↓ still walk the result list so you can
+        // filter then arrow straight to a hit without leaving the query.
+        .search, .sessions => {
             session.moveSelection(delta);
             session.ensureSelectionVisible(aiHistoryListVisibleRowsForWindow());
         },
@@ -2327,12 +2880,12 @@ fn startAiHistoryScan(allocator: std.mem.Allocator, session: *ai_history_session
 /// that could not be resolved, or local on a non-POSIX host).
 /// Background job: scan the local library (`<config>/skills`) off the UI thread.
 const SkillLibraryScanJob = struct {
-    root_expr: []u8, // owned shell expression for the library root
+    root_expr: []u8, // owned shell expression for the library root (POSIX path)
+    local_path: []u8, // owned raw absolute library root (native path)
 
     fn run(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]skill_center.LibrarySkill {
         const job: *SkillLibraryScanJob = @ptrCast(@alignCast(ctx));
-        var le = SkillLocExec{ .conn = null };
-        const outcome = try skill_scan.scanLocation(allocator, job.root_expr, le.host());
+        const outcome = skillCenterScanOutcome(allocator, job.root_expr, job.local_path, null, false);
         // Move the scanned rows into the library list (frees the rows slice).
         return skill_center.libraryFromRows(allocator, outcome.rows);
     }
@@ -2340,6 +2893,7 @@ const SkillLibraryScanJob = struct {
     fn destroy(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         const job: *SkillLibraryScanJob = @ptrCast(@alignCast(ctx));
         allocator.free(job.root_expr);
+        allocator.free(job.local_path);
         allocator.destroy(job);
     }
 };
@@ -2349,26 +2903,24 @@ const SkillImportScanJob = struct {
     target: skill_center.Target, // owned
     conn: ?ssh_connection.SshConnection,
     root_expr: []u8, // owned
+    local_path: ?[]u8, // owned raw root when local; null when remote (native path)
 
     fn run(ctx: *anyopaque, allocator: std.mem.Allocator) skill_center.OpResult {
         const job: *SkillImportScanJob = @ptrCast(@alignCast(ctx));
-        var le = SkillLocExec{ .conn = job.conn };
-        var outcome = skill_scan.scanLocation(allocator, job.root_expr, le.host()) catch {
-            return .failed;
-        };
+        var outcome = skillCenterScanOutcome(allocator, job.root_expr, job.local_path, job.conn, job.target.is_wsl);
         const tgt = job.target.clone(allocator) catch {
             outcome.deinit(allocator);
             return .failed;
         };
-        // An unreachable source yields `{ reachable = false, rows = &.{} }` (not an
-        // exec error), so it survives the catch above; importScanResult turns it
-        // into `.failed` rather than an empty import list.
+        // An unreachable source yields `{ reachable = false, rows = &.{} }`;
+        // importScanResult turns it into `.failed` rather than an empty list.
         return skill_center.importScanResult(allocator, &outcome, tgt);
     }
     fn destroy(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         const job: *SkillImportScanJob = @ptrCast(@alignCast(ctx));
         job.target.deinit(allocator);
         allocator.free(job.root_expr);
+        if (job.local_path) |p| allocator.free(p);
         allocator.destroy(job);
     }
 };
@@ -2379,15 +2931,19 @@ const SkillDeployScanJob = struct {
     target: skill_center.Target, // owned
     conn: ?ssh_connection.SshConnection,
     root_expr: []u8, // owned
+    local_path: ?[]u8, // owned raw root when local; null when remote (native path)
     name: []u8, // owned
     src_hash: ?[]u8, // owned
 
     fn run(ctx: *anyopaque, allocator: std.mem.Allocator) skill_center.OpResult {
         const job: *SkillDeployScanJob = @ptrCast(@alignCast(ctx));
-        var le = SkillLocExec{ .conn = job.conn };
-        var outcome = skill_scan.scanLocation(allocator, job.root_expr, le.host()) catch {
+        var outcome = skillCenterScanOutcome(allocator, job.root_expr, job.local_path, job.conn, job.target.is_wsl);
+        // A genuinely unreachable target (SSH failure) → fail fast, as the old
+        // scan-error path did; a reachable-but-empty target deploys via `.direct`.
+        if (!outcome.reachable) {
+            outcome.deinit(allocator);
             return .failed;
-        };
+        }
         const tgt = job.target.clone(allocator) catch {
             outcome.deinit(allocator);
             return .failed;
@@ -2416,6 +2972,7 @@ const SkillDeployScanJob = struct {
         const job: *SkillDeployScanJob = @ptrCast(@alignCast(ctx));
         job.target.deinit(allocator);
         allocator.free(job.root_expr);
+        if (job.local_path) |p| allocator.free(p);
         allocator.free(job.name);
         if (job.src_hash) |h| allocator.free(h);
         allocator.destroy(job);
@@ -2426,20 +2983,28 @@ const SkillDeployScanJob = struct {
 const SkillTransferJob = struct {
     is_import: bool,
     conn: ?ssh_connection.SshConnection,
-    lib_root: []u8, // owned
-    tgt_root: []u8, // owned
+    is_wsl: bool,
+    lib_root: []u8, // owned shell expr (POSIX path)
+    tgt_root: []u8, // owned shell expr (POSIX path)
     tgt_is_local: bool,
     name: []u8, // owned
+    lib_path: []u8, // owned raw absolute library root (native path)
+    tgt_path: ?[]u8, // owned raw absolute target root when local; null when remote
+    tgt_software: skill_center.Software, // for resolving the remote root natively
 
     fn run(ctx: *anyopaque, allocator: std.mem.Allocator) skill_center.OpResult {
         const job: *SkillTransferJob = @ptrCast(@alignCast(ctx));
-        var tctx = SkillTransferCtx{ .conn = job.conn };
-        const lib_ep = skill_transfer.Endpoint{ .root_expr = job.lib_root, .is_local = true };
-        const tgt_ep = skill_transfer.Endpoint{ .root_expr = job.tgt_root, .is_local = job.tgt_is_local };
-        const from = if (job.is_import) tgt_ep else lib_ep;
-        const to = if (job.is_import) lib_ep else tgt_ep;
-        const r = skill_transfer.transfer(allocator, tctx.ops(), from, to, job.name);
-        const ok = (r == .ok);
+        var tctx = SkillTransferCtx{ .conn = job.conn, .is_wsl = job.is_wsl };
+        const ok = if (job.is_wsl)
+            wslSkillTransfer(allocator, job, &tctx)
+        else if (remote_file.localPosixExecSupported()) blk: {
+            // POSIX local host: the proven tar-over-scp dance (Linux/macOS).
+            const lib_ep = skill_transfer.Endpoint{ .root_expr = job.lib_root, .is_local = true };
+            const tgt_ep = skill_transfer.Endpoint{ .root_expr = job.tgt_root, .is_local = job.tgt_is_local };
+            const from = if (job.is_import) tgt_ep else lib_ep;
+            const to = if (job.is_import) lib_ep else tgt_ep;
+            break :blk skill_transfer.transfer(allocator, tctx.ops(), from, to, job.name) == .ok;
+        } else nativeSkillTransfer(allocator, job, &tctx);
         var summary: ?[]u8 = null;
         if (!ok) {
             if (tctx.lastErr()) |s| summary = allocator.dupe(u8, s) catch null;
@@ -2451,21 +3016,190 @@ const SkillTransferJob = struct {
         allocator.free(job.lib_root);
         allocator.free(job.tgt_root);
         allocator.free(job.name);
+        allocator.free(job.lib_path);
+        if (job.tgt_path) |p| allocator.free(p);
         allocator.destroy(job);
     }
 };
 
+/// Transfer a skill to/from the default WSL distro. Both endpoints are visible
+/// to a single `wsl.exe` shell — the library on the Windows filesystem reached
+/// at `/mnt/<drive>/…`, the target under `$HOME` — so the whole transfer runs
+/// inside WSL with no host↔guest file copy: tar-create + extract over `wslExec`
+/// (see `SkillTransferCtx` and the both-remote case of `skill_transfer`).
+/// `job.lib_path` is a native Windows path that must be converted to its guest
+/// `/mnt` form before `tar -C` can read it. Returns true on full success.
+fn wslSkillTransfer(allocator: std.mem.Allocator, job: *SkillTransferJob, tctx: *SkillTransferCtx) bool {
+    const guest_lib = (platform_wsl.hostPathToGuestPathAlloc(allocator, job.lib_path) catch null) orelse {
+        tctx.noteErr("library is not on a mounted drive");
+        return false;
+    };
+    defer allocator.free(guest_lib);
+    const lib_root = skill_transfer_cmd.absRootExpr(allocator, guest_lib) catch return false;
+    defer allocator.free(lib_root);
+
+    // Both endpoints remote (is_local = false) → skill_transfer skips its copy
+    // primitive and runs tar-create + extract entirely over wslExec.
+    const lib_ep = skill_transfer.Endpoint{ .root_expr = lib_root, .is_local = false };
+    const tgt_ep = skill_transfer.Endpoint{ .root_expr = job.tgt_root, .is_local = false };
+    const from = if (job.is_import) tgt_ep else lib_ep;
+    const to = if (job.is_import) lib_ep else tgt_ep;
+    return skill_transfer.transfer(allocator, tctx.ops(), from, to, job.name) == .ok;
+}
+
+/// Transfer a skill without a POSIX shell (native Windows, no WSL):
+///   - local↔local: a native `std.fs` directory copy with atomic swap.
+///   - local↔remote: `scp -r` to/from a staging dir + an SSH stage/swap, so the
+///     local side never needs `tar` or a `/tmp` path. The remote side stays
+///     POSIX (its `mkdir`/`mv` run over SSH). Returns true on full success.
+fn nativeSkillTransfer(allocator: std.mem.Allocator, job: *SkillTransferJob, tctx: *SkillTransferCtx) bool {
+    if (job.conn == null) {
+        const tgt_path = job.tgt_path orelse {
+            tctx.noteErr("could not resolve target path");
+            return false;
+        };
+        const src = if (job.is_import) tgt_path else job.lib_path;
+        const dst = if (job.is_import) job.lib_path else tgt_path;
+        skill_local_fs.transferLocalToLocal(allocator, src, dst, job.name) catch {
+            tctx.noteErr("local copy failed");
+            return false;
+        };
+        return true;
+    }
+    var conn = job.conn.?;
+    if (job.is_import) return nativeImportFromRemote(allocator, job, &conn, tctx);
+    return nativeDeployToRemote(allocator, job, &conn, tctx);
+}
+
+/// Resolve the target's ABSOLUTE skills root on the remote (e.g.
+/// `/home/user/.claude/skills`) by asking the remote shell to expand `$HOME`.
+/// scp must be handed a literal path: its default (SFTP) protocol does NOT
+/// shell-expand a `"$HOME"`/quoted remote spec — passing the shell expression
+/// would only work via the legacy `-O` fallback on a POSIX login shell, which
+/// breaks on modern Windows OpenSSH (SFTP default) and non-POSIX login shells.
+/// Caller frees. Null if the home can't be resolved.
+fn resolveRemoteSkillRoot(
+    allocator: std.mem.Allocator,
+    conn: *const ssh_connection.SshConnection,
+    software: skill_center.Software,
+) ?[]u8 {
+    const home = remote_file.sshExecCapture(allocator, conn.*, "printf %s \"$HOME\"") catch return null;
+    defer allocator.free(home);
+    const trimmed = std.mem.trim(u8, home, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    // POSIX remote path → always '/' separators, never std.fs.path.join.
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimmed, software.rootRel() }) catch null;
+}
+
+/// Deploy the library skill to a remote target via `scp -r` (no local tar).
+fn nativeDeployToRemote(
+    allocator: std.mem.Allocator,
+    job: *SkillTransferJob,
+    conn: *const ssh_connection.SshConnection,
+    tctx: *SkillTransferCtx,
+) bool {
+    const abs_root = resolveRemoteSkillRoot(allocator, conn, job.tgt_software) orelse {
+        tctx.noteErr("could not resolve remote home");
+        return false;
+    };
+    defer allocator.free(abs_root);
+    const root_expr = skill_transfer_cmd.absRootExpr(allocator, abs_root) catch return false;
+    defer allocator.free(root_expr);
+
+    const prep = skill_transfer_cmd.remoteStagePrepCmd(allocator, root_expr) catch return false;
+    defer allocator.free(prep);
+    if (!SkillTransferCtx.remoteExec(tctx, allocator, prep)) return false;
+
+    const local_src = std.fs.path.join(allocator, &.{ job.lib_path, job.name }) catch return false;
+    defer allocator.free(local_src);
+    // Clean absolute remote path for scp (works under both the SFTP-default and
+    // legacy protocols); the ssh prep above created exactly this dir.
+    const remote_stage = std.fmt.allocPrint(allocator, "{s}/{s}", .{ abs_root, skill_transfer_cmd.XFER_STAGING }) catch return false;
+    defer allocator.free(remote_stage);
+    var spec_buf: [512]u8 = undefined;
+    const dst_spec = scp.remoteSpec(&spec_buf, conn, remote_stage);
+    var control: scp.TransferControl = .{};
+    if (scp.transferDirWithControl(allocator, conn, local_src, dst_spec, &control) != .ok) {
+        tctx.noteErr("scp upload failed");
+        return false;
+    }
+
+    const swap = skill_transfer_cmd.remoteStageSwapCmd(allocator, root_expr, job.name) catch return false;
+    defer allocator.free(swap);
+    return SkillTransferCtx.remoteExec(tctx, allocator, swap);
+}
+
+/// Import a remote skill into the library via `scp -r` into a local staging dir,
+/// then a native atomic swap.
+fn nativeImportFromRemote(
+    allocator: std.mem.Allocator,
+    job: *SkillTransferJob,
+    conn: *const ssh_connection.SshConnection,
+    tctx: *SkillTransferCtx,
+) bool {
+    const abs_root = resolveRemoteSkillRoot(allocator, conn, job.tgt_software) orelse {
+        tctx.noteErr("could not resolve remote home");
+        return false;
+    };
+    defer allocator.free(abs_root);
+
+    skill_local_fs.ensureDirAbsolute(job.lib_path) catch {
+        tctx.noteErr("library dir unavailable");
+        return false;
+    };
+    const staging = std.fs.path.join(allocator, &.{ job.lib_path, skill_transfer_cmd.XFER_STAGING }) catch return false;
+    defer allocator.free(staging);
+    std.fs.deleteTreeAbsolute(staging) catch {};
+    skill_local_fs.ensureDirAbsolute(staging) catch {
+        tctx.noteErr("local staging failed");
+        return false;
+    };
+    defer std.fs.deleteTreeAbsolute(staging) catch {};
+
+    // Clean absolute remote source path for scp (SFTP-default safe).
+    const remote_src = std.fmt.allocPrint(allocator, "{s}/{s}", .{ abs_root, job.name }) catch return false;
+    defer allocator.free(remote_src);
+    var spec_buf: [512]u8 = undefined;
+    const src_spec = scp.remoteSpec(&spec_buf, conn, remote_src);
+    var control: scp.TransferControl = .{};
+    if (scp.transferDirWithControl(allocator, conn, src_spec, staging, &control) != .ok) {
+        tctx.noteErr("scp download failed");
+        return false;
+    }
+
+    const staged_skill = std.fs.path.join(allocator, &.{ staging, job.name }) catch return false;
+    defer allocator.free(staged_skill);
+    const final = std.fs.path.join(allocator, &.{ job.lib_path, job.name }) catch return false;
+    defer allocator.free(final);
+    std.fs.deleteTreeAbsolute(final) catch {};
+    std.fs.renameAbsolute(staged_skill, final) catch {
+        tctx.noteErr("local install failed");
+        return false;
+    };
+    return true;
+}
+
 /// Background op: read one skill's SKILL.md (local or via ssh) for preview.
 const SkillPreviewJob = struct {
     conn: ?ssh_connection.SshConnection,
+    is_wsl: bool,
     name: []u8, // owned — becomes the preview title
     cmd: []u8, // owned — `cat <root>/'<name>'/'SKILL.md'`
+    local_md_path: ?[]u8, // owned absolute SKILL.md path for a LOCAL target (native read)
 
     fn run(ctx: *anyopaque, allocator: std.mem.Allocator) skill_center.OpResult {
         const job: *SkillPreviewJob = @ptrCast(@alignCast(ctx));
-        var le = SkillLocExec{ .conn = job.conn };
-        const host = le.host();
-        const content = host.exec(host.ctx, allocator, job.cmd) catch return .failed;
+        // Local target on a non-POSIX host (Windows): read SKILL.md natively;
+        // `cat` via localPosixExec is unavailable. Remote/posix/WSL use the shell
+        // cmd (WSL via `wsl.exe`, see SkillLocExec).
+        const content = if (job.conn == null and !job.is_wsl and !remote_file.localPosixExecSupported()) blk: {
+            const p = job.local_md_path orelse return .failed;
+            break :blk skill_local_fs.readFileAllocAbsolute(allocator, p, 1024 * 1024) catch return .failed;
+        } else blk: {
+            var le = SkillLocExec{ .conn = job.conn, .is_wsl = job.is_wsl };
+            const host = le.host();
+            break :blk host.exec(host.ctx, allocator, job.cmd) catch return .failed;
+        };
         const title = allocator.dupe(u8, job.name) catch {
             allocator.free(content);
             return .failed;
@@ -2476,9 +3210,76 @@ const SkillPreviewJob = struct {
         const job: *SkillPreviewJob = @ptrCast(@alignCast(ctx));
         allocator.free(job.name);
         allocator.free(job.cmd);
+        if (job.local_md_path) |p| allocator.free(p);
         allocator.destroy(job);
     }
 };
+
+/// Background op: parse the URL, resolve the default branch if absent, fetch the
+/// Git Trees response, and enumerate skills for the checklist.
+const SkillInstallEnumerateJob = struct {
+    url: []u8, // owned
+
+    fn run(ctx: *anyopaque, allocator: std.mem.Allocator) skill_center.OpResult {
+        const job: *SkillInstallEnumerateJob = @ptrCast(@alignCast(ctx));
+        var repo = skill_install.parseGithubUrl(allocator, job.url) catch return .failed;
+        // NB: `enumerate` is error-returning so `errdefer` fires on every failure
+        // path below (the bare `return .failed` of the plan's code would leak
+        // `repo` because a value-return does not trigger errdefer).
+        return enumerate(allocator, &repo) catch {
+            repo.deinit(allocator);
+            return .failed;
+        };
+    }
+    fn enumerate(allocator: std.mem.Allocator, repo: *skill_install.RepoRef) !skill_center.OpResult {
+        // Resolve the ref if the URL had none.
+        if (repo.ref == null) {
+            repo.ref = resolveDefaultBranch(allocator, repo.owner, repo.repo) catch
+                try allocator.dupe(u8, "main");
+        }
+
+        const api = try skill_install.treeApiUrl(allocator, repo.owner, repo.repo, repo.ref.?);
+        defer allocator.free(api);
+        const json = try update_install.httpGetAlloc(allocator, api, 8 * 1024 * 1024);
+        defer allocator.free(json);
+
+        const res = try skill_install.findSkills(allocator, json, repo.subpath);
+        return .{ .install_enumerate = .{ .repo = repo.*, .entries = res.entries, .truncated = res.truncated } };
+    }
+    fn destroy(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const job: *SkillInstallEnumerateJob = @ptrCast(@alignCast(ctx));
+        allocator.free(job.url);
+        allocator.destroy(job);
+    }
+};
+
+/// Background op: download + install the selected skills into the library.
+const SkillInstallDownloadJob = struct {
+    repo: skill_install.RepoRef, // owned
+    entries: []skill_install.SkillEntry, // owned
+
+    fn run(ctx: *anyopaque, allocator: std.mem.Allocator) skill_center.OpResult {
+        const job: *SkillInstallDownloadJob = @ptrCast(@alignCast(ctx));
+        const r = downloadSelectedSkillsToLibrary(allocator, job.repo, job.entries);
+        return .{ .install_done = .{ .installed = r.installed, .overwritten = r.overwritten, .failed = r.failed } };
+    }
+    fn destroy(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const job: *SkillInstallDownloadJob = @ptrCast(@alignCast(ctx));
+        job.repo.deinit(allocator);
+        skill_install.freeEntries(allocator, job.entries);
+        allocator.destroy(job);
+    }
+};
+
+/// Best-effort default-branch resolution. Tries the repo API's `default_branch`,
+/// then falls back to "master" (the caller defaults to "main" on total failure).
+fn resolveDefaultBranch(allocator: std.mem.Allocator, owner: []const u8, repo: []const u8) ![]u8 {
+    const api = try skill_install.repoApiUrl(allocator, owner, repo);
+    defer allocator.free(api);
+    const json = update_install.httpGetAlloc(allocator, api, 1024 * 1024) catch return allocator.dupe(u8, "master");
+    defer allocator.free(json);
+    return skill_install.parseDefaultBranch(allocator, json) catch allocator.dupe(u8, "master");
+}
 
 /// Kick off an async library scan for `session`. UI thread.
 fn startSkillCenterScan(allocator: std.mem.Allocator, session: *skill_center.Session) void {
@@ -2491,12 +3292,18 @@ fn startSkillCenterScan(allocator: std.mem.Allocator, session: *skill_center.Ses
         session.publishScanFailure(session.scan_generation);
         return;
     };
-    const job = allocator.create(SkillLibraryScanJob) catch {
+    const local_path = allocator.dupe(u8, lib_dir) catch {
         allocator.free(root_expr);
         session.publishScanFailure(session.scan_generation);
         return;
     };
-    job.* = .{ .root_expr = root_expr };
+    const job = allocator.create(SkillLibraryScanJob) catch {
+        allocator.free(root_expr);
+        allocator.free(local_path);
+        session.publishScanFailure(session.scan_generation);
+        return;
+    };
+    job.* = .{ .root_expr = root_expr, .local_path = local_path };
     session.scanAsync(.{ .ctx = job, .run = SkillLibraryScanJob.run, .destroy = SkillLibraryScanJob.destroy });
 }
 
@@ -2565,6 +3372,13 @@ pub fn aiHistoryHandleMousePress(xpos: f64, ypos: f64) bool {
 
     switch (hit) {
         .none => {},
+        .search => {
+            session.mutex.lock();
+            session.focus = .search;
+            session.mutex.unlock();
+            markUiDirty();
+            return true;
+        },
         .refresh => {
             _ = aiHistoryScanLocalNow();
             return true;
@@ -2589,8 +3403,10 @@ pub fn aiHistoryHandleMousePress(xpos: f64, ypos: f64) bool {
         .row => |visible_index| {
             // Re-lock independently of the hit-test above: a worker may have
             // replaced rows in between, but selectVisibleIndex clamps to the
-            // current visible count, so a now-stale index is safe.
+            // current visible count, so a now-stale index is safe. Clicking a row
+            // also moves focus to the list so 'r'/Space act as Scan/Preview again.
             session.mutex.lock();
+            session.focus = .sessions;
             session.selectVisibleIndex(visible_index);
             session.ensureSelectionVisible(visible_rows);
             session.mutex.unlock();
@@ -2701,6 +3517,13 @@ pub fn aiCopilotVisible() bool {
     return tab.activeCopilotVisible();
 }
 
+/// True when a right-docked panel (browser / Jupyter webview) is showing for the
+/// active tab. The Copilot edge handle defers while one is up, since they share
+/// the exclusive right slot.
+pub fn anyRightDockPanelVisible() bool {
+    return browser_panel.isVisibleForActiveTab();
+}
+
 /// Hide the active tab's copilot panel if visible (used by the right-slot
 /// arbiter when another right panel opens). No-op if already hidden.
 pub fn hideAiCopilot() void {
@@ -2801,6 +3624,7 @@ pub fn toggleAiCopilot() void {
     _ = tab.setActiveCopilotVisible(true);
     _ = ensureActiveCopilotSession();
     input.focusAiCopilot();
+    if (g_allocator) |alloc| platform_window_state.setCopilotHintShown(alloc);
     g_force_rebuild = true;
     g_cells_valid = false;
 }
@@ -2957,7 +3781,7 @@ fn clearUiStateOnTabChange() void {
 fn getActiveCwd(cwd_buf: *platform_pty_command.CwdBuffer) platform_pty_command.Cwd {
     if (tab.activeSurface()) |surface| {
         if (surface.getCwd()) |guest_path| {
-            if (platform_wsl.guestPathToNativeCwd(guest_path, cwd_buf)) |cwd| {
+            if (platform_wsl.nativeCwdForLaunchKind(surface.launch_kind, guest_path, cwd_buf)) |cwd| {
                 return platform_pty_command.cwdFromBuffer(cwd_buf, cwd.len);
             }
         }
@@ -2989,6 +3813,10 @@ fn installSessionRestoreHooks() void {
     // tab.zig routes persisted AI snapshots back through these hooks.
     tab.g_ai_restore_hook = reopenAiChatTabFromHistorySessionId;
     tab.g_ai_history_restore_hook = reopenAiHistoryTabFromSnapshot;
+    // tmux session persistence (#4c): save the active tmux profile names; on
+    // restore, re-attach each via the launcher's tmux connect path.
+    tab.g_tmux_active_profiles_hook = tmux_controller.activeProfileNames;
+    tab.g_tmux_restore_hook = overlays.connectProfileByNameTmux;
 }
 
 fn deinitGlobalAgentHistoryStore(allocator: std.mem.Allocator) void {
@@ -3116,6 +3944,27 @@ pub fn spawnTabWithCommandUtf8(command: []const u8) bool {
     return spawnTabWithCommandUtf8ReturningSurface(command) != null;
 }
 
+/// Start a tmux control-mode session (Phase 3d). `ssh_cmd` is a full
+/// `ssh … tmux -CC …` command; `password` is injected at the SSH prompt (empty
+/// for key auth). The controller (pumped from the main loop) builds tabs/splits
+/// from the remote tmux windows/panes. Returns false if the transport could not
+/// be launched.
+pub fn startTmuxSession(ssh_cmd: []const u8, password: []const u8, profile_name: []const u8, ssh_conn: ?@import("ssh_connection.zig").SshConnection) bool {
+    const allocator = g_allocator orelse return false;
+    return tmux_controller.start(
+        allocator,
+        ssh_cmd,
+        password,
+        profile_name,
+        term_cols,
+        term_rows,
+        tab.g_scrollback_limit,
+        g_cursor_style,
+        g_cursor_blink,
+        ssh_conn,
+    );
+}
+
 pub fn spawnTabWithCommandUtf8ReturningSurface(command: []const u8) ?*Surface {
     const allocator = g_allocator orelse return null;
     const command_line = platform_pty_command.allocCommandLineFromUtf8(allocator, command) catch return null;
@@ -3130,6 +3979,14 @@ pub fn spawnTabWithCommandUtf8ReturningSurface(command: []const u8) ?*Surface {
 
 pub fn syncDefaultShellCommandFromConfig(shell: []const u8) void {
     tab.g_shell_cmd_len = App.resolveShellCommandLine(&tab.g_shell_cmd_buf, shell);
+}
+
+/// Store the configured primary font family in our own buffer. Must be used
+/// instead of aliasing App.font_family, which is freed/reallocated on reload.
+fn setRequestedFont(family: []const u8) void {
+    const n = @min(family.len, g_requested_font_buf.len);
+    @memcpy(g_requested_font_buf[0..n], family[0..n]);
+    g_requested_font = g_requested_font_buf[0..n];
 }
 
 threadlocal var g_configured_shell_title_buf: [1024]u8 = undefined;
@@ -3442,6 +4299,9 @@ fn syncFileExplorerToActiveTerminalSurface(force: bool) void {
 pub fn closeTab(idx: usize) void {
     const allocator = g_allocator orelse return;
     if (tab.g_tab_count <= 1 or idx >= tab.g_tab_count) return;
+    if (tab.g_tabs[idx]) |closing| {
+        if (closing.tmux_window_id != null) tmux_controller.forgetClosedTab(closing);
+    }
     tab.closeTab(idx, allocator);
     file_explorer.onTabClosed(idx);
     browser_panel.onTabClosed(idx);
@@ -3473,11 +4333,26 @@ pub fn splitFocused(direction: SplitTree.Split.Direction) void {
 
 pub fn splitFocusedReturningSurface(direction: SplitTree.Split.Direction) ?*Surface {
     const allocator = g_allocator orelse return null;
+
+    // In a tmux-backed tab, a split must be a real tmux pane: drive
+    // `split-window` and let the echoed %layout-change reconcile the new pane.
+    // Returning null here is correct — the new surface arrives asynchronously
+    // via the controller, not from this call.
+    if (tab.activeTab()) |t| {
+        if (t.tmux_window_id != null) {
+            if (t.focusedSurface()) |focused| {
+                const horizontal = direction == .left or direction == .right;
+                _ = tmux_controller.requestSplit(focused, horizontal);
+            }
+            return null; // a tmux tab's splits are owned by tmux; never spawn a local/ssh surface
+        }
+    }
+
     var cwd_buf: platform_pty_command.CwdBuffer = undefined;
     const cwd = getActiveCwd(&cwd_buf);
     const surface = tab.splitFocusedReturningSurface(allocator, direction, font.cell_width, font.cell_height, g_cursor_style, g_cursor_blink, cwd) orelse return null;
     if (surface.ssh_connection) |conn| {
-        if (conn.password_auth) {
+        if (conn.usesPasswordAuth()) {
             const pw = conn.password();
             if (pw.len > 0)
                 overlays.scheduleSshPasswordForSurface(surface, pw);
@@ -3493,6 +4368,17 @@ pub fn splitFocusedReturningSurface(direction: SplitTree.Split.Direction) ?*Surf
 
 pub fn closeFocusedSplit() void {
     const allocator = g_allocator orelse return;
+
+    // tmux tab: kill-pane and let tmux drive removal — its %layout-change drops
+    // the split, or %window-close drops the whole tab when the last pane goes.
+    if (tab.activeTab()) |t| {
+        if (t.tmux_window_id != null) {
+            if (t.focusedSurface()) |focused| {
+                if (tmux_controller.requestClosePane(focused)) return;
+            }
+        }
+    }
+
     const closing_tab_idx = active_tab_state.g_active_tab;
     var closing_surface_id: ?[16]u8 = null;
     if (tab.activeSurface()) |surface| closing_surface_id = surface.remote_id;
@@ -3628,6 +4514,8 @@ pub threadlocal var g_focus_follows_mouse: bool = false;
 threadlocal var g_agent_context_surface_id: [16]u8 = undefined;
 threadlocal var g_agent_context_surface_id_len: usize = 0;
 pub threadlocal var g_copy_on_select: bool = false;
+pub threadlocal var g_copilot_hint: bool = true;
+threadlocal var g_copilot_shimmer_checked: bool = false;
 pub threadlocal var g_right_click_action: Config.RightClickAction = .copy;
 pub threadlocal var g_ssh_legacy_algorithms: bool = false;
 pub threadlocal var g_desktop_notifications: bool = true;
@@ -3873,6 +4761,7 @@ fn renderResizeFrame(width: i32, height: i32) void {
                         // terminal arm leaves a per-rect viewport set).
                         gpu.state.setViewport(0, 0, @intCast(fb_width), @intCast(fb_height));
                         gpu.gl_init.setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+                        const close_hovered = if (input.g_preview_close_hover) |h| h == rect.handle else false;
                         markdown_preview_renderer.renderInto(
                             p,
                             @floatFromInt(rect.x),
@@ -3880,6 +4769,7 @@ fn renderResizeFrame(width: i32, height: i32) void {
                             @floatFromInt(rect.width),
                             @floatFromInt(rect.height),
                             @floatFromInt(fb_height),
+                            close_hovered,
                         );
                         if (is_focused) drawPaneFocusRing(rect, @floatFromInt(fb_height));
                     },
@@ -3890,6 +4780,7 @@ fn renderResizeFrame(width: i32, height: i32) void {
             gpu.state.setViewport(0, 0, @intCast(fb_width), @intCast(fb_height));
             gpu.gl_init.setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
             overlays.renderSplitDividers(active_tab, content_x, content_y, content_w, content_h, @floatFromInt(fb_height));
+            overlays.renderPaneAgentDots(active_tab, content_x, content_y, content_w, content_h, @floatFromInt(fb_height));
         }
     } else {
         gpu.state.setViewport(0, 0, @intCast(fb_width), @intCast(fb_height));
@@ -3939,47 +4830,9 @@ fn resizeWindowToGrid() void {
     if (g_window) |w| window_backend.resizeClientArea(w, win_w, win_h);
 }
 
-fn triggerSkillUpdate() void {
-    if (g_app) |app| app.requestSkillUpdate();
-}
-
 fn pollUpdateCheck(app: *App) void {
     const result = app.consumeUpdateResult();
     if (result.state != .idle) overlays.showUpdateCheckResult(result);
-}
-
-fn pollSkillUpdate(app: *App) void {
-    const result = app.consumeSkillUpdateResult();
-    switch (result.state) {
-        .idle, .downloading => {},
-        .done => {
-            if (result.count == 0) {
-                overlays.showStatusToast("Skills already up to date");
-            } else {
-                var buf: [64]u8 = undefined;
-                const msg: []const u8 = std.fmt.bufPrint(&buf, "Skills updated ({d})", .{result.count}) catch "Skills updated";
-                overlays.showStatusToast(msg);
-            }
-            if (activeAiChat()) |session| session.reloadSkillSuggestions();
-        },
-        .failed => overlays.showStatusToast("Skill update failed"),
-    }
-}
-
-/// Open a SKILL.md preview in a reused-or-new preview leaf. UI thread.
-fn openSkillMdInPreviewLeaf(allocator: std.mem.Allocator, title: []const u8, content: []const u8) void {
-    const at = tab.activeTab() orelse return;
-    const pane = if (tab.previewForReuse(allocator, at, .markdown)) |h|
-        switch (at.tree.nodes[h.idx()]) {
-            .leaf => |pn| switch (pn) {
-                .preview => |p| p,
-                else => return,
-            },
-            .split => return,
-        }
-    else
-        (tab.splitIntoPreviewStacked(allocator) orelse return);
-    pane.open(.markdown, title, "SKILL.md", content);
 }
 
 /// UI thread: consume a finished skill-center op result and apply it (open the
@@ -4033,7 +4886,41 @@ fn pollSkillCenterOp(session: *skill_center.Session) void {
             }
         },
         .preview => |*v| {
-            openSkillMdInPreviewLeaf(allocator, v.title, v.content);
+            session.mutex.lock();
+            session.model.openTextPreview(v.title, v.content) catch {};
+            session.mutex.unlock();
+        },
+        .install_enumerate => {
+            const moved = result; // shallow copy of the union (owns repo+entries)
+            result = .failed; // outer defer now no-ops; `moved` is sole owner
+            const v = moved.install_enumerate;
+            if (v.entries.len == 0) {
+                var mv = moved;
+                mv.deinit(allocator); // free repo+entries
+                overlays.showStatusToast(i18n.s().sc_toast_no_skills);
+            } else {
+                if (v.truncated) overlays.showStatusToast(i18n.s().sc_toast_truncated);
+                const checked = allocator.alloc(bool, v.entries.len) catch {
+                    var mv = moved;
+                    mv.deinit(allocator);
+                    markUiDirty();
+                    return;
+                };
+                for (checked) |*c| c.* = true; // default: all selected
+                session.mutex.lock();
+                session.model.setOverlay(.{ .install_pick = .{ .repo = v.repo, .entries = v.entries, .checked = checked } });
+                session.mutex.unlock();
+                // ownership of v.repo + v.entries now belongs to the overlay; do NOT deinit `moved`.
+            }
+        },
+        .install_done => |*v| {
+            if (v.failed == 0) {
+                overlays.showStatusToast(i18n.s().sc_toast_installed);
+            } else {
+                overlays.showStatusToast(i18n.s().sc_toast_install_partial);
+            }
+            log.info("skill install: {d} installed, {d} updated, {d} failed", .{ v.installed, v.overwritten, v.failed });
+            startSkillCenterScan(allocator, session); // refresh the library list
         },
     }
     markUiDirty();
@@ -4097,6 +4984,7 @@ fn applyReloadedConfig(allocator: std.mem.Allocator, cfg: *const Config) void {
     overlays.g_unfocused_split_opacity = cfg.@"unfocused-split-opacity";
     g_focus_follows_mouse = cfg.@"focus-follows-mouse";
     g_copy_on_select = cfg.@"copy-on-select";
+    g_copilot_hint = cfg.@"copilot-hint";
     g_right_click_action = cfg.@"right-click-action";
     input.g_url_open_mode = cfg.@"url-open-mode";
     g_ssh_legacy_algorithms = cfg.@"ssh-legacy-algorithms";
@@ -4140,8 +5028,11 @@ fn applyReloadedConfig(allocator: std.mem.Allocator, cfg: *const Config) void {
     const new_font_size = cfg.@"font-size";
     const new_weight = font_backend.fontWeightFromValue(cfg.@"font-style".value());
     const new_family = cfg.@"font-family";
-    font.g_cjk_font_family = cfg.@"font-family-cjk";
-    font.g_fallback_font_families = cfg.@"font-family-fallback";
+    // Copy into the font module's own buffers: `cfg` is deinit'd right after
+    // this returns, and these globals are read lazily on the next fallback
+    // lookup. Aliasing the config-owned slices here was a use-after-free.
+    font.setCjkFontFamily(cfg.@"font-family-cjk");
+    font.setFallbackFontFamilies(cfg.@"font-family-fallback");
 
     const font_changed = new_font_size != font.g_font_size;
 
@@ -4503,6 +5394,101 @@ fn buildRemoteLayoutJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmana
     try out.appendSlice(allocator, "]}");
 }
 
+/// Lightweight panes listing for the agent-control API. Mirrors
+/// buildRemoteLayoutJson's terminal branch but omits the heavy per-surface
+/// scrollback snapshot (that is get-text's job) and adds the surface cwd.
+/// Non-terminal tabs (AI chat / history / etc.) appear as a minimal entry so
+/// the listing is complete. UI-thread only (reads threadlocal tab state).
+fn buildCtlPanesJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    try out.appendSlice(allocator, "{\"activeTab\":");
+    try out.print(allocator, "{d}", .{active_tab_state.g_active_tab});
+    try out.appendSlice(allocator, ",\"tabs\":[");
+
+    var wrote_tab = false;
+    for (0..tab.g_tab_count) |tab_index| {
+        const tab_state = tab.g_tabs[tab_index] orelse continue;
+        if (wrote_tab) try out.append(allocator, ',');
+        wrote_tab = true;
+
+        if (tab_state.kind != .terminal) {
+            try out.appendSlice(allocator, "{\"index\":");
+            try out.print(allocator, "{d}", .{tab_index});
+            try out.appendSlice(allocator, ",\"title\":\"");
+            try remote.appendJsonString(out, allocator, tab_state.getTitle());
+            try out.appendSlice(allocator, "\",\"kind\":\"");
+            try remote.appendJsonString(out, allocator, @tagName(tab_state.kind));
+            try out.appendSlice(allocator, "\",\"surfaces\":[]}");
+            continue;
+        }
+
+        try out.appendSlice(allocator, "{\"index\":");
+        try out.print(allocator, "{d}", .{tab_index});
+        try out.appendSlice(allocator, ",\"title\":\"");
+        try remote.appendJsonString(out, allocator, tab_state.getTitle());
+        try out.appendSlice(allocator, "\",\"kind\":\"terminal\",\"focusedSurfaceId\":\"");
+        if (tab_state.focusedSurface()) |focused|
+            try remote.appendJsonString(out, allocator, focused.remote_id[0..]);
+        try out.appendSlice(allocator, "\",\"surfaces\":[");
+
+        var spatial = tab_state.tree.spatial(allocator) catch null;
+        defer if (spatial) |*sp| sp.deinit(allocator);
+
+        var wrote_surface = false;
+        var it = tab_state.tree.surfaces();
+        while (it.next()) |entry| {
+            if (wrote_surface) try out.append(allocator, ',');
+            wrote_surface = true;
+
+            try out.appendSlice(allocator, "{\"id\":\"");
+            try remote.appendJsonString(out, allocator, entry.surface.remote_id[0..]);
+            try out.appendSlice(allocator, "\",\"title\":\"");
+            try remote.appendJsonString(out, allocator, entry.surface.getTitle());
+            try out.appendSlice(allocator, "\",\"focused\":");
+            try out.appendSlice(allocator, if (entry.handle == tab_state.focused) "true" else "false");
+            try appendAgentDetectionJson(allocator, out, entry.surface);
+            try out.appendSlice(allocator, ",\"cols\":");
+            try out.print(allocator, "{d}", .{entry.surface.size.grid.cols});
+            try out.appendSlice(allocator, ",\"rows\":");
+            try out.print(allocator, "{d}", .{entry.surface.size.grid.rows});
+            var cx: usize = 0;
+            var cy: usize = 0;
+            {
+                entry.surface.render_state.mutex.lock();
+                defer entry.surface.render_state.mutex.unlock();
+                cx = entry.surface.terminal.screens.active.cursor.x;
+                cy = entry.surface.terminal.screens.active.cursor.y;
+            }
+            try out.appendSlice(allocator, ",\"cursorX\":");
+            try out.print(allocator, "{d}", .{cx});
+            try out.appendSlice(allocator, ",\"cursorY\":");
+            try out.print(allocator, "{d}", .{cy});
+            try out.appendSlice(allocator, ",\"cwd\":\"");
+            if (entry.surface.getCwd()) |cwd| try remote.appendJsonString(out, allocator, cwd);
+            try out.append(allocator, '"');
+
+            if (spatial) |sp| {
+                const slot = sp.slots[entry.handle.idx()];
+                try out.appendSlice(allocator, ",\"x\":");
+                try out.print(allocator, "{d:.5}", .{@as(f64, @floatCast(slot.x))});
+                try out.appendSlice(allocator, ",\"y\":");
+                try out.print(allocator, "{d:.5}", .{@as(f64, @floatCast(slot.y))});
+                try out.appendSlice(allocator, ",\"w\":");
+                try out.print(allocator, "{d:.5}", .{@as(f64, @floatCast(slot.width))});
+                try out.appendSlice(allocator, ",\"h\":");
+                try out.print(allocator, "{d:.5}", .{@as(f64, @floatCast(slot.height))});
+            } else {
+                try out.appendSlice(allocator, ",\"x\":0,\"y\":0,\"w\":1,\"h\":1");
+            }
+
+            try out.append(allocator, '}');
+        }
+
+        try out.appendSlice(allocator, "]}");
+    }
+
+    try out.appendSlice(allocator, "]}");
+}
+
 fn remoteAiSurfaceId(tab_index: usize) [16]u8 {
     var id: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&id, "aichat{d:0>10}", .{tab_index}) catch unreachable;
@@ -4701,14 +5687,22 @@ var g_weixin_ui_handle = std.atomic.Value(usize).init(0);
 var g_weixin_ctx: u8 = 0;
 var g_weixin_transcript_mutex: std.Thread.Mutex = .{};
 var g_weixin_transcript_owned: []u8 = &.{};
+/// The AI conversation WeChat is pinned to (independent of the on-screen active
+/// tab). UI-thread-only — read/written exclusively inside
+/// handleWeixinControlRequest, so no lock is needed. Cleared automatically when
+/// its conversation closes (see weixinActiveAiTabIndex).
+var g_weixin_pinned_session: ?*ai_chat.Session = null;
 
 const WeixinRequest = struct {
-    op: enum { find_ai, find_term, open_ai, send_input, latest_transcript, ai_approval_pending, resolve_ai_approval, inbound_file_dir },
+    op: enum { find_ai, find_term, open_ai, send_input, latest_transcript, ai_approval_pending, resolve_ai_approval, inbound_file_dir, list_conversations, pin_by_index },
     // operation inputs (valid for the duration of the synchronous call):
     surface_id: [16]u8 = [_]u8{0} ** 16, // send_input
     bytes: []const u8 = "", // send_input
     reply_context: ?weixin_types.ReplyContext = null, // send_input
     approve: bool = false, // resolve_ai_approval
+    pin_index: usize = 0, // pin_by_index input
+    conv_list_out: ?*weixin_control.ConversationList = null, // list_conversations output
+    conv_one_out: ?*weixin_control.Conversation = null, // pin_by_index output
     // outputs filled by the UI-thread handler:
     found: bool = false,
     out_surface_id: [16]u8 = [_]u8{0} ** 16,
@@ -4719,9 +5713,31 @@ const WeixinRequest = struct {
     dir: []u8 = &.{}, // inbound_file_dir (heap, page_allocator)
 };
 
+/// The *ai_chat.Session a tab contributes as its AI conversation, or null:
+/// a dedicated AI-chat tab's session, or a terminal tab's Copilot sidebar
+/// session (once opened). A tab contributes at most one.
+fn tabConversationSession(ts: *tab.TabState) ?*ai_chat.Session {
+    if (ts.kind == .ai_chat) return ts.ai_chat_session;
+    return ts.copilot_session;
+}
+
 /// Index of the AI-chat tab to target: the active tab if it is AI chat, else the
 /// first AI-chat tab. UI-thread only (reads threadlocal tab state).
 fn weixinActiveAiTabIndex() ?usize {
+    // 1) Honor an explicit WeChat pin if its conversation is still open.
+    //    Pointer identity only — never dereference a possibly-stale pointer.
+    if (g_weixin_pinned_session) |pinned| {
+        for (0..tab.g_tab_count) |i| {
+            if (tab.g_tabs[i]) |ts| {
+                if (tabConversationSession(ts) == pinned) return i;
+            }
+        }
+        // The pinned conversation was closed: drop the stale pin and fall back.
+        g_weixin_pinned_session = null;
+    }
+    // 2) Default (unchanged): the active tab if it is an AI-chat tab, else the
+    //    first AI-chat tab. Copilot sidebars are reachable only via an explicit
+    //    /switch pin, not the default.
     if (active_tab_state.g_active_tab < tab.g_tab_count) {
         if (tab.g_tabs[active_tab_state.g_active_tab]) |ts| {
             if (ts.kind == .ai_chat) return active_tab_state.g_active_tab;
@@ -4797,8 +5813,10 @@ fn handleWeixinControlRequest(req: *WeixinRequest) void {
             if (weixinTabIndexFromSurfaceId(req.surface_id)) |idx| {
                 if (idx >= tab.g_tab_count) return;
                 const tab_state = tab.g_tabs[idx] orelse return;
-                if (tab_state.kind != .ai_chat) return;
-                const session = tab_state.ai_chat_session orelse return;
+                // copilot_session is unreachable here in practice: aichat{N} surface
+                // IDs are only issued for .ai_chat tabs. The fallthrough keeps this
+                // correct if the surface registry is ever extended to Copilot panes.
+                const session = tabConversationSession(tab_state) orelse return;
                 if (req.reply_context) |ctx| {
                     req.busy = !session.applyWeixinInput(req.bytes, ctx);
                 } else {
@@ -4815,23 +5833,20 @@ fn handleWeixinControlRequest(req: *WeixinRequest) void {
         .latest_transcript => {
             const idx = weixinActiveAiTabIndex() orelse return;
             const tab_state = tab.g_tabs[idx] orelse return;
-            if (tab_state.kind != .ai_chat) return;
-            const session = tab_state.ai_chat_session orelse return;
+            const session = tabConversationSession(tab_state) orelse return;
             req.transcript = session.allocRemoteSnapshot(std.heap.page_allocator) catch return;
             req.found = true;
         },
         .ai_approval_pending => {
             const idx = weixinActiveAiTabIndex() orelse return;
             const tab_state = tab.g_tabs[idx] orelse return;
-            if (tab_state.kind != .ai_chat) return;
-            const session = tab_state.ai_chat_session orelse return;
+            const session = tabConversationSession(tab_state) orelse return;
             req.found = session.approvalView() != null;
         },
         .resolve_ai_approval => {
             const idx = weixinActiveAiTabIndex() orelse return;
             const tab_state = tab.g_tabs[idx] orelse return;
-            if (tab_state.kind != .ai_chat) return;
-            const session = tab_state.ai_chat_session orelse return;
+            const session = tabConversationSession(tab_state) orelse return;
             req.sent = session.resolveApprovalExternal(req.approve);
             if (req.sent) g_force_rebuild = true;
         },
@@ -4839,13 +5854,11 @@ fn handleWeixinControlRequest(req: *WeixinRequest) void {
             // Per-conversation working dir if set, else the global default.
             if (weixinActiveAiTabIndex()) |idx| {
                 if (tab.g_tabs[idx]) |tab_state| {
-                    if (tab_state.kind == .ai_chat) {
-                        if (tab_state.ai_chat_session) |session| {
-                            if (session.workingDirOverride()) |w| {
-                                req.dir = std.heap.page_allocator.dupe(u8, w) catch return;
-                                req.found = true;
-                                return;
-                            }
+                    if (tabConversationSession(tab_state)) |session| {
+                        if (session.workingDirOverride()) |w| {
+                            req.dir = std.heap.page_allocator.dupe(u8, w) catch return;
+                            req.found = true;
+                            return;
                         }
                     }
                 }
@@ -4853,6 +5866,51 @@ fn handleWeixinControlRequest(req: *WeixinRequest) void {
             if (ai_chat.defaultWorkingDir()) |w| {
                 req.dir = std.heap.page_allocator.dupe(u8, w) catch return;
                 req.found = true;
+            }
+        },
+        .list_conversations => {
+            const out = req.conv_list_out orelse return;
+            // Also clears g_weixin_pinned_session as a side effect if the pin is
+            // stale (its conversation closed) — listing then correctly marks no
+            // row current and drops the dead pin.
+            const cur = weixinActiveAiTabIndex();
+            var n: usize = 0;
+            for (0..tab.g_tab_count) |i| {
+                if (n >= out.items.len) break;
+                const ts = tab.g_tabs[i] orelse continue;
+                const session = tabConversationSession(ts) orelse continue;
+                var c = &out.items[n];
+                c.* = .{};
+                c.is_copilot = (ts.kind != .ai_chat);
+                c.is_current = (cur != null and cur.? == i);
+                c.busy = session.request_inflight;
+                c.setTitle(ts.getTitle());
+                c.setModel(session.model());
+                if (session.workingDirOverride()) |w| c.setCwd(w);
+                n += 1;
+            }
+            out.count = n;
+            req.found = true;
+        },
+        .pin_by_index => {
+            const out = req.conv_one_out orelse return;
+            var n: usize = 0;
+            for (0..tab.g_tab_count) |i| {
+                const ts = tab.g_tabs[i] orelse continue;
+                const session = tabConversationSession(ts) orelse continue;
+                if (n == req.pin_index) {
+                    g_weixin_pinned_session = session;
+                    out.* = .{};
+                    out.is_copilot = (ts.kind != .ai_chat);
+                    out.is_current = true;
+                    out.busy = session.request_inflight;
+                    out.setTitle(ts.getTitle());
+                    out.setModel(session.model());
+                    if (session.workingDirOverride()) |w| out.setCwd(w);
+                    req.found = true;
+                    return;
+                }
+                n += 1;
             }
         },
     }
@@ -4916,6 +5974,19 @@ fn wxInboundFileDir(_: *anyopaque, buf: []u8) []const u8 {
     return buf[0..n];
 }
 
+fn wxListAiConversations(_: *anyopaque, out: *weixin_control.ConversationList) void {
+    out.count = 0;
+    var req = WeixinRequest{ .op = .list_conversations, .conv_list_out = out };
+    _ = weixinDispatch(&req);
+    // On dispatch failure (no UI window) out stays count=0, which is correct.
+}
+
+fn wxPinAiConversationByIndex(_: *anyopaque, idx0: usize, out: *weixin_control.Conversation) bool {
+    var req = WeixinRequest{ .op = .pin_by_index, .pin_index = idx0, .conv_one_out = out };
+    if (!weixinDispatch(&req)) return false;
+    return req.found;
+}
+
 fn wxAiApprovalPending(_: *anyopaque) bool {
     var req = WeixinRequest{ .op = .ai_approval_pending };
     if (!weixinDispatch(&req)) return false;
@@ -4938,6 +6009,8 @@ const weixin_vtable = weixin_control.Control.VTable{
     .ai_approval_pending = wxAiApprovalPending,
     .resolve_ai_approval = wxResolveAiApproval,
     .inbound_file_dir = wxInboundFileDir,
+    .list_ai_conversations = wxListAiConversations,
+    .pin_ai_conversation_by_index = wxPinAiConversationByIndex,
 };
 
 /// The Control the weixin controller drives. Backed by process-global state, so
@@ -4951,6 +6024,105 @@ fn clearWeixinTranscriptCache() void {
     defer g_weixin_transcript_mutex.unlock();
     if (g_weixin_transcript_owned.len != 0) std.heap.page_allocator.free(g_weixin_transcript_owned);
     g_weixin_transcript_owned = &.{};
+}
+
+// ============================================================================
+// Agent terminal control (wisptermctl) — cross-platform Control surface.
+//
+// Unlike the weixin path, this does NOT marshal to the UI thread: Win32
+// SendMessage is a no-op on Linux (window_linux.zig). get-text/send-text pin
+// the target surface through surface_registry (a mutex liveness guard) and run
+// directly on the ctl server thread, exactly like the agent worker host
+// (agentSurfaceSnapshot / agentWriteSurface). Only `panes` needs threadlocal
+// tab topology, so the UI thread publishes a JSON snapshot into
+// g_ctl_panes_json on the render tick (syncCtlPanes).
+// ============================================================================
+
+var g_agent_control_enabled = std.atomic.Value(bool).init(false);
+var g_ctl_ctx: u8 = 0;
+var g_ctl_panes_mutex: std.Thread.Mutex = .{};
+var g_ctl_panes_json: []u8 = &.{}; // page_allocator-owned latest panes JSON
+// Atomic: syncCtlPanes runs from every window's render thread (the panes cache
+// is process-global, last-writer-wins — acceptable, matching the relay layout
+// sync). The timestamp must be touched atomically to avoid a data race.
+var g_ctl_panes_last_ms = std.atomic.Value(i64).init(0);
+
+const ctl_default_rows: u32 = 1000;
+
+pub fn enableAgentControl() void {
+    g_agent_control_enabled.store(true, .release);
+}
+
+fn ctlListPanes(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8 {
+    _ = ctx;
+    g_ctl_panes_mutex.lock();
+    defer g_ctl_panes_mutex.unlock();
+    if (g_ctl_panes_json.len == 0) return null;
+    return try allocator.dupe(u8, g_ctl_panes_json);
+}
+
+fn ctlGetText(ctx: *anyopaque, allocator: std.mem.Allocator, id: []const u8, recent: ?u32) anyerror!?[]u8 {
+    _ = ctx;
+    // Cross-platform + UAF-safe: the registry blocks Surface.deinit for the
+    // duration of the snapshot, and the id match rejects a reused pointer.
+    const ptr = surface_registry.acquireById(id) orelse return null;
+    defer surface_registry.release();
+    const surface: *Surface = @ptrCast(@alignCast(ptr));
+    const want: usize = if (recent) |r| r else ctl_default_rows;
+    const rows = @min(want, remote_snapshot.default_max_history_rows);
+    return try buildRemoteSurfaceSnapshot(allocator, surface, rows);
+}
+
+fn ctlSendText(ctx: *anyopaque, id: []const u8, data: []const u8) bool {
+    _ = ctx;
+    const ptr = surface_registry.acquireById(id) orelse return false;
+    defer surface_registry.release();
+    const surface: *Surface = @ptrCast(@alignCast(ptr));
+    surface.queuePtyWrite(data);
+    return true;
+}
+
+const ctl_vtable = ctl_control.Control.VTable{
+    .list_panes = ctlListPanes,
+    .get_text = ctlGetText,
+    .send_text = ctlSendText,
+};
+
+/// The Control the agent-control server drives. Backed by process-global state,
+/// so the dummy ctx is unused.
+pub fn agentControl() ctl_control.Control {
+    return .{ .ctx = &g_ctl_ctx, .vtable = &ctl_vtable };
+}
+
+fn clearCtlPanesCache() void {
+    g_ctl_panes_mutex.lock();
+    defer g_ctl_panes_mutex.unlock();
+    if (g_ctl_panes_json.len != 0) std.heap.page_allocator.free(g_ctl_panes_json);
+    g_ctl_panes_json = &.{};
+}
+
+/// UI-thread: publish a fresh panes JSON snapshot (throttled). Called from the
+/// render loop next to syncRemoteLayout. No-op unless ctl is enabled.
+fn syncCtlPanes(allocator: std.mem.Allocator) void {
+    if (!g_agent_control_enabled.load(.acquire)) return;
+    const now = std.time.milliTimestamp();
+    if (now - g_ctl_panes_last_ms.load(.monotonic) < 200) return;
+    g_ctl_panes_last_ms.store(now, .monotonic);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    buildCtlPanesJson(allocator, &out) catch return;
+
+    const owned = std.heap.page_allocator.dupe(u8, out.items) catch return;
+    g_ctl_panes_mutex.lock();
+    defer g_ctl_panes_mutex.unlock();
+    if (g_ctl_panes_json.len != 0) std.heap.page_allocator.free(g_ctl_panes_json);
+    g_ctl_panes_json = owned;
+}
+
+test "ctl surface callbacks reject an unregistered id without dereferencing" {
+    try std.testing.expect((try ctlGetText(&g_ctl_ctx, std.testing.allocator, "missing", null)) == null);
+    try std.testing.expect(!ctlSendText(&g_ctl_ctx, "missing", "x"));
 }
 
 fn buildRemoteSurfaceSnapshot(allocator: std.mem.Allocator, surface: *Surface, max_history_rows: usize) ![]u8 {
@@ -4998,20 +6170,24 @@ fn makeAgentToolSurface(
     tab_index: usize,
     focused: bool,
 ) anyerror!ai_chat.ToolSurface {
-    return .{
-        .id = try allocator.dupe(u8, surface.remote_id[0..]),
-        .title = try allocator.dupe(u8, surface.getTitle()),
-        .cwd = try allocator.dupe(u8, surface.getCwd() orelse surface.getInitialCwd() orelse ""),
-        .snapshot = buildRemoteSurfaceSnapshot(allocator, surface, remote_snapshot.agent_max_history_rows) catch try allocator.dupe(u8, ""),
-        .tab_index = tab_index,
-        .focused = focused,
-        .is_ssh = surface.launch_kind == .ssh and surface.ssh_connection != null,
-        .is_wsl = surface.launch_kind == .wsl,
-        .agent_app = surface.agent_detection.app,
-        .agent_state = surface.agent_detection.state,
-        .agent_confidence = surface.agent_detection.confidence,
-        .ptr = @ptrCast(surface),
-    };
+    const snapshot = buildRemoteSurfaceSnapshot(allocator, surface, remote_snapshot.agent_max_history_rows) catch try allocator.dupe(u8, "");
+    return ai_chat.ToolSurface.initOwned(
+        allocator,
+        surface.remote_id[0..],
+        surface.getTitle(),
+        surface.getCwd() orelse surface.getInitialCwd() orelse "",
+        snapshot,
+        .{
+            .tab_index = tab_index,
+            .focused = focused,
+            .is_ssh = surface.launch_kind == .ssh and surface.ssh_connection != null,
+            .is_wsl = surface.launch_kind == .wsl,
+            .agent_app = surface.agent_detection.app,
+            .agent_state = surface.agent_detection.state,
+            .agent_confidence = surface.agent_detection.confidence,
+            .ptr = @ptrCast(surface),
+        },
+    );
 }
 
 fn collectAgentToolSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!ai_chat.ToolSnapshot {
@@ -5031,12 +6207,14 @@ fn collectAgentToolSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyer
         while (it.next()) |entry| {
             const is_context = context_surface_id.len > 0 and std.mem.eql(u8, entry.surface.remote_id[0..], context_surface_id);
             if (is_context) active_tab = tab_index;
-            try surfaces.append(allocator, try makeAgentToolSurface(
+            const tool_surface = try makeAgentToolSurface(
                 allocator,
                 entry.surface,
                 tab_index,
                 is_context,
-            ));
+            );
+            errdefer tool_surface.deinit(allocator);
+            try surfaces.append(allocator, tool_surface);
         }
     }
 
@@ -6498,8 +7676,31 @@ fn runMainLoop(self: *AppWindow) !void {
     defer {
         background_image.deinit();
         post_process.deinit();
-        cell_pipeline.deinit();
-        ui_pipeline.deinit();
+        // macOS/Metal: cell_pipeline/ui_pipeline.deinit() release the
+        // MTLRenderPipelineState/MTLBuffer objects held in the render thread's
+        // _Thread_local slot tables (renderer/gpu/metal/bridge.m). At TRUE
+        // process exit on x86_64 that manual-refcount [obj release] cascade
+        // faults as the thread's TLV storage is torn down (the reported crash is
+        // inside cell_pipeline.deinit). The Metal device/queue/layer are already
+        // leaked on purpose (gpu.Context.deinit is never called) and the OS
+        // reclaims all GPU memory on process death, so skip these two on the LAST
+        // window. A SECONDARY window closing while the app keeps running still
+        // tears them down on its own live render thread to avoid leaking the
+        // slot-table objects. OpenGL (Windows/Linux) teardown is well-behaved
+        // and stays unchanged: gpu.active is comptime, so `skip` folds to false
+        // off Metal and both deinits always run there.
+        const is_last_window = blk: {
+            self.app.mutex.lock();
+            defer self.app.mutex.unlock();
+            // This window is still in app.windows here — the caller swap-removes
+            // it only AFTER runMainLoop returns — so len <= 1 means it is last.
+            break :blk self.app.windows.items.len <= 1;
+        };
+        const skip_pipeline_teardown = gpu.active == .metal and is_last_window;
+        if (!skip_pipeline_teardown) {
+            cell_pipeline.deinit();
+            ui_pipeline.deinit();
+        }
     }
 
     // Ghostty approach: calculate grid size from ACTUAL window size.
@@ -6638,6 +7839,24 @@ fn runMainLoop(self: *AppWindow) !void {
                 }
             },
         }
+
+        // Dev/automation hook: WISPTERM_AUTOCONNECT names an SSH profile to
+        // connect (plain) on launch; WISPTERM_AUTOCONNECT_TMUX connects one in
+        // tmux control mode. No manual launcher click — for testing/automation.
+        if (std.process.getEnvVarOwned(allocator, "WISPTERM_AUTOCONNECT")) |autoconnect_profile| {
+            defer allocator.free(autoconnect_profile);
+            if (autoconnect_profile.len > 0) {
+                std.debug.print("ssh: auto-connecting profile '{s}'\n", .{autoconnect_profile});
+                _ = overlays.connectProfileByName(autoconnect_profile);
+            }
+        } else |_| {}
+        if (std.process.getEnvVarOwned(allocator, "WISPTERM_AUTOCONNECT_TMUX")) |p| {
+            defer allocator.free(p);
+            if (p.len > 0) {
+                std.debug.print("tmux: auto-connecting profile '{s}' (tmux)\n", .{p});
+                _ = overlays.connectProfileByNameTmux(p);
+            }
+        } else |_| {}
     }
 
     gpu.state.setBlendEnabled(true);
@@ -6681,6 +7900,7 @@ fn runMainLoop(self: *AppWindow) !void {
         g_loop_iter +%= 1; // tag each iteration so the latency probe can tell same-iteration paints from stalls
         // Check for config file changes
         if (config_watcher) |*w| checkConfigReload(allocator, w);
+        tmux_controller.tickAll(allocator, term_cols, term_rows);
         overlays.tickSessionLauncher();
         if (file_explorer.tickAsync()) {
             g_force_rebuild = true;
@@ -6701,7 +7921,6 @@ fn runMainLoop(self: *AppWindow) !void {
         maybePrintMemoryDebug(std.time.milliTimestamp());
         flushAgentHistoryStoreIfDirty(false);
         pollUpdateCheck(self.app);
-        pollSkillUpdate(self.app);
         if (activeSkillCenter()) |sc_session| pollSkillCenterOp(sc_session);
         if (self.app.port_forward_manager.tick() and activePortForwarding() != null) {
             g_force_rebuild = true;
@@ -6887,6 +8106,7 @@ fn runMainLoop(self: *AppWindow) !void {
             const content_h: i32 = @intFromFloat(@as(f32, @floatFromInt(fb_height)) - top_padding - padding);
             const split_count = computeSplitLayout(active_tab, content_x, content_y, content_w, content_h, font.cell_width, font.cell_height);
             syncRemoteLayout(allocator);
+            syncCtlPanes(allocator);
             syncImeCaretPosition(win, split_count);
             if (active_tab.kind != .ai_chat and active_tab.kind != .ai_history and active_tab.kind != .skill_center and active_tab.kind != .port_forwarding and synchronizedOutputPendingForVisibleSplits(split_count)) {
                 // Block instead of spinning at ~1kHz: the IO thread posts a
@@ -7042,6 +8262,7 @@ fn runMainLoop(self: *AppWindow) !void {
                                 // so restore the full-window viewport/projection first.
                                 gpu.state.setViewport(0, 0, @intCast(fb_width), @intCast(fb_height));
                                 gpu.gl_init.setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
+                                const close_hovered = if (input.g_preview_close_hover) |h| h == rect.handle else false;
                                 markdown_preview_renderer.renderInto(
                                     p,
                                     @floatFromInt(rect.x),
@@ -7049,6 +8270,7 @@ fn runMainLoop(self: *AppWindow) !void {
                                     @floatFromInt(rect.width),
                                     @floatFromInt(rect.height),
                                     @floatFromInt(fb_height),
+                                    close_hovered,
                                 );
                                 if (is_focused) drawPaneFocusRing(rect, @floatFromInt(fb_height));
 
@@ -7083,8 +8305,9 @@ fn runMainLoop(self: *AppWindow) !void {
                     gpu.state.setViewport(0, 0, @intCast(fb_width), @intCast(fb_height));
                     gpu.gl_init.setProjection(@floatFromInt(fb_width), @floatFromInt(fb_height));
 
-                    // Draw split dividers
+                    // Draw split dividers and per-pane agent dots
                     overlays.renderSplitDividers(active_tab, content_x, content_y, content_w, content_h, @floatFromInt(fb_height));
+                    overlays.renderPaneAgentDots(active_tab, content_x, content_y, content_w, content_h, @floatFromInt(fb_height));
                 }
             }
         } else if (!post_process.g_post_enabled) {
@@ -7105,6 +8328,22 @@ fn runMainLoop(self: *AppWindow) !void {
         // after terminal content, occupying the exclusive right slot.
         renderAiCopilotPanel(fb_width, fb_height, titlebar_offset);
         overlays.renderBrowserUrlBar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
+        if (copilot_hint_gate.handleEligible(g_copilot_hint, aiCopilotVisible(), isActiveTabTerminal(), anyRightDockPanelVisible())) {
+            if (!g_copilot_shimmer_checked) {
+                g_copilot_shimmer_checked = true;
+                const hint_shown = if (g_allocator) |alloc| platform_window_state.copilotHintShown(alloc) else true;
+                if (copilot_hint_gate.shimmerDecision(true, true, hint_shown) == .shimmer) {
+                    overlays.copilotEdgeHandleStartShimmer();
+                    if (g_allocator) |alloc| platform_window_state.setCopilotHintShown(alloc);
+                }
+            }
+            overlays.renderCopilotEdgeHandle(
+                @floatFromInt(fb_width),
+                @floatFromInt(fb_height),
+                titlebar_offset,
+                leftPanelsWidth(),
+            );
+        }
         overlays.renderStartupShortcutsOverlay(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
         overlays.renderCommandPalette(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
         overlays.renderJupyterPicker(@floatFromInt(fb_width), @floatFromInt(fb_height));
@@ -7193,10 +8432,31 @@ fn runMainLoop(self: *AppWindow) !void {
     weixin_qr_renderer.deinit();
     weixin_qr_panel.deinit();
     clearWeixinTranscriptCache();
+    clearCtlPanesCache();
     markdown_preview_renderer.deinit();
     browser_panel.deinit();
 
     // Tab cleanup is handled by AppWindow.deinit()
+}
+
+test "appwindow: setRequestedFont keeps a private copy of the family string" {
+    // Regression: g_requested_font aliased App.font_family, which App frees and
+    // reallocates on every config reload (App.replaceStr). The captured family
+    // is read later in the event loop (handleWindowDpiChanged), so it must not
+    // point into freed memory. The setter copies into its own buffer.
+    defer {
+        @memset(&g_requested_font_buf, 0);
+        g_requested_font = "";
+    }
+    var src: [16]u8 = undefined;
+    @memcpy(src[0..11], "JetBrains M");
+    setRequestedFont(src[0..11]);
+    @memset(&src, 'x'); // clobber the source the way replaceStr would
+    try std.testing.expectEqualStrings("JetBrains M", g_requested_font);
+
+    const long = "z" ** 1000;
+    setRequestedFont(long);
+    try std.testing.expect(g_requested_font.len < long.len);
 }
 
 test "appwindow: syncDefaultShellCommandFromConfig refreshes tab default shell" {

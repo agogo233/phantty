@@ -35,13 +35,14 @@ keybind = global:ctrl+backquote=toggle_quake
 | `Ctrl+Shift+P` | `toggle_command_palette` | 打开命令中心 |
 | `Ctrl+Shift+T` | `new_session` | 打开会话启动器（shell / Copilot / Sessions） |
 | `Ctrl+Shift+N` | `new_window` | 新建窗口 |
-| `Ctrl+Shift+O` | `split_right` | 分屏当前面板 |
+| `Ctrl+Shift++` | `split_right` | 向右分屏当前面板 |
+| `Ctrl+Shift+-` | `split_down` | 向下分屏当前面板 |
 | `Ctrl+Shift+B` | `toggle_sidebar` | 切换侧边栏 |
 | `Ctrl+Shift+A` | `toggle_ai_copilot` | 在终端上切换 Copilot 侧栏 |
 | `Ctrl+Shift+Alt+E` | `toggle_file_explorer` | 切换文件浏览器 |
 | `Ctrl+Shift+W` | `close_panel_or_tab` | 关闭当前面板/标签 |
 | `Alt+Enter` | `toggle_maximize` | 最大化/还原当前面板 |
-| `Ctrl++`（也可 `Ctrl+Shift++`） | `font_size_increase` | 增大字号 |
+| `Ctrl++`（不按 Shift） | `font_size_increase` | 增大字号 |
 | `Ctrl+-` | `font_size_decrease` | 减小字号 |
 | `Ctrl+Shift+C` | `copy` | 复制选区 |
 | `Ctrl+V` | `paste` | 粘贴 |
@@ -61,7 +62,8 @@ keybind = global:ctrl+backquote=toggle_quake
 - **重命名标签：** 双击标签标题，输入新名称，再按 `Enter` 确认或 `Escape` 取消。
 - **交换两个面板：** 按住 `Alt` 并用左键把一个面板拖到另一个面板上即可互换内容。
 - **预览/打开文件路径：** 按住 `Ctrl`（macOS 上 `Cmd`）左键点击文件路径可预览，右键点击
-  可用默认应用打开（仅本地终端）。见 [[文件浏览器与预览|File-Explorer-zh]]。
+  可用默认应用打开（仅本地终端）。PDF 预览面板聚焦时，`PageUp` / `PageDown` 翻页。
+  见 [[文件浏览器与预览|File-Explorer-zh]]。
 - **调整面板大小：** 拖动两个面板之间的分隔线。
 - **重排标签：** 在侧栏（`Ctrl+Shift+B`）里把标签上下拖动。
 - **新建/关闭标签：** 点 `+` 按钮新建；点标签上的 `×` 或中键点击标签可关闭。
@@ -71,7 +73,7 @@ keybind = global:ctrl+backquote=toggle_quake
 所有可绑定的应用级动作：
 
 `toggle_quake`、`toggle_command_palette`、`new_window`、`new_session`、
-`split_right`、`toggle_file_explorer`、`toggle_sidebar`、`toggle_ai_copilot`、
+`split_right`、`split_down`、`toggle_file_explorer`、`toggle_sidebar`、`toggle_ai_copilot`、
 `close_panel_or_tab`、`toggle_maximize`、`font_size_increase`、
 `font_size_decrease`、`copy`、`paste`、`paste_image`、`focus_left`、
 `focus_right`、`focus_up`、`focus_down`、`focus_previous`、`focus_next`、

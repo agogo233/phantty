@@ -63,6 +63,16 @@ pub const TabState = struct {
     /// on one tab from appearing on another tab.
     copilot_visible: bool = false,
 
+    /// tmux control-mode window id this tab mirrors (Phase 3c-2), or null for a
+    /// normal local tab. `tmux_owner` is the controller/bridge that owns this
+    /// tab; tmux window ids are only unique within a connection. Set by
+    /// `tmux_bridge`. `tmux_name_buf`/`tmux_name_len` hold the tmux window name
+    /// (`%window-renamed`), used by `getTitle`.
+    tmux_window_id: ?usize = null,
+    tmux_owner: ?*anyopaque = null,
+    tmux_name_buf: [256]u8 = undefined,
+    tmux_name_len: usize = 0,
+
     pub const Kind = enum {
         terminal,
         ai_chat,
@@ -86,6 +96,11 @@ pub const TabState = struct {
     pub fn getTitle(self: *const TabState) []const u8 {
         if (g_forced_title) |forced| {
             return forced;
+        }
+        // A tmux-backed terminal tab shows the tmux window name (if any) before
+        // falling back to the focused surface's title.
+        if (self.kind == .terminal and self.tmux_name_len > 0) {
+            return self.tmux_name_buf[0..self.tmux_name_len];
         }
         if (self.kind == .ai_chat) {
             const chat = self.ai_chat_session orelse return i18n.s().sl_ai_agent;
@@ -169,6 +184,13 @@ pub threadlocal var g_ai_restore_hook: ?*const fn (session_id: []const u8) bool 
 // for the duration of the hook call; callees must duplicate any fields they
 // keep after returning. Returns true if the tab was reopened.
 pub threadlocal var g_ai_history_restore_hook: ?*const fn (session_persist.AiHistorySnap) bool = null;
+
+// tmux session persistence (Phase 3d #4c). The save hook returns the SSH profile
+// names of active tmux controllers (arena-allocated); the restore hook re-attaches
+// a profile by name. Registered by AppWindow so tab.zig stays free of the
+// controller/overlay dependency (and the import cycle).
+pub threadlocal var g_tmux_active_profiles_hook: ?*const fn (std.mem.Allocator) []const []const u8 = null;
+pub threadlocal var g_tmux_restore_hook: ?*const fn (profile_name: []const u8) bool = null;
 
 // Forced title from config (overrides all tab titles)
 pub threadlocal var g_forced_title: ?[]const u8 = null;
@@ -310,11 +332,13 @@ fn splitSshCommand(
 ) ?platform_pty_command.OwnedCommandLine {
     const conn = surface.ssh_connection orelse return null;
 
-    var command_buf: [512]u8 = undefined;
+    var command_buf: [8192]u8 = undefined;
     const command = platform_pty_command.sshInteractiveCommand(command_buf[0..], .{
         .user = conn.user(),
         .host = conn.host(),
         .port = conn.port(),
+        .auth_method = conn.auth_method,
+        .identity_file = conn.identityFile(),
         .password_auth = conn.password_auth,
         .legacy_algorithms = conn.legacy_algorithms,
         .proxy_jump = conn.proxyJump(),
@@ -400,6 +424,12 @@ pub fn spawnTabWithCommandAndCwd(allocator: std.mem.Allocator, cols: u16, rows: 
     t.skill_center_session = null;
     t.port_forwarding_session = null;
     t.copilot_session = null;
+    // allocator.create returns undefined memory and struct-default values are
+    // NOT applied to field-by-field init, so these must be set explicitly or
+    // getTitle reads a garbage tmux_name_len (Phase 3c-2 fields).
+    t.tmux_window_id = null;
+    t.tmux_owner = null;
+    t.tmux_name_len = 0;
     t.copilot_visible = false;
 
     g_tabs[g_tab_count] = t;
@@ -459,6 +489,12 @@ pub fn spawnAiChatTab(
     t.skill_center_session = null;
     t.port_forwarding_session = null;
     t.copilot_session = null;
+    // allocator.create returns undefined memory and struct-default values are
+    // NOT applied to field-by-field init, so these must be set explicitly or
+    // getTitle reads a garbage tmux_name_len (Phase 3c-2 fields).
+    t.tmux_window_id = null;
+    t.tmux_owner = null;
+    t.tmux_name_len = 0;
     t.copilot_visible = false;
 
     g_tabs[g_tab_count] = t;
@@ -491,6 +527,12 @@ pub fn spawnAiChatTabFromHistoryRecord(allocator: std.mem.Allocator, record: age
     t.skill_center_session = null;
     t.port_forwarding_session = null;
     t.copilot_session = null;
+    // allocator.create returns undefined memory and struct-default values are
+    // NOT applied to field-by-field init, so these must be set explicitly or
+    // getTitle reads a garbage tmux_name_len (Phase 3c-2 fields).
+    t.tmux_window_id = null;
+    t.tmux_owner = null;
+    t.tmux_name_len = 0;
     t.copilot_visible = false;
 
     g_tabs[g_tab_count] = t;
@@ -520,6 +562,12 @@ pub fn spawnAiHistoryTab(allocator: std.mem.Allocator, source: ai_history_source
     t.focused = .root;
     t.ai_chat_session = null;
     t.copilot_session = null;
+    // allocator.create returns undefined memory and struct-default values are
+    // NOT applied to field-by-field init, so these must be set explicitly or
+    // getTitle reads a garbage tmux_name_len (Phase 3c-2 fields).
+    t.tmux_window_id = null;
+    t.tmux_owner = null;
+    t.tmux_name_len = 0;
     t.copilot_visible = false;
     t.ai_history_session = session_ptr;
     t.skill_center_session = null;
@@ -876,6 +924,35 @@ pub fn previewForReuse(gpa: std.mem.Allocator, t: *const TabState, kind: markdow
     return null;
 }
 
+/// Move split-tree focus to the leaf holding `pane` in the active tab, so a
+/// just-opened (or reused) preview becomes the focused pane. With the preview
+/// focused, Ctrl+Shift+W closes IT — not the terminal the user came from — and
+/// PgUp/PgDn/arrows/Home/End/+/- scroll & zoom it (see input.zig). Closing the
+/// preview refocuses the surviving terminal, so typing resumes naturally.
+///
+/// Matching is by pointer identity (the leaf handle equals the node index), so
+/// it is allocation-free and unambiguous even with multiple same-kind previews.
+/// Returns false without changing focus when there is no active terminal tab or
+/// `pane` is not a leaf of its tree — defensive against a tree reshaped between
+/// pane creation and this call.
+pub fn focusPreviewPane(pane: *PreviewPane) bool {
+    const t = activeTab() orelse return false;
+    if (t.kind != .terminal) return false;
+    for (t.tree.nodes, 0..) |node, i| {
+        switch (node) {
+            .leaf => |pn| switch (pn) {
+                .preview => |p| if (p == pane) {
+                    t.focused = @enumFromInt(i);
+                    return true;
+                },
+                else => {},
+            },
+            .split => {},
+        }
+    }
+    return false;
+}
+
 /// Split the focused surface in the given direction.
 /// Returns true on success. The caller handles g_resize_active and rebuild flags.
 pub fn splitFocused(
@@ -983,7 +1060,7 @@ fn splitFocusedSurfaceWithCommand(
 
     if (inherit_ssh_connection) {
         if (focused_surface.ssh_connection) |conn| {
-            new_surface.setSshConnection(conn.user(), conn.host(), conn.port(), conn.password(), conn.proxyJump(), conn.password_auth, conn.legacy_algorithms);
+            new_surface.setSshConnectionValue(conn);
         }
     }
 
@@ -1652,6 +1729,12 @@ pub fn restoreTab(
     t.skill_center_session = null;
     t.port_forwarding_session = null;
     t.copilot_session = null;
+    // allocator.create returns undefined memory and struct-default values are
+    // NOT applied to field-by-field init, so these must be set explicitly or
+    // getTitle reads a garbage tmux_name_len (Phase 3c-2 fields).
+    t.tmux_window_id = null;
+    t.tmux_owner = null;
+    t.tmux_name_len = 0;
     t.copilot_visible = false;
     applyRestoredTabMetadata(t, snap);
 
@@ -1708,21 +1791,27 @@ pub fn collectSessionSnapshot(arena: *std.heap.ArenaAllocator) !session_persist.
     const alloc = arena.allocator();
     if (g_tab_count == 0) return error.NoTabs;
 
+    // tmux tabs are NOT persisted as surface trees — they are recreated by the
+    // controller on restore (see tmux_profiles below). Skip them here.
+    const tmux_profiles = if (g_tmux_active_profiles_hook) |hook| hook(alloc) else &[_][]const u8{};
+
     const tabs = try alloc.alloc(session_persist.TabSnap, g_tab_count);
     var i: usize = 0;
     var written: usize = 0;
     while (i < g_tab_count) : (i += 1) {
         if (g_tabs[i]) |t| {
+            if (t.tmux_window_id != null) continue;
             tabs[written] = snapshotTab(alloc, t) catch continue;
             written += 1;
         }
     }
-    if (written == 0) return error.NoTabs;
+    if (written == 0 and tmux_profiles.len == 0) return error.NoTabs;
 
     return .{
         .version = session_persist.SCHEMA_VERSION,
-        .active_tab = @intCast(@min(active_tab_state.g_active_tab, written - 1)),
+        .active_tab = if (written > 0) @intCast(@min(active_tab_state.g_active_tab, written - 1)) else 0,
         .tabs = tabs[0..written],
+        .tmux_profiles = tmux_profiles,
     };
 }
 
@@ -1775,10 +1864,23 @@ pub fn restoreSessionFromFile(
             std.debug.print("restoreSessionFromFile: skipping failed tab\n", .{});
         }
     }
-    if (rebuilt == 0) return false;
 
-    const target = @min(@as(usize, loaded.value.active_tab), rebuilt - 1);
-    switchTab(target);
+    // Re-attach persisted tmux sessions (Phase 3d #4c): each profile re-connects
+    // via the controller, which rebuilds its window-tabs from the live server.
+    var tmux_restored: usize = 0;
+    if (g_tmux_restore_hook) |hook| {
+        for (loaded.value.tmux_profiles) |name| {
+            std.debug.print("tmux: restoring session for profile '{s}'\n", .{name});
+            if (hook(name)) tmux_restored += 1;
+        }
+    }
+
+    if (rebuilt == 0 and tmux_restored == 0) return false;
+
+    if (rebuilt > 0) {
+        const target = @min(@as(usize, loaded.value.active_tab), rebuilt - 1);
+        switchTab(target);
+    }
     return true;
 }
 
@@ -2399,6 +2501,21 @@ test "tab: reorder rejects invalid and no-op moves" {
     try std.testing.expectEqual(@as(usize, 0), active_tab_state.g_active_tab);
 }
 
+test "TabState.getTitle returns the tmux window name when set" {
+    var t = makeTestTabState();
+    t.tmux_window_id = 2;
+    const name = "build";
+    @memcpy(t.tmux_name_buf[0..name.len], name);
+    t.tmux_name_len = name.len;
+
+    // Empty tree => no focused surface; the tmux-name branch must win first.
+    try std.testing.expectEqualStrings("build", t.getTitle());
+
+    // With no tmux name, an empty terminal tab falls back to the default.
+    t.tmux_name_len = 0;
+    try std.testing.expectEqualStrings("wispterm", t.getTitle());
+}
+
 test "focusPanelByIndex focuses panels in screen reading order" {
     // Two side-by-side panels: root horizontal, left | right.
     var l = session_persist.NodeSnap{ .leaf = .{ .surface = .{ .local_shell = .{} } } };
@@ -2533,6 +2650,76 @@ test "tab: splitIntoPreview adds a preview leaf and grows the tree by 2 nodes" {
     // t.deinit (deferred) will call tree.deinit(), which unrefs the preview pane
     // (freeing it) and decrements the surface refcount. The testing allocator
     // must report no leak after the defer runs.
+}
+
+test "tab: focusPreviewPane selects the just-opened preview leaf" {
+    resetTestTabGlobals();
+    const gpa = std.testing.allocator;
+
+    var surface: Surface = undefined;
+    surface.ref_count = 1;
+    surface.ssh_connection = null;
+    surface.cwd_path_len = 0;
+    surface.initial_cwd_path_len = 0;
+    surface.title_override_len = 0;
+    surface.agent_recent_output_len = 0;
+
+    const t = try gpa.create(TabState);
+    t.* = .{
+        .kind = .terminal,
+        .tree = try SplitTree.init(gpa, &surface),
+        .focused = .root,
+        .ai_chat_session = null,
+        .ai_history_session = null,
+        .skill_center_session = null,
+        .copilot_session = null,
+        .copilot_visible = false,
+    };
+    defer {
+        t.deinit(gpa);
+        gpa.destroy(t);
+        resetTestTabGlobals();
+    }
+
+    const saved_active = active_tab_state.g_active_tab;
+    const saved_count = g_tab_count;
+    const saved_tab0 = g_tabs[0];
+    defer {
+        active_tab_state.g_active_tab = saved_active;
+        g_tab_count = saved_count;
+        g_tabs[0] = saved_tab0;
+    }
+    g_tabs[0] = t;
+    active_tab_state.g_active_tab = 0;
+    g_tab_count = 1;
+
+    // splitIntoPreview keeps the TERMINAL focused (its documented contract).
+    const p = splitIntoPreview(gpa) orelse return error.SplitIntoPreviewFailed;
+    switch (t.tree.nodes[t.focused.idx()]) {
+        .leaf => |pane| switch (pane) {
+            .terminal => {}, // precondition: terminal focused, preview not.
+            .preview => return error.PreconditionPreviewAlreadyFocused,
+        },
+        .split => return error.PreconditionFocusedIsSplit,
+    }
+
+    // focusPreviewPane moves focus onto the preview leaf holding `p`.
+    try std.testing.expect(focusPreviewPane(p));
+    try std.testing.expect(t.focused.idx() < t.tree.nodes.len);
+    switch (t.tree.nodes[t.focused.idx()]) {
+        .leaf => |pane| switch (pane) {
+            .preview => |fp| try std.testing.expectEqual(p, fp),
+            .terminal => return error.FocusedIsTerminalNotPreview,
+        },
+        .split => return error.FocusedIsSplitNotPreview,
+    }
+
+    // A pane that is not in the tree leaves focus untouched (returns false).
+    const focused_before = t.focused;
+    const foreign = try PreviewPane.create(gpa);
+    defer foreign.unref(gpa);
+    try std.testing.expect(!focusPreviewPane(foreign));
+    try std.testing.expectEqual(focused_before, t.focused);
 }
 
 test "tab: closeFocusedSplit closes a focused preview and refocuses the terminal" {

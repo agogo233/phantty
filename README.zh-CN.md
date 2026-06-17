@@ -2,11 +2,23 @@
 
 # WispTerm
 
-**WispTerm**（原名 Phantty）是一个面向远程开发与 AI 智能体工作流的跨平台终端工作区。它用 Zig 编写，终端模拟由 [libghostty-vt](https://github.com/ghostty-org/ghostty) 驱动。
+<p>
+<a href="https://github.com/xuzhougeng/wispterm/releases"><img src="https://img.shields.io/badge/Windows-supported-0078D4" alt="Windows supported"></a>
+<a href="https://github.com/xuzhougeng/wispterm/releases"><img src="https://img.shields.io/badge/macOS-supported-000000" alt="macOS supported"></a>
+<a href="https://github.com/xuzhougeng/wispterm/releases"><img src="https://img.shields.io/badge/Linux-experimental-FCC624" alt="Linux experimental"></a>
+<a href="https://github.com/xuzhougeng/wispterm/blob/main/LICENSE"><img src="https://img.shields.io/github/license/xuzhougeng/wispterm" alt="License"></a>
+<br>
+<a href="https://github.com/xuzhougeng/wispterm/stargazers"><img src="https://img.shields.io/github/stars/xuzhougeng/wispterm?style=social" alt="Stars"></a>
+<a href="https://github.com/xuzhougeng/wispterm/releases"><img src="https://img.shields.io/github/v/release/xuzhougeng/wispterm?include_prereleases" alt="Release"></a>
+<a href="https://github.com/xuzhougeng/wispterm/releases"><img src="https://img.shields.io/github/downloads/xuzhougeng/wispterm/total" alt="Downloads"></a>
+<a href="https://github.com/xuzhougeng/wispterm/commits/main"><img src="https://img.shields.io/github/last-commit/xuzhougeng/wispterm" alt="Last commit"></a>
+</p>
+
+**WispTerm** 是一个面向远程开发与 AI 智能体工作流的跨平台终端工作区。它用 Zig 编写，终端模拟由 [libghostty-vt](https://github.com/ghostty-org/ghostty) 驱动。
 
 > [!NOTE]
 > WispTerm 提供 **Windows** 与 **macOS**（Apple Silicon 与 Intel）版本。**Linux**
-> 移植仍在进行中（见 [TODO.md](TODO.md)）。
+> AppImage 会作为社区测试版本发布，仍属实验性质。
 
 ## 功能特性
 
@@ -17,9 +29,12 @@
 - **主题支持** —— 兼容 Ghostty 主题文件，内置 450+ 主题（默认：Poimandres）
 - **背景图与着色器** —— 壁纸混合，外加 Ghostty 兼容的 GLSL 后处理
 - **分屏与标签页** —— 横/纵向分屏、标签栏、焦点跟随鼠标、均分尺寸
-- **文件浏览器与预览** —— 浏览本地、WSL、SSH 文件；无需离开终端即可预览 Markdown / 文本 / 表格 / 图片
+- **文件浏览器与预览** —— 浏览本地、WSL、SSH 文件；无需离开终端即可预览 Markdown / 文本 / 表格 / 图片 / PDF
 - **内嵌浏览器面板** —— 在侧边 WebView2 面板或默认浏览器中打开网址，并为 profile 会话提供持久的 SSH 回环端口转发
+- **SSH 端口转发管理器** —— 在专用标签页中静默管理本地与反向 SSH 转发规则
 - **AI 智能体会话** —— 启动 OpenAI 兼容的智能体标签页，配置 profile、恢复历史，导出完整或精简的 Markdown 对话记录
+- **会话内切换模型** —— 输入 `/model` 或点击模型标签，把当前 AI Chat/Copilot 会话切到另一个已保存 profile，并用摘要交接上下文
+- **AI 历史浏览器** —— 浏览本地、WSL 与 SSH 上的 Codex / Claude Code / Reasonix 历史，并从原始项目目录恢复会话
 - **Kitty 图形协议** —— 通过 `imgcat.py` / `pdfcat.py` 在远程 shell 中内联显示图片和 PDF
 - **可选的远程访问** —— 通过 Cloudflare 托管的中继分享会话密钥（默认关闭）
 
@@ -29,6 +44,7 @@
 - [文件浏览器与预览](docs/file-explorer.md)
 - [AI 智能体会话](docs/ai-agent.md)
 - [媒体、背景图与内联远程图片](docs/media.md)
+- [SSH 端口转发](docs/port-forwarding.md)
 - [开发、架构、打包与发布](docs/development.md)
 - [常见问题](docs/faq.md)
 
@@ -121,10 +137,13 @@ keybind = global:ctrl+backquote=toggle_quake
 | 新建会话（会话启动器） | **Ctrl+Shift+T** | **Cmd+Shift+T** |
 | 新建窗口 | **Ctrl+Shift+N** | **Cmd+Shift+N** |
 | 切换标签侧边栏 | **Ctrl+Shift+B** | **Cmd+Shift+B** |
-| 向右分屏 | **Ctrl+Shift+O** | **Cmd+Shift+O** |
+| 向右分屏 | **Ctrl+Shift++** | **Cmd+Shift++** |
+| 向下分屏 | **Ctrl+Shift+-** | **Cmd+Shift+-** |
 | 切换文件浏览器侧边栏 | **Ctrl+Shift+Alt+E** | **Cmd+Shift+Opt+E** |
 | 切换 AI Copilot 侧边栏（当前终端） | **Ctrl+Shift+A** | **Cmd+Shift+A** |
 | 预览文件（终端内 Ctrl/Cmd 单击，或文件浏览器中双击） | Ctrl 单击 | Cmd 单击 |
+| 在图库中查看上一张 / 下一张图片或 PDF（预览面板聚焦时） | Left / Right | Left / Right |
+| PDF 预览上一页 / 下一页（PDF 预览面板聚焦时） | PageUp / PageDown | PageUp / PageDown |
 | 下载 SSH 远程文件 | 在 SSH 输出中 Ctrl+Shift 单击路径 | 在 SSH 输出中 Cmd+Shift 单击路径 |
 | 关闭聚焦的面板、标签页或窗口 | **Ctrl+Shift+W** | **Cmd+Shift+W** |
 | 最大化或还原窗口 | **Alt+Enter** | **Opt+Enter** |
@@ -136,6 +155,11 @@ keybind = global:ctrl+backquote=toggle_quake
 | 选择 AI 聊天输入；输入为空时选择整段记录 | 在 AI 聊天中 **Ctrl+A** | 在 AI 聊天中 **Cmd+A** |
 | 复制 AI 聊天选区或完整记录 | 在 AI 聊天中 **Ctrl+C** | 在 AI 聊天中 **Cmd+C** |
 | 删除选中的已保存智能体会话 | 在智能体历史中 **D** / **Delete** | 在智能体历史中 **D** / **Delete** |
+| 编辑 AI 历史筛选条件 | 在 AI 历史中输入 / Backspace | 在 AI 历史中输入 / Backspace |
+| 移动选中的 AI 历史会话 | AI 历史中 Up / Down | AI 历史中 Up / Down |
+| 恢复选中的 AI 历史会话 | AI 历史中 Enter | AI 历史中 Enter |
+| 预览选中的 AI 历史记录 | AI 历史中 Space | AI 历史中 Space |
+| 刷新本地 AI 历史扫描 | 本地 AI 历史中 **R** | 本地 AI 历史中 **R** |
 | 编辑 AI 聊天输入光标 | Left/Right/Home/End/Delete/Backspace | Left/Right/Home/End/Delete/Backspace |
 | 停止进行中的 AI 聊天或智能体请求 | 工作时在 AI 聊天中按 **Esc** | 工作时在 AI 聊天中按 **Esc** |
 | 复制选区（右键） | 右键点击选区 | 右键点击选区 |
@@ -205,7 +229,7 @@ __wispterm_report_cwd
 
 - 原始项目：[arya-s/phantty](https://github.com/arya-s/phantty) —— Zig + libghostty-vt
 的基础与 Windows 终端核心。WispTerm 在此基础上构建，并在其上叠加了更多特性：内嵌
-WebView2 浏览器面板、带 Markdown/文本/表格/图片预览的文件浏览器、可导出 Markdown 的
+WebView2 浏览器面板、带 Markdown/文本/表格/图片/PDF 预览的文件浏览器、可导出 Markdown 的
 AI 智能体会话、可选的远程访问客户端、Kitty 图形图片协议支持，以及可配置的背景图。
 - 终端模拟：[ghostty-org/ghostty](https://github.com/ghostty-org/ghostty)，通过
 `libghostty-vt`。
@@ -214,3 +238,24 @@ AI 智能体会话、可选的远程访问客户端、Kitty 图形图片协议�
 ## 许可证
 
 MIT
+
+## Star History
+
+<a href="https://star-history.com/#xuzhougeng/wispterm&Date">
+  <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=xuzhougeng/wispterm&type=Date" />
+</a>
+
+## 引用
+
+Xu, Z.-G. (2026). *WispTerm* (Version 1.24.0) [Computer software]. Zenodo.
+https://doi.org/10.5281/zenodo.20660542
+
+可直接复制的致谢模板：
+
+```text
+我们在生命科学数据分析中使用 WispTerm 作为计算环境的一部分，用于远程计算流程、
+可重复的命令行处理，以及相关文献与分析代码的整理。
+
+Xu, Z.-G. (2026). WispTerm (Version 1.24.0) [Computer software]. Zenodo.
+https://doi.org/10.5281/zenodo.20660542
+```

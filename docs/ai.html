@@ -14,7 +14,7 @@
   <link rel="apple-touch-icon" href="assets/wispterm.png">
   <link rel="alternate" hreflang="en" href="./ai.html">
   <link rel="alternate" hreflang="zh-CN" href="./ai.zh.html">
-  <link rel="stylesheet" href="style.css?v=6">
+  <link rel="stylesheet" href="style.css?v=8">
 </head>
 <body>
   <header class="site-header">
@@ -87,6 +87,10 @@
           <div class="feature">
             <h3>DeepSeek V4 profiles</h3>
             <p>The default profile targets OpenAI-compatible Chat Completions at <code>https://api.deepseek.com</code> with <code>deepseek-v4-pro</code>. Use <code>deepseek-v4-flash</code> when you want a faster, lighter profile.</p>
+          </div>
+          <div class="feature">
+            <h3>Switch models in-session</h3>
+            <p>Use <code>/model</code>, <code>/model &lt;name&gt;</code>, the <code>/模型</code> alias, or the clickable model label to move the current chat or Copilot session to another saved profile. WispTerm summarizes prior context for the new model without changing your global default profile.</p>
           </div>
           <div class="feature">
             <h3>Terminal-aware tools</h3>
@@ -191,7 +195,7 @@ ai-agent-output-limit       = 16384</code></pre>
           </div>
           <div class="feature">
             <h3>Slash commands</h3>
-            <p><code>/skills</code> lists discovered skills, <code>/commands</code> lists local AI commands, and <code>/reload-skills</code> refreshes future skill calls from disk.</p>
+            <p><code>/model</code> switches saved profiles, <code>/skills</code> lists discovered skills, <code>/commands</code> lists local AI commands, and <code>/reload-skills</code> refreshes future skill calls from disk.</p>
           </div>
           <div class="feature">
             <h3>Command center paths</h3>
@@ -219,7 +223,7 @@ ai-agent-output-limit       = 16384</code></pre>
           </div>
           <div class="feature">
             <h3>Model aliases</h3>
-            <p>Use current DeepSeek V4 model IDs such as <code>deepseek-v4-pro</code> or <code>deepseek-v4-flash</code> rather than legacy aliases.</p>
+            <p>Use current DeepSeek V4 model IDs such as <code>deepseek-v4-pro</code> or <code>deepseek-v4-flash</code> rather than legacy aliases. To switch a running conversation to a different saved profile, use <code>/model</code> or click the model label.</p>
           </div>
         </div>
         <p class="section-foot">References: <a href="https://api-docs.deepseek.com/quick_start/pricing/" target="_blank" rel="noopener">DeepSeek model details</a> and <a href="https://api-docs.deepseek.com/guides/thinking_mode" target="_blank" rel="noopener">DeepSeek thinking mode</a>.</p>

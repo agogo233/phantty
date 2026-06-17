@@ -384,6 +384,15 @@ language: i18n.LanguageSetting = .auto,
 /// finish/confirm notifications to the bound WeChat owner. Opt-in; default off.
 @"weixin-notify-forward": bool = false,
 
+/// Enable the local agent terminal control API (wisptermctl). Lets external
+/// agents list panes / read text / send input over a loopback socket. Opt-in;
+/// default off. Binds 127.0.0.1 only; a random token + the chosen port are
+/// written to <config-dir>/agent-control.json (0600) for client auto-discovery.
+@"agent-control-enabled": bool = false,
+
+/// Fixed loopback port for the agent control API (0 = let the OS assign one).
+@"agent-control-port": u16 = 0,
+
 /// Show a debug FPS overlay in the bottom-right corner.
 @"wispterm-debug-fps": bool = false,
 @"wispterm-debug-draw-calls": bool = false,
@@ -430,6 +439,8 @@ language: i18n.LanguageSetting = .auto,
 /// Show the "What's New" changelog once after upgrading to a newer build.
 /// Disables only the automatic popup; the command-center entry always works.
 @"whats-new-on-update": bool = true,
+/// Show the Copilot discovery hint to new users. Set to false to suppress permanently.
+@"copilot-hint": bool = true,
 
 /// Load an additional config file. Can be repeated. Relative paths are
 /// resolved relative to the file containing the directive. Prefix with
@@ -927,6 +938,19 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
         } else {
             log.warn("invalid weixin-notify-forward: {s}", .{value});
         }
+    } else if (std.mem.eql(u8, key, "agent-control-enabled")) {
+        if (std.mem.eql(u8, value, "true")) {
+            self.@"agent-control-enabled" = true;
+        } else if (std.mem.eql(u8, value, "false")) {
+            self.@"agent-control-enabled" = false;
+        } else {
+            log.warn("invalid agent-control-enabled: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "agent-control-port")) {
+        self.@"agent-control-port" = std.fmt.parseInt(u16, std.mem.trim(u8, value, " \t"), 10) catch {
+            log.warn("invalid agent-control-port: {s}", .{value});
+            return;
+        };
     } else if (std.mem.eql(u8, key, "wispterm-debug-fps")) {
         if (std.mem.eql(u8, value, "true")) {
             self.@"wispterm-debug-fps" = true;
@@ -1010,6 +1034,14 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
             self.@"whats-new-on-update" = false;
         } else {
             log.warn("invalid whats-new-on-update: {s}", .{value});
+        }
+    } else if (std.mem.eql(u8, key, "copilot-hint")) {
+        if (std.mem.eql(u8, value, "true")) {
+            self.@"copilot-hint" = true;
+        } else if (std.mem.eql(u8, value, "false")) {
+            self.@"copilot-hint" = false;
+        } else {
+            log.warn("invalid copilot-hint: {s}", .{value});
         }
     } else if (std.mem.eql(u8, key, "config-file")) {
         self.loadConfigFileDirective(allocator, value, base_dir);
@@ -1372,6 +1404,8 @@ pub fn writeHelp(writer: anytype) !void {
         \\  --weixin-reply-timeout-ms <n> Deprecated (no-op); AI-reply window is ~30 min
         \\  --weixin-allowed-user <id>   Restrict control to one ilink user_id
         \\  --weixin-notify-forward <bool> Forward agent notifications to the bound WeChat owner
+        \\  --agent-control-enabled <bool> Enable the local wisptermctl terminal control API (loopback)
+        \\  --agent-control-port <n>     Fixed loopback port for the control API (0 = auto)
         \\  --quake-mode <bool>          Enable Quake-style drop-down mode (default: true)
         \\
         \\Color Options (override theme):
@@ -1521,6 +1555,23 @@ pub fn setConfigValue(allocator: std.mem.Allocator, key: []const u8, value: []co
     };
     defer if (content.len > 0) allocator.free(content);
 
+    const out = try setConfigValueInContent(allocator, content, key, value);
+    defer allocator.free(out);
+
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(out);
+}
+
+/// Pure: return a copy of `content` with `key`'s active value set to `value`.
+/// The first active occurrence is rewritten in place and any later duplicate
+/// occurrences are dropped, so the value the loader applies matches what was just
+/// set — config keys are last-wins during load, so without dropping duplicates a
+/// file with two active `font-size` lines would keep applying the second one and
+/// the Settings page (which only rewrote the first) would appear to do nothing.
+/// Comments and unrelated lines are preserved; the line is appended if the key is
+/// absent. Caller owns the returned slice.
+pub fn setConfigValueInContent(allocator: std.mem.Allocator, content: []const u8, key: []const u8, value: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
@@ -1528,9 +1579,12 @@ pub fn setConfigValue(allocator: std.mem.Allocator, key: []const u8, value: []co
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_raw| {
         const line = std.mem.trimRight(u8, line_raw, "\r");
-        if (!replaced and configLineMatchesKey(line, key)) {
-            try out.writer(allocator).print("{s} = {s}\n", .{ key, value });
-            replaced = true;
+        if (configLineMatchesKey(line, key)) {
+            if (!replaced) {
+                try out.writer(allocator).print("{s} = {s}\n", .{ key, value });
+                replaced = true;
+            }
+            // Drop later duplicate active lines for the same key.
         } else if (line.len > 0) {
             try out.appendSlice(allocator, line);
             try out.append(allocator, '\n');
@@ -1544,9 +1598,7 @@ pub fn setConfigValue(allocator: std.mem.Allocator, key: []const u8, value: []co
         try out.writer(allocator).print("{s} = {s}\n", .{ key, value });
     }
 
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(out.items);
+    return out.toOwnedSlice(allocator);
 }
 
 /// Pure: return a copy of `content` with active `key = value` lines for any of
@@ -1996,6 +2048,46 @@ test "config: settings reset strips settings-page keys but preserves everything 
     try std.testing.expect(std.mem.indexOf(u8, stripped, "font-family = JetBrains Mono") != null);
     try std.testing.expect(std.mem.indexOf(u8, stripped, "keybind = ctrl+shift+p=toggle_command_palette") != null);
     try std.testing.expect(std.mem.indexOf(u8, stripped, "quake-mode = true") != null);
+}
+
+test "setConfigValueInContent rewrites first active line and drops duplicates" {
+    const allocator = std.testing.allocator;
+    // Two active font-size lines (as can accumulate in a real config): load is
+    // last-wins, so the Settings page rewriting only the first would never take
+    // effect. The dedupe collapses them to one line carrying the new value.
+    const content =
+        \\# Font
+        \\font-size = 20
+        \\theme = dracula
+        \\font-size = 16
+        \\
+    ;
+    const out = try setConfigValueInContent(allocator, content, "font-size", "24");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        \\# Font
+        \\font-size = 24
+        \\theme = dracula
+        \\
+    , out);
+}
+
+test "setConfigValueInContent leaves commented lines and appends when key absent" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\# font-size = 13
+        \\theme = dracula
+        \\
+    ;
+    const out = try setConfigValueInContent(allocator, content, "font-size", "18");
+    defer allocator.free(out);
+    // The comment is preserved (not matched) and the active key is appended.
+    try std.testing.expectEqualStrings(
+        \\# font-size = 13
+        \\theme = dracula
+        \\font-size = 18
+        \\
+    , out);
 }
 
 test "config: inline comments after values are ignored" {

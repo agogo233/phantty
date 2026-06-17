@@ -2,10 +2,10 @@
 
 *[English](Installation) · 中文*
 
-> 在 Windows 或 macOS 上下载运行 WispTerm，或从源码构建。
+> 在 Windows、macOS 或实验性 Linux 上下载运行 WispTerm，或从源码构建。
 
-WispTerm 提供 **Windows** 与 **macOS** 版本。Linux 移植仍在进行中（见
-[`TODO.md`](https://github.com/xuzhougeng/wispterm/blob/main/TODO.md)）。
+WispTerm 提供 **Windows** 与 **macOS** 版本。**Linux** x86_64 AppImage 也会作为社区测试
+版本发布，仍属实验性质。
 
 ## Windows
 
@@ -31,6 +31,18 @@ WispTerm 就会用它作为配置，整套设置可随 U 盘或共享目录携�
   ```
 
 > 传入命令行选项必须用二进制路径 —— 双击 `.app` 无法附带参数。
+
+## Linux（实验性）
+
+下载 `WispTerm-*-x86_64.AppImage` release asset，赋予可执行权限后运行：
+
+```bash
+chmod +x WispTerm-*-x86_64.AppImage
+./WispTerm-*-x86_64.AppImage
+```
+
+如果系统没有 FUSE 支持，可加 `--appimage-extract-and-run`。Linux 构建内置 SDL3，主要用于
+社区测试，尚不视为稳定版本。
 
 ## 从源码构建
 
@@ -72,7 +84,7 @@ wispterm --show-config-path   # 打印解析出的配置文件路径
 - **Open Latest Release** —— 在浏览器中打开发布页。
 
 升级后，**What's New**（命令中心里，也会在首次启动新版本时自动弹出）会汇总改动。
-**Update Skills** 会从 GitHub 下载最新的内置 AI 技能。
+**Skill Center（技能中心）** 可以盘点、安装并跨服务器同步技能，也能从 GitHub 仓库安装最新技能。
 
 下一步：**[[快速上手|Getting-Started-zh]]**。
 

@@ -71,6 +71,13 @@ remote-session-key = Workstation
 | `restore-tabs-on-startup`   | `false`    | Persist tab/split layout to the platform config directory (`session.json`) on close and rebuild it on next launch. SSH passwords are never persisted; reconnects re-prompt. CLI overrides (`--cwd`) take precedence and skip restore. |
 | `auto-update-check`         | `true`     | Check GitHub Releases after startup and show a clickable prompt when a newer version is available. Set to `false` to disable startup checks.                                                                             |
 | `config-file`               | *(none)*   | Include another config file (prefix with `?` to make optional)                                                                                                                                                          |
+| `ai-default-profile`        | *(none)*   | Saved AI profile name used by New Agent, startup auto-open, remote auto-open, and Copilot defaults. Empty falls back to the first saved profile. `/model` changes only the current session and does not rewrite this key. |
+| `ai-agent-enabled`          | `false`    | Enable agent tools for AI Chat profiles by default.                                                                                                                                                                     |
+| `ai-agent-permission`       | `ask`      | Agent tool permission mode: `ask`, `auto`, or `full`.                                                                                                                                                                   |
+| `ai-agent-command-timeout-ms` | `60000`  | Timeout budget for agent shell/SSH commands.                                                                                                                                                                           |
+| `ai-agent-output-limit`     | `16384`    | Maximum bytes returned from a single tool result.                                                                                                                                                                      |
+| `ai-agent-working-dir`      | *(none)*   | Default working directory for agent local commands. Empty leaves it unset.                                                                                                                                              |
+| `copilot-hint`              | `true`     | Show the right-edge Copilot summon handle and one-time shimmer hint. Set to `false` to hide that discovery affordance.                                                                                                  |
 | `remote-enabled`            | `false`    | Start the shared outbound RemoteClient for this WispTerm instance                                                                                                                                                        |
 | `remote-server-url`         | *(none)*   | Cloudflare relay URL, for example `https://remote.example.com`                                                                                                                                                          |
 | `remote-server-fingerprint` | *(none)*   | Expected relay fingerprint for server identity pinning                                                                                                                                                                  |
@@ -118,7 +125,9 @@ the settings page; it leaves Quake mode, your saved AI profiles, and custom
 Open the command center and run **Load OpenSSH Config** to import compatible
 entries from `~/.ssh/config` into WispTerm's SSH profiles. WispTerm imports
 `Host`, `HostName`, `User`, `Port`, and `ProxyJump`, skips wildcard host
-patterns, and does not import passwords.
+patterns, and does not import passwords. Imported profiles use the
+`credentials` auth method, so OpenSSH config, default keys, ssh-agent, and
+platform credential providers remain in charge of authentication.
 
 ## Keyboard Shortcuts
 

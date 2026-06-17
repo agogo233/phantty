@@ -7,7 +7,6 @@ pub const SlashCommand = enum {
     skills,
     commands,
     reload_skills,
-    update_skills,
     reload_commands,
     clear,
     rewind_picker,
@@ -21,6 +20,7 @@ pub const SlashCommand = enum {
     remember,
     memory,
     forget,
+    model_switch,
     unknown,
 };
 
@@ -78,10 +78,6 @@ pub const slash_command_entries = [_]SlashCommandEntry{
         .action = .reload_skills,
     },
     .{
-        .suggestion = .{ .command = "/update-skills", .description = "download latest skills from GitHub" },
-        .action = .update_skills,
-    },
-    .{
         .suggestion = .{ .command = "/clear", .description = "clear the conversation context" },
         .action = .clear,
     },
@@ -133,6 +129,10 @@ pub const slash_command_entries = [_]SlashCommandEntry{
         .suggestion = .{ .command = "/forget", .description = "delete a remembered fact by name" },
         .action = .forget,
     },
+    .{
+        .suggestion = .{ .command = "/model", .description = "switch the model / AI profile" },
+        .action = .model_switch,
+    },
 };
 
 pub const SkillInvocation = struct {
@@ -156,6 +156,7 @@ pub fn parseSlashCommand(input: []const u8) ?SlashCommand {
     if (!std.mem.startsWith(u8, trimmed, "/")) return null;
     if (isDistillAlias(trimmed)) return .distill;
     if (memoryCommandAlias(trimmed)) |c| return c;
+    if (modelCommandAlias(trimmed)) |c| return c;
     for (slash_command_entries) |entry| {
         if (std.mem.eql(u8, trimmed, entry.suggestion.command)) return entry.action;
     }
@@ -167,6 +168,7 @@ pub fn parseSlashCommand(input: []const u8) ?SlashCommand {
 pub fn exactBuiltinCommand(token: []const u8) ?SlashCommand {
     if (isDistillAlias(token)) return .distill;
     if (memoryCommandAlias(token)) |c| return c;
+    if (modelCommandAlias(token)) |c| return c;
     for (slash_command_entries) |entry| {
         if (std.mem.eql(u8, token, entry.suggestion.command)) return entry.action;
     }
@@ -181,6 +183,11 @@ pub fn memoryCommandAlias(token: []const u8) ?SlashCommand {
     if (std.mem.eql(u8, token, "/记住")) return .remember;
     if (std.mem.eql(u8, token, "/记忆")) return .memory;
     if (std.mem.eql(u8, token, "/忘记")) return .forget;
+    return null;
+}
+
+pub fn modelCommandAlias(token: []const u8) ?SlashCommand {
+    if (std.mem.eql(u8, token, "/模型")) return .model_switch;
     return null;
 }
 
@@ -417,6 +424,17 @@ test "parseSlashCommand recognizes new lifecycle commands" {
     try std.testing.expectEqual(SlashCommand.distill, parseSlashCommand("/沉淀").?);
     try std.testing.expectEqual(SlashCommand.distill, exactBuiltinCommand("/沉淀").?);
     try std.testing.expectEqual(@as(?SlashCommand, null), parseSlashCommand("/沉淀 主题"));
+}
+
+test "parseSlashCommand recognizes model switch and alias" {
+    try std.testing.expectEqual(SlashCommand.model_switch, parseSlashCommand("/model").?);
+    try std.testing.expectEqual(SlashCommand.model_switch, parseSlashCommand("/模型").?);
+    try std.testing.expectEqual(SlashCommand.model_switch, exactBuiltinCommand("/model").?);
+    try std.testing.expectEqual(SlashCommand.model_switch, exactBuiltinCommand("/模型").?);
+    // "/model GPT-5" is dispatched by exactBuiltinCommand on the first token only:
+    try std.testing.expectEqual(SlashCommand.model_switch, exactBuiltinCommand("/model").?);
+    // parseSlashCommand on the whole string with an arg must NOT match (has a space):
+    try std.testing.expectEqual(@as(?SlashCommand, null), parseSlashCommand("/model GPT-5"));
 }
 
 test "parseSlashCommand recognizes exact, unknown, and rejects non-slash" {

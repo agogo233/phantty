@@ -16,6 +16,22 @@ const render_diagnostics = @import("render_diagnostics.zig");
 const window_backend = @import("platform/window_backend.zig");
 const i18n = @import("i18n.zig");
 const ai_chat = @import("ai_chat.zig");
+const build_options = @import("build_options");
+const diag_log = @import("diag_log.zig");
+
+/// Diagnostic builds (-Ddebug-console) route std.log to the on-disk debug log;
+/// normal builds keep std defaults (zero cost).
+pub const std_options: std.Options = if (build_options.debug_console)
+    .{ .logFn = diag_log.logFn, .log_level = .debug }
+else
+    .{};
+
+/// Diagnostic builds write a crash report before aborting; normal builds use the
+/// default panic.
+pub const panic = if (build_options.debug_console)
+    std.debug.FullPanic(diag_log.panicFn)
+else
+    std.debug.FullPanic(std.debug.defaultPanic);
 
 // ============================================================================
 // Font Discovery Test Functions (use --list-fonts or --test-font-discovery)
@@ -147,6 +163,13 @@ pub fn main() !void {
         return;
     }
 
+    if (build_options.debug_console) {
+        diag_log.init();
+        diag_log.installCrashHandlers();
+        std.log.info("diagnostic build start version={s}", .{build_options.app_version});
+    }
+    defer if (build_options.debug_console) diag_log.close();
+
     std.debug.print("WispTerm starting...\n", .{});
     rerootCwdFromBundleRootIfNeeded();
     image_decoder.install();
@@ -218,6 +241,9 @@ pub fn main() !void {
 
     // Start the WeChat direct bridge (no-op unless weixin-direct-enabled is set).
     app.startWeixin(&cfg);
+
+    // Start the local agent terminal control API (no-op unless agent-control-enabled).
+    app.startAgentControl(&cfg);
 
     try app.run();
 

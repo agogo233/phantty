@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WispTerm — A terminal for Windows &amp; macOS, powered by Ghostty</title>
-  <meta name="description" content="WispTerm is a fast, modern terminal emulator for Windows and macOS, written in Zig and powered by libghostty-vt. Splits, tabs, AI agent tools, themes, background images, and more.">
-  <meta property="og:title" content="WispTerm — A terminal for Windows &amp; macOS, powered by Ghostty">
-  <meta property="og:description" content="A fast, modern terminal for Windows and macOS, written in Zig, powered by libghostty-vt.">
+  <title>WispTerm — A terminal for Windows, macOS &amp; experimental Linux, powered by Ghostty</title>
+  <meta name="description" content="WispTerm is a fast, modern terminal emulator for Windows, macOS, and experimental Linux, written in Zig and powered by libghostty-vt. Splits, tabs, AI agent tools, themes, background images, and more.">
+  <meta property="og:title" content="WispTerm — A terminal for Windows, macOS &amp; experimental Linux, powered by Ghostty">
+  <meta property="og:description" content="A fast, modern terminal for Windows, macOS, and experimental Linux, written in Zig, powered by libghostty-vt.">
   <meta property="og:image" content="assets/wispterm.png">
   <meta property="og:type" content="website">
   <meta name="theme-color" content="#1b1e28">
@@ -14,7 +14,7 @@
   <link rel="apple-touch-icon" href="assets/wispterm.png">
   <link rel="alternate" hreflang="en" href="./">
   <link rel="alternate" hreflang="zh-CN" href="./zh.html">
-  <link rel="stylesheet" href="style.css?v=6">
+  <link rel="stylesheet" href="style.css?v=8">
 </head>
 <body>
   <header class="site-header">
@@ -24,6 +24,7 @@
         <span>WispTerm</span>
       </a>
       <nav class="nav-links">
+        <a href="#quickstart">Quick start</a>
         <a href="#features">Features</a>
         <a href="#install">Install</a>
         <a href="#config">Config</a>
@@ -46,12 +47,12 @@
       <div class="container hero-inner">
         <img class="hero-logo" src="assets/wispterm.png" alt="WispTerm logo" width="128" height="128">
         <h1>WispTerm</h1>
-        <p class="tagline">A fast, modern terminal for <strong>Windows and macOS</strong>, written in Zig, powered by <a href="https://github.com/ghostty-org/ghostty" target="_blank" rel="noopener">libghostty-vt</a>.</p>
+        <p class="tagline">A fast, modern terminal for <strong>Windows, macOS, and experimental Linux</strong>, written in Zig, powered by <a href="https://github.com/ghostty-org/ghostty" target="_blank" rel="noopener">libghostty-vt</a>.</p>
         <div class="cta-row">
           <a class="cta primary" href="https://github.com/xuzhougeng/wispterm/releases/latest" target="_blank" rel="noopener">Download latest release</a>
           <a class="cta secondary" href="https://github.com/xuzhougeng/wispterm" target="_blank" rel="noopener">View on GitHub</a>
         </div>
-        <p class="platform-note">Ships for <strong>Windows</strong> and <strong>macOS</strong> (Apple Silicon &amp; Intel). Linux port in progress.</p>
+        <p class="platform-note">Ships for <strong>Windows</strong>, <strong>macOS</strong> (Apple Silicon &amp; Intel), and an <strong>experimental Linux AppImage</strong>.</p>
       </div>
 
       <div class="container preview-wrap">
@@ -84,6 +85,27 @@ nothing to commit, working tree clean
       </div>
     </section>
 
+    <section id="quickstart" class="section alt">
+      <div class="container">
+        <h2>Quick start</h2>
+        <p class="section-lead">Three steps to a productive WispTerm session: install the app, point the AI Copilot at an LLM provider, and teach your SSH servers to report their working directory.</p>
+        <div class="feature-grid">
+          <div class="feature">
+            <h3>1 · Install</h3>
+            <p>Grab the latest Windows or macOS build, or build from source with Zig. <a href="#install">Jump to install options ↓</a></p>
+          </div>
+          <div class="feature">
+            <h3>2 · Configure an LLM provider</h3>
+            <p>Open the session launcher (<kbd>Ctrl/Cmd</kbd><kbd>Shift</kbd><kbd>T</kbd>), choose <code>AI Agent</code>, and fill in a base URL, API key, and model — DeepSeek V4 is the default. Switch later with <code>/model</code> or the model label. <a href="./ai.html#setup">Configure the LLM provider →</a></p>
+          </div>
+          <div class="feature">
+            <h3>3 · Configure your SSH servers</h3>
+            <p>Add a small OSC 7 snippet to the remote shell so downloads and dragged uploads land in the directory you actually <code>cd</code>'d to. <a href="#ssh-setup">SSH server setup ↓</a></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section id="features" class="section">
       <div class="container">
         <h2>Built for daily work</h2>
@@ -103,7 +125,11 @@ nothing to commit, working tree clean
           </div>
           <div class="feature">
             <h3>AI agent tabs</h3>
-            <p>Chat tabs can act as local agents: read terminal snapshots, run shell commands (PowerShell on Windows, shell on macOS), work with WSL and SSH sessions, load skills, keep tool approval inside WispTerm, and export full or clean Markdown records. <a href="./ai.html">Explore the AI workflow</a> or <a href="./use-cases.html">see use cases</a>.</p>
+            <p>Chat tabs can act as local agents: read terminal snapshots, run shell commands (PowerShell on Windows, shell on macOS/Linux), work with WSL and SSH sessions, load skills, switch models in-session with <code>/model</code>, keep tool approval inside WispTerm, and export full or clean Markdown records. <a href="./ai.html">Explore the AI workflow</a> or <a href="./use-cases.html">see use cases</a>.</p>
+          </div>
+          <div class="feature">
+            <h3>Copilot where you work</h3>
+            <p>Use <kbd>Ctrl/Cmd</kbd><kbd>Shift</kbd><kbd>A</kbd>, the command center, or the terminal's right-edge Copilot handle to open the in-context sidebar for the focused terminal.</p>
           </div>
           <div class="feature">
             <h3>453 themes built-in</h3>
@@ -148,7 +174,7 @@ nothing to commit, working tree clean
     <section id="install" class="section alt">
       <div class="container">
         <h2>Install</h2>
-        <p class="section-lead">Pre-built releases for Windows and macOS are published per version. Pick the package that fits your platform and workflow.</p>
+        <p class="section-lead">Pre-built releases for Windows, macOS, and experimental Linux are published per version. Pick the package that fits your platform and workflow.</p>
         <div class="install-grid">
           <div class="install-card">
             <span class="badge">Windows · Recommended</span>
@@ -166,6 +192,12 @@ nothing to commit, working tree clean
             <span class="badge">macOS · Beta</span>
             <h3>macOS DMG</h3>
             <p>Signed and notarized <code>.dmg</code> for Apple Silicon and Intel. Requires macOS 13+. Open the DMG and drag <code>WispTerm.app</code> to Applications.</p>
+            <a class="cta primary small" href="https://github.com/xuzhougeng/wispterm/releases/latest" target="_blank" rel="noopener">Latest release →</a>
+          </div>
+          <div class="install-card">
+            <span class="badge">Linux · Experimental</span>
+            <h3>AppImage</h3>
+            <p>Portable x86_64 AppImage for community testing. It bundles SDL3; expect rough edges while the Linux port matures.</p>
             <a class="cta primary small" href="https://github.com/xuzhougeng/wispterm/releases/latest" target="_blank" rel="noopener">Latest release →</a>
           </div>
           <div class="install-card">
@@ -216,6 +248,49 @@ ai-agent-output-limit  = 16384</code></pre>
       </div>
     </section>
 
+    <section id="ssh-setup" class="section">
+      <div class="container">
+        <h2>SSH downloads &amp; uploads that follow your current directory</h2>
+        <p class="section-lead">WispTerm can download a relative file path from SSH terminal output, and upload dragged files into the interactive SSH shell's current directory — but only when the remote shell reports that directory with <strong>OSC 7</strong>, the same terminal convention <a href="https://ghostty.org/docs/help/terminfo" target="_blank" rel="noopener">Ghostty's shell integration</a> uses.</p>
+        <p class="section-lead">When OSC 7 is missing, the helper <code>ssh.exe</code> / <code>scp.exe</code> commands open a fresh session that usually sees the login directory, not the directory you <code>cd</code>'d to. In that case WispTerm shows <em>“SSH cwd unknown; click for setup”</em> instead of guessing <code>~/file</code>.</p>
+        <p class="section-lead">Add one of these snippets to the remote shell's startup file, then start a new WispTerm SSH session.</p>
+        <div class="shell-setup">
+          <div class="setup-panel">
+            <h3>Bash — <code>~/.bashrc</code></h3>
+            <div class="code-copy">
+              <button class="copy-btn" type="button" data-copied="Copied">Copy</button>
+<pre class="code-block"><code>__wispterm_report_cwd() {
+  printf '\033]7;file://%s%s\a' "${HOSTNAME:-localhost}" "$PWD"
+}
+PROMPT_COMMAND="__wispterm_report_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"</code></pre>
+            </div>
+          </div>
+          <div class="setup-panel">
+            <h3>Zsh — <code>~/.zshrc</code></h3>
+            <div class="code-copy">
+              <button class="copy-btn" type="button" data-copied="Copied">Copy</button>
+<pre class="code-block"><code>__wispterm_report_cwd() {
+  printf '\033]7;file://%s%s\a' "${HOST:-localhost}" "$PWD"
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook chpwd __wispterm_report_cwd
+add-zsh-hook precmd __wispterm_report_cwd</code></pre>
+            </div>
+          </div>
+          <div class="setup-panel">
+            <h3>Fish — <code>~/.config/fish/config.fish</code></h3>
+            <div class="code-copy">
+              <button class="copy-btn" type="button" data-copied="Copied">Copy</button>
+<pre class="code-block"><code>function __wispterm_report_cwd --on-variable PWD
+    printf '\e]7;file://%s%s\a' (hostname) (string escape --style=url $PWD)
+end
+__wispterm_report_cwd</code></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section id="shortcuts" class="section alt">
       <div class="container">
         <h2>Keyboard shortcuts</h2>
@@ -226,7 +301,9 @@ ai-agent-output-limit  = 16384</code></pre>
           <div><span class="label">New window</span><span class="keys"><kbd>Ctrl/Cmd</kbd><kbd>Shift</kbd><kbd>N</kbd></span></div>
           <div><span class="label">Toggle tab sidebar</span><span class="keys"><kbd>Ctrl/Cmd</kbd><kbd>Shift</kbd><kbd>B</kbd></span></div>
           <div><span class="label">Toggle file explorer</span><span class="keys"><kbd>Ctrl/Cmd</kbd><kbd>Shift</kbd><kbd>Alt/Opt</kbd><kbd>E</kbd></span></div>
-          <div><span class="label">Split to the right</span><span class="keys"><kbd>Ctrl/Cmd</kbd><kbd>Shift</kbd><kbd>O</kbd></span></div>
+          <div><span class="label">Toggle AI Copilot sidebar</span><span class="keys"><kbd>Ctrl/Cmd</kbd><kbd>Shift</kbd><kbd>A</kbd></span></div>
+          <div><span class="label">Split to the right</span><span class="keys"><kbd>Ctrl/Cmd</kbd><kbd>Shift</kbd><kbd>+</kbd></span></div>
+          <div><span class="label">Split downward</span><span class="keys"><kbd>Ctrl/Cmd</kbd><kbd>Shift</kbd><kbd>-</kbd></span></div>
           <div><span class="label">Equalize splits</span><span class="keys"><kbd>Ctrl/Cmd</kbd><kbd>Shift</kbd><kbd>Z</kbd></span></div>
           <div><span class="label">Close panel / tab / window</span><span class="keys"><kbd>Ctrl/Cmd</kbd><kbd>Shift</kbd><kbd>W</kbd></span></div>
           <div><span class="label">Maximize / restore window</span><span class="keys"><kbd>Alt/Opt</kbd><kbd>Enter</kbd></span></div>
@@ -267,9 +344,13 @@ ai-agent-output-limit  = 16384</code></pre>
             <h3>How do I connect to older bastions or SSH servers?</h3>
             <p>Set <code>ssh-legacy-algorithms = true</code> in your config file. This enables compatibility options for older hosts that still require <code>ssh-rsa</code>, <code>ssh-dss</code>, legacy Diffie-Hellman key exchange, or CBC ciphers.</p>
           </div>
+          <div class="feature">
+            <h3>Can I switch AI models without starting over?</h3>
+            <p>Yes. In an AI Chat tab or Copilot sidebar, type <code>/model</code> to open the saved-profile picker, <code>/model &lt;name&gt;</code> to switch directly, or click the model label in the header. WispTerm summarizes the prior transcript for the new model and keeps the switch local to that session.</p>
+          </div>
           <div class="feature" id="ssh-current-directory">
             <h3>Why did an SSH download or upload lose the current directory?</h3>
-            <p>WispTerm can download relative SSH paths and upload dragged files into the interactive SSH shell's current directory only when the remote shell reports OSC 7. If OSC 7 is missing, helper <code>ssh.exe</code> / <code>scp.exe</code> commands start a fresh session that usually sees the login directory, not the directory you <code>cd</code>'d to. Configure your remote shell to emit OSC 7; see the <a href="https://github.com/xuzhougeng/wispterm#ssh-current-directory-for-downloads-and-uploads" target="_blank" rel="noopener">setup snippets in README</a>.</p>
+            <p>WispTerm can download relative SSH paths and upload dragged files into the interactive SSH shell's current directory only when the remote shell reports OSC 7. If OSC 7 is missing, helper <code>ssh.exe</code> / <code>scp.exe</code> commands start a fresh session that usually sees the login directory, not the directory you <code>cd</code>'d to. Configure your remote shell to emit OSC 7 — see the <a href="#ssh-setup">SSH setup snippets above</a>.</p>
           </div>
           <div class="feature">
             <h3>What is the AI Chat / Agent prompt length limit?</h3>
@@ -311,5 +392,22 @@ ai-agent-output-limit  = 16384</code></pre>
       </div>
     </div>
   </footer>
+
+  <script>
+    document.querySelectorAll(".code-copy .copy-btn").forEach((btn) => {
+      const label = btn.textContent;
+      const copied = btn.dataset.copied || "Copied";
+      btn.addEventListener("click", async () => {
+        const code = btn.parentElement.querySelector("code");
+        try {
+          await navigator.clipboard.writeText(code ? code.textContent : "");
+          btn.textContent = copied;
+        } catch {
+          btn.textContent = "Press Ctrl+C";
+        }
+        window.setTimeout(() => { btn.textContent = label; }, 1400);
+      });
+    });
+  </script>
 </body>
 </html>

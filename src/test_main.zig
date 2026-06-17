@@ -118,10 +118,12 @@ comptime {
     }
 
     const profile_codec_source = @embedFile("renderer/overlays/profile_codec.zig");
-    if (std.mem.indexOf(u8, profile_codec_source, "pub const SSH_FIELD_COUNT = 6") == null or
+    if (std.mem.indexOf(u8, profile_codec_source, "pub const SSH_FIELD_COUNT = 8") == null or
+        std.mem.indexOf(u8, profile_codec_source, "auth_method = 6") == null or
+        std.mem.indexOf(u8, profile_codec_source, "identity_file = 7") == null or
         std.mem.indexOf(u8, profile_codec_source, "port_forward") != null)
     {
-        @compileError("Port forwarding must not extend the existing ssh_hosts profile schema");
+        @compileError("ssh_hosts profile schema must only add server auth fields; port forwarding must not extend it");
     }
 
     const ssh_tunnel_source = @embedFile("ssh_tunnel.zig");
@@ -631,6 +633,7 @@ comptime {
 comptime {
     _ = @import("ai_chat.zig");
     _ = @import("ai_chat_request.zig");
+    _ = @import("ai_model_switch.zig");
     _ = @import("ai_chat_tools.zig");
     _ = @import("ai_chat_skills.zig");
     _ = @import("ai_chat_types.zig");
@@ -653,6 +656,7 @@ comptime {
     _ = @import("ai_history_session.zig");
     _ = @import("renderer/ai_history_renderer.zig");
     _ = @import("agent_detector.zig");
+    _ = @import("Surface.zig");
     _ = @import("agent_prompt_answer.zig");
     _ = @import("App.zig");
     _ = @import("AppWindow.zig");
@@ -663,6 +667,7 @@ comptime {
     _ = @import("appwindow/tab.zig");
     _ = @import("appwindow/thread_message.zig");
     _ = @import("scp.zig");
+    _ = @import("diag_log.zig");
     _ = if (build_options.webview) @import("browser_panel.zig") else @import("browser_panel_stub.zig");
     _ = @import("browser_url.zig");
     _ = @import("build_guards.zig");
@@ -720,6 +725,22 @@ comptime {
     _ = @import("platform/process.zig");
     _ = @import("platform/console_host_policy.zig");
     _ = @import("platform/pty.zig");
+    switch (@import("builtin").os.tag) {
+        .windows, .linux, .macos => {
+            _ = @import("platform/pty_virtual_test.zig");
+            _ = @import("tmux/pane_io_test.zig");
+            _ = @import("appwindow/tmux_bridge.zig");
+        },
+        else => {},
+    }
+    // The posix tmux controller (drop/reconnect decision) is posix-only; it uses
+    // std.posix poll/read paths that don't compile for the windows app target.
+    switch (@import("builtin").os.tag) {
+        .linux, .macos => {
+            _ = @import("appwindow/tmux_controller_posix.zig");
+        },
+        else => {},
+    }
     _ = @import("platform/pty_command.zig");
     _ = @import("platform/remote_file.zig");
     _ = @import("platform/remote_transport.zig");
@@ -759,6 +780,8 @@ comptime {
     _ = @import("agent_memory.zig");
     _ = @import("skill_registry.zig");
     _ = @import("skill_scan.zig");
+    _ = @import("skill_install.zig");
+    _ = @import("skill_local_fs.zig");
     _ = @import("skill_inventory.zig");
     _ = @import("skill_inventory_cache.zig");
     _ = @import("skill_center.zig");
@@ -777,10 +800,10 @@ comptime {
     _ = @import("system_browser.zig");
     _ = @import("split_tree.zig");
     _ = @import("preview_pane.zig");
+    _ = @import("renderer/markdown_preview_renderer.zig");
     _ = @import("ui_perf.zig");
     _ = @import("update_check.zig");
     _ = @import("update_install.zig");
-    _ = @import("skill_update.zig");
 }
 
 test "app version metadata is exposed for CLI and command center" {

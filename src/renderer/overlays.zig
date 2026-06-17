@@ -34,6 +34,10 @@ const close_confirm = @import("../close_confirm.zig");
 const weixin_qr_panel = @import("../weixin/qr_panel.zig");
 const weixin_types = @import("../weixin/types.zig");
 const i18n = @import("../i18n.zig");
+const ai_model_switch = @import("../ai_model_switch.zig");
+const claude_integration = @import("../claude_integration.zig");
+const platform_atomic_file = @import("../platform/atomic_file.zig");
+const agent_detector = @import("../agent_detector.zig");
 
 const ui_pipeline = @import("ui_pipeline.zig");
 
@@ -45,6 +49,7 @@ pub const renderRoundedQuadAlpha = primitives.renderRoundedQuadAlpha;
 pub const scrollbar = @import("overlays/scrollbar.zig");
 pub const resize = @import("overlays/resize.zig");
 pub const startup_shortcuts = @import("overlays/startup_shortcuts.zig");
+pub const copilot_edge_handle = @import("overlays/copilot_edge_handle.zig");
 
 pub const SCROLLBAR_WIDTH = scrollbar.SCROLLBAR_WIDTH;
 pub const ScrollbarGeometry = scrollbar.ScrollbarGeometry;
@@ -71,6 +76,10 @@ pub const startupShortcutsShow = startup_shortcuts.startupShortcutsShow;
 pub const startupShortcutsDismiss = startup_shortcuts.startupShortcutsDismiss;
 pub const startupShortcutsToggle = startup_shortcuts.startupShortcutsToggle;
 pub const renderStartupShortcutsOverlay = startup_shortcuts.renderStartupShortcutsOverlay;
+pub const renderCopilotEdgeHandle = copilot_edge_handle.render;
+pub const copilotEdgeHandleSetTarget = copilot_edge_handle.setProximityTarget;
+pub const copilotEdgeHandleSetHovered = copilot_edge_handle.setHovered;
+pub const copilotEdgeHandleStartShimmer = copilot_edge_handle.startShimmer;
 
 // ============================================================================
 // Split divider rendering
@@ -136,7 +145,7 @@ threadlocal var g_update_prompt_rect: ?DebugLineRect = null;
 
 threadlocal var g_close_shortcut_confirm_until_ms: i64 = 0;
 
-pub const CloseConfirmVariant = enum { running_program, window_generic };
+pub const CloseConfirmVariant = enum { running_program, window_generic, terminal_split };
 threadlocal var g_window_close_confirm_visible: bool = false;
 threadlocal var g_close_confirm_pending: close_confirm.PendingClose = .window;
 threadlocal var g_close_confirm_variant: CloseConfirmVariant = .window_generic;
@@ -198,6 +207,7 @@ const COMMAND_ENTRIES = command_center_state.command_entries;
 const PaletteItem = union(enum) {
     command: usize,
     ssh_profile: usize,
+    tmux_profile: usize,
     ai_profile: usize,
     theme: usize,
 };
@@ -282,6 +292,26 @@ pub fn commandPaletteMove(delta: i32) void {
     while (next < 0) next += count_i;
     next = @mod(next, count_i);
     g_command_palette_selected = @intCast(next);
+}
+
+/// Mouse-wheel handling for the command center. The list scrolls by moving the
+/// selection (which the view follows via commandPaletteFirstVisibleIndex),
+/// matching the keyboard Up/Down model. Positive delta scrolls toward the top,
+/// mirroring whatsNewHandleScroll(). Clamps at the ends so the wheel never wraps.
+pub fn commandPaletteHandleScroll(delta_y: f64) void {
+    if (!g_command_palette_visible) return;
+    const step: i32 = if (delta_y > 0) -1 else if (delta_y < 0) 1 else 0;
+    if (step == 0) return;
+    if (commandPaletteIsHistoryMode()) {
+        commandPaletteMoveAgentHistory(step);
+        return;
+    }
+    const count = commandPaletteVisibleCount();
+    if (count == 0) return;
+    if (step < 0) {
+        if (g_command_palette_selected == 0) return;
+    } else if (g_command_palette_selected + 1 >= count) return;
+    commandPaletteMove(step);
 }
 
 pub fn commandPaletteAgentHistoryVisible() bool {
@@ -519,6 +549,7 @@ fn executeCommand(action: CommandAction) void {
         .new_tab => sessionLauncherOpenFromCommandPalette(),
         .load_openssh_config => loadOpenSshConfigDefault(),
         .new_agent => openDefaultAgentSessionFromCommandCenter(),
+        .toggle_ai_copilot => AppWindow.toggleAiCopilot(),
         .manage_ai_profiles => openAiListFromCommandPalette(),
         .select_agent_history => commandPaletteOpenAgentHistory(),
         .split_right => AppWindow.splitFocused(.right),
@@ -569,14 +600,8 @@ fn executeCommand(action: CommandAction) void {
         },
         .open_latest_release => openLatestRelease(),
         .show_whats_new => showWhatsNew(),
-        .update_skills => {
-            if (AppWindow.g_app) |app| {
-                showStatusToast(i18n.s().toast_updating_skills);
-                app.requestSkillUpdate();
-            } else {
-                showStatusToast(i18n.s().toast_update_skills_unavailable);
-            }
-        },
+        .install_claude_code_integration => installClaudeCodeIntegration(),
+        .remove_claude_code_integration => removeClaudeCodeIntegration(),
         .open_skill_center => {
             _ = AppWindow.spawnSkillCenterTab();
         },
@@ -585,7 +610,10 @@ fn executeCommand(action: CommandAction) void {
         },
         .split_preview => {
             if (AppWindow.g_allocator) |gpa| {
-                _ = AppWindow.tab.splitIntoPreview(gpa);
+                // Focus the new (empty) preview so Ctrl+Shift+W closes it.
+                if (AppWindow.tab.splitIntoPreview(gpa)) |pane| {
+                    _ = AppWindow.tab.focusPreviewPane(pane);
+                }
                 AppWindow.g_force_rebuild = true;
                 AppWindow.g_cells_valid = false;
             }
@@ -772,6 +800,14 @@ fn commandEntrySecondaryMatches(entry: CommandEntry, filter: []const u8) bool {
     return containsIgnoreCase(commandEntryShortcut(entry, &shortcut_buf), filter);
 }
 
+test "tmuxSessionName sanitizes a profile name to a tmux-safe session name" {
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("wispterm-NGS00", tmuxSessionName(&buf, "NGS00"));
+    try std.testing.expectEqualStrings("wispterm-prod_db_1", tmuxSessionName(&buf, "prod.db:1"));
+    try std.testing.expectEqualStrings("wispterm-a_b_c", tmuxSessionName(&buf, "a b\tc"));
+    try std.testing.expectEqualStrings("wispterm", tmuxSessionName(&buf, ""));
+}
+
 test "command palette filter accepts UTF-8 CJK and backspaces whole codepoints" {
     commandPaletteClearFilter();
     defer commandPaletteClearFilter();
@@ -804,10 +840,91 @@ test "command palette matches English source even when title is localized" {
     try std.testing.expect(!commandEntryTitleMatches(entry, "设置")); // no localized title under en
 }
 
+fn setCommandPaletteFilterForTest(filter: []const u8) void {
+    const len = @min(filter.len, g_command_palette_filter.len);
+    @memcpy(g_command_palette_filter[0..len], filter[0..len]);
+    g_command_palette_filter_len = len;
+    g_command_palette_selected = 0;
+}
+
+fn paletteContainsSshProfileForTest(profile_idx: usize) bool {
+    for (g_palette_scratch[0..g_palette_scratch_len]) |item| {
+        switch (item) {
+            .ssh_profile => |idx| {
+                if (idx == profile_idx) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn paletteContainsTmuxProfileForTest(profile_idx: usize) bool {
+    for (g_palette_scratch[0..g_palette_scratch_len]) |item| {
+        switch (item) {
+            .tmux_profile => |idx| {
+                if (idx == profile_idx) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+test "command palette includes tmux profile actions for SSH profile search" {
+    const previous_mode = g_command_palette_mode;
+    const previous_filter_len = g_command_palette_filter_len;
+    var previous_filter: [COMMAND_PALETTE_FILTER_MAX]u8 = undefined;
+    if (previous_filter_len > 0) @memcpy(previous_filter[0..previous_filter_len], g_command_palette_filter[0..previous_filter_len]);
+    const previous_selected = g_command_palette_selected;
+    const previous_scratch_len = g_palette_scratch_len;
+    const previous_ssh_loaded = g_ssh_profiles_loaded;
+    const previous_ssh_count = g_ssh_profile_count;
+    var previous_ssh_profiles: [SSH_PROFILE_MAX]SshProfile = undefined;
+    if (previous_ssh_count > 0) @memcpy(previous_ssh_profiles[0..previous_ssh_count], g_ssh_profiles[0..previous_ssh_count]);
+    const previous_ai_loaded = g_ai_profiles_loaded;
+    const previous_ai_count = g_ai_profile_count;
+    var previous_ai_profiles: [AI_PROFILE_MAX]AiProfile = undefined;
+    if (previous_ai_count > 0) @memcpy(previous_ai_profiles[0..previous_ai_count], g_ai_profiles[0..previous_ai_count]);
+    defer {
+        g_command_palette_mode = previous_mode;
+        g_command_palette_filter_len = previous_filter_len;
+        if (previous_filter_len > 0) @memcpy(g_command_palette_filter[0..previous_filter_len], previous_filter[0..previous_filter_len]);
+        g_command_palette_selected = previous_selected;
+        g_palette_scratch_len = previous_scratch_len;
+        g_ssh_profiles_loaded = previous_ssh_loaded;
+        g_ssh_profile_count = previous_ssh_count;
+        if (previous_ssh_count > 0) @memcpy(g_ssh_profiles[0..previous_ssh_count], previous_ssh_profiles[0..previous_ssh_count]);
+        g_ai_profiles_loaded = previous_ai_loaded;
+        g_ai_profile_count = previous_ai_count;
+        if (previous_ai_count > 0) @memcpy(g_ai_profiles[0..previous_ai_count], previous_ai_profiles[0..previous_ai_count]);
+    }
+
+    g_command_palette_mode = .commands;
+    g_ssh_profiles_loaded = true;
+    g_ssh_profile_count = 2;
+    g_ssh_profiles[0] = makeSshProfile("CPU2", "10.0.0.1", "user", "22");
+    g_ssh_profiles[1] = makeSshProfile("GPU", "10.0.0.2", "user", "22");
+    g_ai_profiles_loaded = true;
+    g_ai_profile_count = 0;
+
+    setCommandPaletteFilterForTest("CPU");
+    rebuildPaletteScratch();
+    try std.testing.expect(paletteContainsSshProfileForTest(0));
+    try std.testing.expect(paletteContainsTmuxProfileForTest(0));
+    try std.testing.expect(!paletteContainsTmuxProfileForTest(1));
+
+    setCommandPaletteFilterForTest("tmux");
+    rebuildPaletteScratch();
+    try std.testing.expect(paletteContainsTmuxProfileForTest(0));
+    try std.testing.expect(paletteContainsTmuxProfileForTest(1));
+}
+
 fn commandEntryKeybindAction(action: CommandAction) ?keybind.Action {
     return switch (action) {
         .new_tab => .new_session,
         .split_right => .split_right,
+        .split_down => .split_down,
         .focus_previous => .focus_previous,
         .focus_next => .focus_next,
         .equalize_splits => .equalize_splits,
@@ -866,9 +983,16 @@ fn rebuildPaletteScratch() void {
     for (0..g_ssh_profile_count) |profile_idx| {
         if (g_palette_scratch_len >= COMMAND_PALETTE_MAX_VISIBLE_ROWS) break;
         const profile = &g_ssh_profiles[profile_idx];
-        if (!command_palette_model.sshProfileNameMatchesFilter(profileField(profile, .name), filter)) continue;
-        g_palette_scratch[g_palette_scratch_len] = .{ .ssh_profile = profile_idx };
-        g_palette_scratch_len += 1;
+        const name = profileField(profile, .name);
+        if (command_palette_model.sshProfileNameMatchesFilter(name, filter)) {
+            g_palette_scratch[g_palette_scratch_len] = .{ .ssh_profile = profile_idx };
+            g_palette_scratch_len += 1;
+            if (g_palette_scratch_len >= COMMAND_PALETTE_MAX_VISIBLE_ROWS) break;
+        }
+        if (command_palette_model.tmuxProfileMatchesFilter(name, filter)) {
+            g_palette_scratch[g_palette_scratch_len] = .{ .tmux_profile = profile_idx };
+            g_palette_scratch_len += 1;
+        }
     }
     loadAiProfiles();
     for (0..g_ai_profile_count) |ai_idx| {
@@ -890,6 +1014,7 @@ fn executePaletteItem(item: PaletteItem) void {
     switch (item) {
         .command => |cmd_idx| executeCommand(COMMAND_ENTRIES[cmd_idx].action),
         .ssh_profile => |profile_idx| connectSshProfile(profile_idx),
+        .tmux_profile => |profile_idx| connectSshProfileTmux(profile_idx),
         .ai_profile => |profile_idx| _ = spawnAiProfileWithAgentOverride(profile_idx, null),
         .theme => |ti| applyEmbeddedThemeFromPalette(ti),
     }
@@ -962,6 +1087,14 @@ fn overlayTextHeight() f32 {
     return @max(1.0, font.g_titlebar_cell_height);
 }
 
+/// Clamp an overlay box height so the centered panel never paints past the
+/// content area on very short windows. The *RowCapacity helpers already size the
+/// box to fit in the common case; this guards the degenerate case where even the
+/// header + one row + footer exceeds the window.
+fn clampOverlayBoxHeight(box_h: f32, content_height: f32) f32 {
+    return @max(1.0, @min(box_h, content_height - 32.0));
+}
+
 fn overlayLineHeight() f32 {
     return @round(@max(24.0, overlayTextHeight() + 8.0));
 }
@@ -1014,7 +1147,7 @@ fn commandPaletteLayout(window_width: f32, window_height: f32, top_offset: f32) 
     const max_rows = commandPaletteRowCapacity(content_height, base_h, row_h);
     const rendered_rows = @min(visible_count, max_rows);
     const row_area_h = row_h * @as(f32, @floatFromInt(@max(rendered_rows, 1)));
-    const box_h = @round(base_h + row_area_h);
+    const box_h = @round(clampOverlayBoxHeight(base_h + row_area_h, content_height));
     const box_x = @round(@max(16, (window_width - box_w) / 2));
     const box_top_px = @round(top_offset + @max(16, (content_height - box_h) / 2));
     const row_top_px = @round(box_top_px + header_h + filter_h + 12);
@@ -1311,9 +1444,16 @@ pub fn renderJupyterPicker(window_width: f32, window_height: f32) void {
     const row_h: f32 = @max(28.0, font.g_titlebar_cell_height + 12);
     const box_w: f32 = @min(window_width - 80, 720);
     const title_h: f32 = row_h;
-    const box_h: f32 = title_h + row_h * @as(f32, @floatFromInt(n)) + 16;
+    const bottom_pad: f32 = 16;
+    // Clamp the row count to what fits the window, then scroll to keep the
+    // selected server visible (the list is keyboard/wheel navigable).
+    const usable_h = @max(row_h, window_height - 32.0 - title_h - bottom_pad);
+    const fit: usize = @intFromFloat(@max(1.0, @floor(usable_h / row_h)));
+    const visible = @min(n, fit);
+    const scroll = jupyter_picker.firstVisible(jupyter_picker.selectedIndex(), visible, n);
+    const box_h: f32 = clampOverlayBoxHeight(title_h + row_h * @as(f32, @floatFromInt(visible)) + bottom_pad, window_height);
     const box_x = @round((window_width - box_w) / 2);
-    const box_top = @round((window_height - box_h) / 2);
+    const box_top = @round(@max(16.0, (window_height - box_h) / 2));
     const box_y = @round(window_height - box_top - box_h);
 
     ui_pipeline.fillQuadAlpha(0, 0, window_width, window_height, .{ 0.0, 0.0, 0.0 }, 0.30);
@@ -1323,15 +1463,35 @@ pub fn renderJupyterPicker(window_width: f32, window_height: f32) void {
     const title_y = @round(box_y + box_h - title_h + (title_h - font.g_titlebar_cell_height) / 2);
     _ = titlebar.renderTextLimited("Select a Jupyter server (Up/Down, Enter, Esc)", box_x + 16, title_y, mixColor(bg, fg, 0.6), box_w - 32);
 
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const row_top_px = box_top + title_h + row_h * @as(f32, @floatFromInt(i));
+    var display: usize = 0;
+    while (display < visible) : (display += 1) {
+        const i = scroll + display;
+        if (i >= n) break;
+        const row_top_px = box_top + title_h + row_h * @as(f32, @floatFromInt(display));
         const row_y = @round(window_height - row_top_px - row_h);
         if (i == jupyter_picker.selectedIndex()) {
             renderRoundedQuadAlpha(box_x + 8, row_y + 3, box_w - 16, row_h - 6, 5, sel_bg, 0.6);
         }
         const ty = @round(row_y + (row_h - font.g_titlebar_cell_height) / 2);
         _ = titlebar.renderTextLimited(jupyter_picker.urlAt(i), box_x + 18, ty, text_color, box_w - 36);
+    }
+
+    // Scrollbar thumb when the list is taller than the window.
+    if (n > visible and visible > 0) {
+        const total_f: f32 = @floatFromInt(n);
+        const vis_f: f32 = @floatFromInt(visible);
+        const track_h = row_h * vis_f;
+        const track_top_px = box_top + title_h;
+        const sb_w: f32 = 3;
+        const sb_x = box_x + box_w - sb_w - 6;
+        const track_gl_y = @round(window_height - track_top_px - track_h);
+        ui_pipeline.fillQuadAlpha(sb_x, track_gl_y, sb_w, track_h, mixColor(bg, fg, 0.25), 0.30);
+        const thumb_h = @max(24.0, @round(track_h * vis_f / total_f));
+        const max_scroll_f: f32 = @floatFromInt(n - visible);
+        const scroll_f: f32 = @floatFromInt(scroll);
+        const thumb_offset = if (max_scroll_f > 0) @round((track_h - thumb_h) * (scroll_f / max_scroll_f)) else 0;
+        const thumb_gl_y = @round(window_height - (track_top_px + thumb_offset) - thumb_h);
+        ui_pipeline.fillQuadAlpha(sb_x, thumb_gl_y, sb_w, thumb_h, accent, 0.55);
     }
 }
 
@@ -1548,7 +1708,7 @@ pub fn renderCommandPalette(window_width: f32, window_height: f32, top_offset: f
     } else {
         rebuildPaletteScratch();
         if (g_palette_scratch_len == 0) {
-            const empty_text = "No matching commands or themes";
+            const empty_text = "No matching results";
             const empty_y = @round(window_height - layout.row_top_px - layout.row_h + (layout.row_h - overlayTextHeight()) / 2);
             renderTitlebarText(empty_text, layout.box_x + (layout.box_w - measureTitlebarText(empty_text)) / 2, empty_y, muted);
         } else {
@@ -1599,6 +1759,19 @@ pub fn renderCommandPalette(window_width: f32, window_height: f32, top_offset: f
                         renderTitlebarTextLimited(target, target_left, text_y, shortcut_color, target_max_w);
                         renderTitlebarTextLimited(ssh_title, title_x, text_y, row_title_color, @max(1.0, target_left - title_x - 18));
                     },
+                    .tmux_profile => |profile_idx| {
+                        if (profile_idx >= g_ssh_profile_count) continue;
+                        const profile = &g_ssh_profiles[profile_idx];
+                        var title_buf: [SSH_FIELD_MAX + 6]u8 = undefined;
+                        const tmux_title = std.fmt.bufPrint(title_buf[0..], "tmux: {s}", .{profileField(profile, .name)}) catch "tmux";
+                        var target_buf: [SSH_FIELD_MAX * 2]u8 = undefined;
+                        const target = sshProfileTarget(profile, target_buf[0..]);
+                        const target_w = measureTitlebarText(target);
+                        const target_max_w = @min(target_w, @max(80.0, layout.box_w * 0.40));
+                        const target_left = @round(layout.box_x + layout.box_w - pad_x - target_max_w);
+                        renderTitlebarTextLimited(target, target_left, text_y, shortcut_color, target_max_w);
+                        renderTitlebarTextLimited(tmux_title, title_x, text_y, row_title_color, @max(1.0, target_left - title_x - 18));
+                    },
                     .ai_profile => |profile_idx| {
                         if (profile_idx >= g_ai_profile_count) continue;
                         const profile = &g_ai_profiles[profile_idx];
@@ -1628,6 +1801,29 @@ pub fn renderCommandPalette(window_width: f32, window_height: f32, top_offset: f
         }
     }
 
+    // Scrollbar indicator when more results exist than fit (short windows or
+    // long result lists). The list scrolls via keyboard/click selection-follow
+    // and the mouse wheel.
+    const total_results = commandPaletteResultCount();
+    if (total_results > layout.rendered_rows and layout.rendered_rows > 0) {
+        const total_f: f32 = @floatFromInt(total_results);
+        const vis_f: f32 = @floatFromInt(layout.rendered_rows);
+        const track_h = layout.row_h * vis_f;
+        const track_top_px = layout.row_top_px;
+        const sb_w: f32 = 3;
+        const sb_x = layout.box_x + layout.box_w - sb_w - 7;
+        const track_gl_y = @round(window_height - track_top_px - track_h);
+        ui_pipeline.fillQuadAlpha(sb_x, track_gl_y, sb_w, track_h, mixColor(bg, fg, 0.25), 0.30);
+
+        const first_row = commandPaletteFirstVisibleIndex(layout.rendered_rows);
+        const thumb_h = @max(24.0, @round(track_h * vis_f / total_f));
+        const max_scroll_f: f32 = @floatFromInt(total_results - layout.rendered_rows);
+        const scroll_f: f32 = @floatFromInt(first_row);
+        const thumb_offset = if (max_scroll_f > 0) @round((track_h - thumb_h) * (scroll_f / max_scroll_f)) else 0;
+        const thumb_gl_y = @round(window_height - (track_top_px + thumb_offset) - thumb_h);
+        ui_pipeline.fillQuadAlpha(sb_x, thumb_gl_y, sb_w, thumb_h, accent, 0.55);
+    }
+
     const footer = if (commandPaletteIsHistoryMode()) i18n.s().cmd_palette_footer_history else i18n.s().cmd_palette_footer;
     renderTitlebarTextLimited(footer, layout.box_x + pad_x, rowTextY(box_y, layout.footer_h), muted, layout.box_w - pad_x * 2);
 }
@@ -1652,6 +1848,7 @@ const AiField = profile_codec.AiField;
 const SessionAction = enum {
     local_shell,
     ssh,
+    tmux,
     wsl,
     ai_chat,
     ai_history,
@@ -1679,12 +1876,14 @@ const SshListMode = enum {
     edit_select,
     delete_select,
     ai_history_select,
+    tmux_connect,
 };
 
 const AiListMode = enum {
     manage,
     edit_select,
     delete_select,
+    switch_model,
 };
 
 const AiHistorySourceChoice = enum { local, wsl, ssh };
@@ -1712,6 +1911,12 @@ const SessionLayout = struct {
     header_h: f32,
     first_row_top_px: f32,
     row_h: f32,
+    /// Total rows in the active mode.
+    row_count: usize,
+    /// Rows that fit in the box for the current window height.
+    visible_rows: usize,
+    /// Index of the first rendered row (scroll offset, selection-following).
+    scroll: usize,
 };
 
 pub threadlocal var g_session_launcher_visible: bool = false;
@@ -1721,6 +1926,9 @@ threadlocal var g_ssh_list_visible: bool = false;
 threadlocal var g_ssh_form_visible: bool = false;
 threadlocal var g_ai_list_visible: bool = false;
 threadlocal var g_ai_form_visible: bool = false;
+/// Live session bound to a `.switch_model` picker; set when the picker opens,
+/// cleared when a row is chosen or the picker closes.
+threadlocal var g_switch_model_target: ?*AppWindow.ai_chat.Session = null;
 threadlocal var g_ai_history_source_visible: bool = false;
 threadlocal var g_ai_history_source_selected: usize = 0;
 threadlocal var g_ssh_focus: usize = @intFromEnum(SshField.name);
@@ -1967,8 +2175,8 @@ pub fn sessionLauncherHandleKey(ev: input_key.KeyEvent) void {
             return;
         }
         switch (ev.key) {
-            .arrow_down, .tab => g_session_launcher_selected = (g_session_launcher_selected + 1) % command_center_state.SESSION_LAUNCHER_ROW_COUNT,
-            .arrow_up => g_session_launcher_selected = if (g_session_launcher_selected == 0) command_center_state.SESSION_LAUNCHER_ROW_COUNT - 1 else g_session_launcher_selected - 1,
+            .arrow_down, .tab => g_session_launcher_selected = (g_session_launcher_selected + 1) % platform_pty_command.sessionLauncherRowCount(),
+            .arrow_up => g_session_launcher_selected = if (g_session_launcher_selected == 0) platform_pty_command.sessionLauncherRowCount() - 1 else g_session_launcher_selected - 1,
             .enter => runSessionLauncherRow(g_session_launcher_selected),
             .key_p => {
                 g_session_launcher_selected = 0;
@@ -1985,11 +2193,11 @@ pub fn sessionLauncherHandleKey(ev: input_key.KeyEvent) void {
                 }
             },
             .key_a => {
-                g_session_launcher_selected = command_center_state.SESSION_LAUNCHER_ROW_AI_AGENT;
+                g_session_launcher_selected = platform_pty_command.sessionLauncherAiAgentRow();
                 runSessionLauncherRow(g_session_launcher_selected);
             },
             .key_h => {
-                g_session_launcher_selected = command_center_state.SESSION_LAUNCHER_ROW_AI_HISTORY;
+                g_session_launcher_selected = platform_pty_command.sessionLauncherAiHistoryRow();
                 runSessionLauncherRow(g_session_launcher_selected);
             },
             else => {},
@@ -2029,6 +2237,26 @@ pub fn sessionLauncherHandleKey(ev: input_key.KeyEvent) void {
     }
 }
 
+/// Mouse-wheel handling for the session launcher. Scrolls by moving the active
+/// mode's selected/focused row (the view follows it), clamped at the ends so the
+/// wheel never wraps. Positive delta scrolls toward the top, mirroring
+/// whatsNewHandleScroll().
+pub fn sessionLauncherHandleScroll(delta_y: f64) void {
+    if (!sessionLauncherVisible()) return;
+    const step: i32 = if (delta_y > 0) -1 else if (delta_y < 0) 1 else 0;
+    if (step == 0) return;
+    const count = sessionActiveRowCount();
+    if (count == 0) return;
+    const sel = sessionActiveSelectionPtr();
+    if (step < 0) {
+        if (sel.* == 0) return;
+        sel.* -= 1;
+    } else {
+        if (sel.* + 1 >= count) return;
+        sel.* += 1;
+    }
+}
+
 pub fn sessionLauncherContainsPoint(xpos: f64, ypos: f64, window_width: f32, window_height: f32, top_offset: f32) bool {
     const layout = sessionLayout(window_width, window_height, top_offset);
     const x: f32 = @floatCast(xpos);
@@ -2042,6 +2270,7 @@ pub fn sessionLauncherExecuteAt(xpos: f64, ypos: f64, window_width: f32, window_
     switch (action) {
         .local_shell => openLocalShellSession(),
         .ssh => openSshList(),
+        .tmux => openTmuxSshPicker(),
         .wsl => openWslSession(),
         .ai_chat => openDefaultAiSession(),
         .ai_history => openAiHistorySourcePicker(),
@@ -2140,15 +2369,18 @@ fn runSessionLauncherRow(row: usize) void {
         openLocalShellSession();
     } else if (row == 1) {
         openSshList();
+    } else if (row == command_center_state.SESSION_LAUNCHER_ROW_TMUX) {
+        openTmuxSshPicker();
+        return;
     } else if (platform_pty_command.sessionLauncherWslRow()) |wsl_row| {
         if (row == wsl_row) {
             openWslSession();
             return;
         }
     }
-    if (row == command_center_state.SESSION_LAUNCHER_ROW_AI_AGENT) {
+    if (row == platform_pty_command.sessionLauncherAiAgentRow()) {
         openDefaultAiSession();
-    } else if (row == command_center_state.SESSION_LAUNCHER_ROW_AI_HISTORY) {
+    } else if (row == platform_pty_command.sessionLauncherAiHistoryRow()) {
         openAiHistorySourcePicker();
     }
 }
@@ -2173,7 +2405,7 @@ fn openSshDeletePicker() void {
 }
 
 fn openSshProfilePicker(mode: SshListMode) void {
-    if (g_ssh_profile_count == 0 and mode != .ai_history_select) return;
+    if (g_ssh_profile_count == 0 and mode != .ai_history_select and mode != .tmux_connect) return;
     g_session_launcher_visible = false;
     g_ai_history_source_visible = false;
     g_ssh_list_visible = true;
@@ -2218,6 +2450,7 @@ fn clearSshForm() void {
     g_ssh_bufs[@intFromEnum(SshField.port)][0] = '2';
     g_ssh_bufs[@intFromEnum(SshField.port)][1] = '2';
     g_ssh_lens[@intFromEnum(SshField.port)] = 2;
+    appendSshFormText(@intFromEnum(SshField.auth_method), profile_codec.defaultSshFormAuthMethod());
 }
 
 fn handleSshListKey(ev: input_key.KeyEvent) void {
@@ -2234,7 +2467,7 @@ fn handleSshListKey(ev: input_key.KeyEvent) void {
 fn sshListRowCount() usize {
     return switch (g_ssh_list_mode) {
         .manage => sshVisibleProfileCount() + 5,
-        .edit_select, .delete_select, .ai_history_select => sshVisibleProfileCount() + 1,
+        .edit_select, .delete_select, .ai_history_select, .tmux_connect => sshVisibleProfileCount() + 1,
     };
 }
 
@@ -2336,6 +2569,62 @@ fn sshField(field: SshField) []const u8 {
 
 const profileField = profile_codec.profileField;
 
+fn parseSshAuthMethod(value: []const u8) ?ssh_connection.SshAuthMethod {
+    return ssh_connection.SshAuthMethod.parse(std.mem.trim(u8, value, " \t\r\n"));
+}
+
+fn defaultSshAuthMethodForPassword(password: []const u8) ssh_connection.SshAuthMethod {
+    return if (password.len > 0) .password else .credentials;
+}
+
+fn sshFormAuthMethod() ?ssh_connection.SshAuthMethod {
+    const raw = sshField(.auth_method);
+    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return defaultSshAuthMethodForPassword(sshField(.password));
+    return parseSshAuthMethod(raw);
+}
+
+fn sshProfileAuthMethod(profile: *const SshProfile) ?ssh_connection.SshAuthMethod {
+    const raw = profileField(profile, .auth_method);
+    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return defaultSshAuthMethodForPassword(profileField(profile, .password));
+    return parseSshAuthMethod(raw);
+}
+
+fn isIdentityFileSafe(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |ch| {
+        if (ch < 0x20 or ch == 0x7f) return false;
+    }
+    return true;
+}
+
+fn sshConnectionFromProfile(profile: *const SshProfile) ?ssh_connection.SshConnection {
+    const ip = profileField(profile, .ip);
+    const user = profileField(profile, .user);
+    const port = profileField(profile, .port);
+    const password = profileField(profile, .password);
+    const proxy_jump = profileField(profile, .proxy_jump);
+    const auth_method = sshProfileAuthMethod(profile) orelse return null;
+    const identity_file = profileField(profile, .identity_file);
+    if (ip.len == 0 or user.len == 0) return null;
+    if (!isSshTokenSafe(ip) or !isSshTokenSafe(user)) return null;
+    if (port.len > 0 and !isPortTokenSafe(port)) return null;
+    if (!command_palette_model.isProxyJumpSafe(proxy_jump)) return null;
+    if (auth_method == .password and password.len == 0) return null;
+    if (auth_method == .key and !isIdentityFileSafe(identity_file)) return null;
+
+    var conn = ssh_connection.SshConnection.fromParts(.{
+        .user = user,
+        .host = ip,
+        .port = port,
+        .proxy_jump = proxy_jump,
+        .password = password,
+        .auth_method = auth_method,
+        .identity_file = identity_file,
+    });
+    conn.legacy_algorithms = AppWindow.g_ssh_legacy_algorithms;
+    return conn;
+}
+
 fn findSshProfileIndex(identifier_raw: []const u8) ?usize {
     loadSshProfiles();
     return findLoadedSshProfileIndex(identifier_raw);
@@ -2374,31 +2663,7 @@ pub fn aiHistoryConnectSshProfile(identifier: []const u8, remote_command: []cons
 pub fn aiHistorySshConnection(identifier: []const u8) ?ssh_connection.SshConnection {
     const idx = findSshProfileIndex(identifier) orelse return null;
     if (idx >= g_ssh_profile_count) return null;
-    const profile = &g_ssh_profiles[idx];
-    const ip = profileField(profile, .ip);
-    const user = profileField(profile, .user);
-    const port = profileField(profile, .port);
-    const password = profileField(profile, .password);
-    const proxy_jump = profileField(profile, .proxy_jump);
-    if (ip.len == 0 or user.len == 0) return null;
-    if (!isSshTokenSafe(ip) or !isSshTokenSafe(user)) return null;
-    if (port.len > 0 and !isPortTokenSafe(port)) return null;
-    if (!command_palette_model.isProxyJumpSafe(proxy_jump)) return null;
-
-    var conn: ssh_connection.SshConnection = .{};
-    conn.user_len = @min(user.len, conn.user_buf.len);
-    conn.host_len = @min(ip.len, conn.host_buf.len);
-    conn.port_len = @min(port.len, conn.port_buf.len);
-    conn.password_len = @min(password.len, conn.password_buf.len);
-    conn.proxy_jump_len = @min(proxy_jump.len, conn.proxy_jump_buf.len);
-    @memcpy(conn.user_buf[0..conn.user_len], user[0..conn.user_len]);
-    @memcpy(conn.host_buf[0..conn.host_len], ip[0..conn.host_len]);
-    @memcpy(conn.port_buf[0..conn.port_len], port[0..conn.port_len]);
-    @memcpy(conn.password_buf[0..conn.password_len], password[0..conn.password_len]);
-    @memcpy(conn.proxy_jump_buf[0..conn.proxy_jump_len], proxy_jump[0..conn.proxy_jump_len]);
-    conn.password_auth = password.len > 0;
-    conn.legacy_algorithms = AppWindow.g_ssh_legacy_algorithms;
-    return conn;
+    return sshConnectionFromProfile(&g_ssh_profiles[idx]);
 }
 
 /// Enumerate the saved SSH profile names (UI thread; loads the threadlocal
@@ -2480,6 +2745,10 @@ fn mergeOpenSshCandidate(candidate: openssh_config_import.Candidate, stats: *Ope
     copySshProfileField(profile, .user, user);
     copySshProfileField(profile, .port, if (port.len > 0) port else "22");
     copySshProfileField(profile, .proxy_jump, proxy_jump);
+    if (created_new) {
+        copySshProfileField(profile, .auth_method, ssh_connection.SshAuthMethod.credentials.fieldValue());
+        copySshProfileField(profile, .identity_file, "");
+    }
 }
 
 fn opensshCandidateSetForTest(candidate: *openssh_config_import.Candidate, comptime field: enum { name, host, user, port, proxy_jump }, value: []const u8) void {
@@ -2517,6 +2786,8 @@ pub fn agentSaveSshProfile(allocator: std.mem.Allocator, args: AppWindow.ai_chat
     const port_raw = std.mem.trim(u8, args.port, " \t\r\n");
     const port = if (port_raw.len > 0) port_raw else "22";
     const proxy_jump = std.mem.trim(u8, args.proxy_jump, " \t\r\n");
+    const identity_file = std.mem.trim(u8, args.identity_file, " \t\r\n");
+    const auth_method_raw = std.mem.trim(u8, args.auth_method, " \t\r\n");
     if (host.len == 0 or user.len == 0) return error.InvalidProfile;
     if (!isSshTokenSafe(host) or !isSshTokenSafe(user)) return error.InvalidProfile;
     if (!isPortTokenSafe(port)) return error.InvalidProfile;
@@ -2529,10 +2800,32 @@ pub fn agentSaveSshProfile(allocator: std.mem.Allocator, args: AppWindow.ai_chat
         if (g_ssh_profile_count >= SSH_PROFILE_MAX) return error.ProfileLimit;
         const next = g_ssh_profile_count;
         g_ssh_profile_count += 1;
+        g_ssh_profiles[next] = .{};
         break :blk next;
     };
 
     const profile = &g_ssh_profiles[idx];
+    const auth_method = if (auth_method_raw.len > 0)
+        (parseSshAuthMethod(auth_method_raw) orelse return error.InvalidProfile)
+    else if (args.password.len > 0)
+        ssh_connection.SshAuthMethod.password
+    else if (identity_file.len > 0)
+        ssh_connection.SshAuthMethod.key
+    else if (updated_existing)
+        (sshProfileAuthMethod(profile) orelse defaultSshAuthMethodForPassword(profileField(profile, .password)))
+    else
+        ssh_connection.SshAuthMethod.credentials;
+    const password_to_save = if (auth_method == .password)
+        (if (args.password.len > 0) args.password else profileField(profile, .password))
+    else
+        "";
+    const identity_to_save = if (auth_method == .key)
+        (if (identity_file.len > 0) identity_file else profileField(profile, .identity_file))
+    else
+        "";
+    if (auth_method == .password and password_to_save.len == 0) return error.InvalidProfile;
+    if (auth_method == .key and !isIdentityFileSafe(identity_to_save)) return error.InvalidProfile;
+
     const final_name = if (name_raw.len > 0)
         name_raw
     else if (updated_existing and profileField(profile, .name).len > 0)
@@ -2543,13 +2836,13 @@ pub fn agentSaveSshProfile(allocator: std.mem.Allocator, args: AppWindow.ai_chat
     copySshProfileField(profile, .name, final_name);
     copySshProfileField(profile, .ip, host);
     copySshProfileField(profile, .user, user);
-    if (args.password.len > 0 or !updated_existing) {
-        copySshProfileField(profile, .password, args.password);
-    }
+    copySshProfileField(profile, .password, password_to_save);
     if (proxy_jump.len > 0 or !updated_existing) {
         copySshProfileField(profile, .proxy_jump, proxy_jump);
     }
     copySshProfileField(profile, .port, port);
+    copySshProfileField(profile, .auth_method, auth_method.fieldValue());
+    copySshProfileField(profile, .identity_file, identity_to_save);
 
     saveSshProfiles(allocator);
 
@@ -2557,6 +2850,7 @@ pub fn agentSaveSshProfile(allocator: std.mem.Allocator, args: AppWindow.ai_chat
     const saved_host = profileField(profile, .ip);
     const saved_user = profileField(profile, .user);
     const saved_port = profileField(profile, .port);
+    const saved_auth_method = profileField(profile, .auth_method);
     const name_copy = try allocator.dupe(u8, saved_name);
     errdefer allocator.free(name_copy);
     const host_copy = try allocator.dupe(u8, saved_host);
@@ -2565,13 +2859,17 @@ pub fn agentSaveSshProfile(allocator: std.mem.Allocator, args: AppWindow.ai_chat
     errdefer allocator.free(user_copy);
     const port_copy = try allocator.dupe(u8, saved_port);
     errdefer allocator.free(port_copy);
+    const auth_method_copy = try allocator.dupe(u8, saved_auth_method);
+    errdefer allocator.free(auth_method_copy);
     return .{
         .name = name_copy,
         .host = host_copy,
         .user = user_copy,
         .port = port_copy,
+        .auth_method = auth_method_copy,
         .updated_existing = updated_existing,
         .password_saved = profileField(profile, .password).len > 0,
+        .identity_file_saved = profileField(profile, .identity_file).len > 0,
     };
 }
 
@@ -2616,6 +2914,14 @@ fn runSshListRow(row: usize) void {
                 openAiHistorySourcePicker();
             }
         },
+        .tmux_connect => {
+            if (row < visible_profile_count) {
+                const profile_idx = sshVisibleProfileIndexAt(row) orelse return;
+                connectSshProfileTmux(profile_idx);
+            } else {
+                sessionLauncherClose();
+            }
+        },
     }
 }
 
@@ -2658,10 +2964,13 @@ fn saveSshFormProfile() ?usize {
     const ip = sshField(.ip);
     const user = sshField(.user);
     const port = sshField(.port);
+    const auth_method = sshFormAuthMethod() orelse return null;
     if (ip.len == 0 or user.len == 0) return null;
     if (!isSshTokenSafe(ip) or !isSshTokenSafe(user)) return null;
     if (port.len > 0 and !isPortTokenSafe(port)) return null;
     if (!command_palette_model.isProxyJumpSafe(sshField(.proxy_jump))) return null;
+    if (auth_method == .password and sshField(.password).len == 0) return null;
+    if (auth_method == .key and !isIdentityFileSafe(sshField(.identity_file))) return null;
 
     const idx = if (g_ssh_edit_index != SSH_PROFILE_NONE)
         g_ssh_edit_index
@@ -2676,6 +2985,9 @@ fn saveSshFormProfile() ?usize {
         g_ssh_profiles[idx].lens[i] = g_ssh_lens[i];
         @memcpy(g_ssh_profiles[idx].fields[i][0..g_ssh_lens[i]], g_ssh_bufs[i][0..g_ssh_lens[i]]);
     }
+    copySshProfileField(&g_ssh_profiles[idx], .auth_method, auth_method.fieldValue());
+    if (auth_method != .password) copySshProfileField(&g_ssh_profiles[idx], .password, "");
+    if (auth_method != .key) copySshProfileField(&g_ssh_profiles[idx], .identity_file, "");
     if (g_ssh_profiles[idx].lens[@intFromEnum(SshField.name)] == 0) {
         const host = sshField(.ip);
         const len = @min(host.len, SSH_FIELD_MAX);
@@ -2692,6 +3004,87 @@ fn connectSshProfile(idx: usize) void {
     _ = connectSshProfileReturningSurface(idx);
 }
 
+/// Derive a tmux-safe session name from a profile name: `wispterm-<name>` with
+/// every char outside [A-Za-z0-9_-] replaced by '_'. Empty name → "wispterm".
+/// `buf` must be at least 9 + name.len bytes.
+fn tmuxSessionName(buf: []u8, profile_name: []const u8) []const u8 {
+    const prefix = "wispterm";
+    @memcpy(buf[0..prefix.len], prefix);
+    if (profile_name.len == 0) return buf[0..prefix.len];
+    buf[prefix.len] = '-';
+    var n: usize = prefix.len + 1;
+    for (profile_name) |c| {
+        if (n >= buf.len) break;
+        buf[n] = if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-') c else '_';
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// Open the SSH profile picker in tmux-connect mode (mirrors the AI-history SSH
+/// picker). Picking a profile starts a tmux control-mode session.
+fn openTmuxSshPicker() void {
+    loadSshProfiles();
+    openSshProfilePicker(.tmux_connect);
+}
+
+/// Connect the profile at `idx` in tmux control mode: `ssh … tmux -CC new -A -s
+/// wispterm-<profile>`. No surface is spawned — the controller owns the tabs.
+fn connectSshProfileTmux(idx: usize) void {
+    if (idx >= g_ssh_profile_count) return;
+    const profile = &g_ssh_profiles[idx];
+    const name = profileField(profile, .name);
+    const conn = sshConnectionFromProfile(profile) orelse return;
+
+    var name_buf: [96]u8 = undefined;
+    const session_name = tmuxSessionName(&name_buf, name);
+    var remote_buf: [128]u8 = undefined;
+    const remote = std.fmt.bufPrint(&remote_buf, "tmux -CC new -A -s {s}", .{session_name}) catch return;
+
+    var cmd_buf: [8192]u8 = undefined;
+    const cmd = platform_pty_command.sshControlCommand(cmd_buf[0..], .{
+        .user = conn.user(),
+        .host = conn.host(),
+        .port = conn.port(),
+        .auth_method = conn.auth_method,
+        .identity_file = conn.identityFile(),
+        .password_auth = conn.password_auth,
+        .legacy_algorithms = AppWindow.g_ssh_legacy_algorithms,
+        .proxy_jump = conn.proxyJump(),
+        .remote_command = remote,
+    }) orelse return;
+
+    sessionLauncherClose();
+    _ = AppWindow.startTmuxSession(cmd, if (conn.usesPasswordAuth()) conn.password() else "", name, conn);
+}
+
+/// Connect a profile by name in tmux mode (dev/automation hook).
+pub fn connectProfileByNameTmux(name: []const u8) bool {
+    loadSshProfiles();
+    var idx: usize = 0;
+    while (idx < g_ssh_profile_count) : (idx += 1) {
+        if (std.mem.eql(u8, profileField(&g_ssh_profiles[idx], .name), name)) {
+            connectSshProfileTmux(idx);
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Connect the SSH profile with the given name (Phase 3d programmatic/test
+/// entry). Loads profiles if needed; returns false if no profile matches.
+pub fn connectProfileByName(name: []const u8) bool {
+    loadSshProfiles();
+    var idx: usize = 0;
+    while (idx < g_ssh_profile_count) : (idx += 1) {
+        if (std.mem.eql(u8, profileField(&g_ssh_profiles[idx], .name), name)) {
+            connectSshProfile(idx);
+            return true;
+        }
+    }
+    return false;
+}
+
 fn connectSshProfileReturningSurface(idx: usize) ?*Surface {
     return connectSshProfileReturningSurfaceWithCommand(idx, "");
 }
@@ -2699,36 +3092,30 @@ fn connectSshProfileReturningSurface(idx: usize) ?*Surface {
 fn connectSshProfileReturningSurfaceWithCommand(idx: usize, remote_command: []const u8) ?*Surface {
     if (idx >= g_ssh_profile_count) return null;
     const profile = &g_ssh_profiles[idx];
-    const ip = profileField(profile, .ip);
-    const user = profileField(profile, .user);
-    const port = profileField(profile, .port);
-    const password = profileField(profile, .password);
-    const proxy_jump = profileField(profile, .proxy_jump);
     const server_name = profileField(profile, .name);
-    if (ip.len == 0 or user.len == 0) return null;
-    if (!isSshTokenSafe(ip) or !isSshTokenSafe(user)) return null;
-    if (port.len > 0 and !isPortTokenSafe(port)) return null;
-    if (!command_palette_model.isProxyJumpSafe(proxy_jump)) return null;
+    const conn = sshConnectionFromProfile(profile) orelse return null;
 
     var command_buf: [8192]u8 = undefined;
     const command = platform_pty_command.sshInteractiveCommand(command_buf[0..], .{
-        .user = user,
-        .host = ip,
-        .port = port,
-        .password_auth = password.len > 0,
+        .user = conn.user(),
+        .host = conn.host(),
+        .port = conn.port(),
+        .auth_method = conn.auth_method,
+        .identity_file = conn.identityFile(),
+        .password_auth = conn.password_auth,
         .legacy_algorithms = AppWindow.g_ssh_legacy_algorithms,
-        .proxy_jump = proxy_jump,
+        .proxy_jump = conn.proxyJump(),
         .remote_command = remote_command,
     }) orelse return null;
 
     sessionLauncherClose();
     if (AppWindow.spawnTabWithCommandUtf8ReturningSurface(command)) |surface| {
-        surface.setSshConnection(user, ip, port, password, proxy_jump, password.len > 0, AppWindow.g_ssh_legacy_algorithms);
+        surface.setSshConnectionValue(conn);
         if (server_name.len > 0) {
             surface.setTitleOverride(server_name);
         }
-        if (password.len > 0) {
-            scheduleSshPasswordForSurface(surface, password);
+        if (conn.usesPasswordAuth()) {
+            scheduleSshPasswordForSurface(surface, conn.password());
         }
         return surface;
     }
@@ -3139,7 +3526,7 @@ fn handleAiListKey(ev: input_key.KeyEvent) void {
 fn aiListRowCount() usize {
     return switch (g_ai_list_mode) {
         .manage => g_ai_profile_count + 4,
-        .edit_select, .delete_select => g_ai_profile_count + 1,
+        .edit_select, .delete_select, .switch_model => g_ai_profile_count + 1,
     };
 }
 
@@ -3179,6 +3566,13 @@ fn runAiListRow(row: usize) void {
             } else {
                 openAiList();
             }
+        },
+        .switch_model => {
+            if (row < g_ai_profile_count) {
+                if (g_switch_model_target) |session| _ = applyProfileToSession(session, row);
+            }
+            g_switch_model_target = null;
+            sessionLauncherClose();
         },
     }
 }
@@ -3306,6 +3700,56 @@ fn spawnAiProfileWithAgentOverride(idx: usize, agent_override: ?[]const u8) bool
 
     sessionLauncherClose();
     return AppWindow.spawnAiChatTab(name, base_url, api_key, model, protocol, system_prompt, thinking, reasoning_effort, stream_val, agent_val, max_tokens, vision_val);
+}
+
+/// Apply profile `idx` to the given live session in place (provider/model only)
+/// and kick off the background summary. Returns false on an invalid profile.
+fn applyProfileToSession(session: *AppWindow.ai_chat.Session, idx: usize) bool {
+    if (idx >= g_ai_profile_count) return false;
+    const profile = &g_ai_profiles[idx];
+    const base_url = aiProfileField(profile, .base_url);
+    const api_key = aiProfileField(profile, .api_key);
+    const model = aiProfileField(profile, .model);
+    const thinking = aiProfileField(profile, .thinking);
+    const reasoning_effort = aiProfileField(profile, .reasoning_effort);
+    const protocol = aiProfileField(profile, .protocol);
+    const max_tokens = std.fmt.parseInt(u32, std.mem.trim(u8, aiProfileField(profile, .max_tokens), " \t"), 10) catch 8192;
+    const vision_val = aiProfileField(profile, .vision);
+    if (base_url.len == 0 or model.len == 0) return false;
+    if (!isHttpUrlish(base_url)) return false;
+    ai_chat.applyProviderProfile(session, base_url, api_key, model, protocol, thinking, reasoning_effort, max_tokens, vision_val);
+    AppWindow.g_force_rebuild = true;
+    AppWindow.g_cells_valid = false;
+    return true;
+}
+
+/// Open the profile picker in switch-model mode, bound to `session`.
+pub fn openSwitchModelPicker(session: *AppWindow.ai_chat.Session) void {
+    loadAiProfiles();
+    if (g_ai_profile_count == 0) {
+        session.appendLocalToolMessage(i18n.s().ai_model_no_profiles);
+        AppWindow.g_force_rebuild = true;
+        AppWindow.g_cells_valid = false;
+        return;
+    }
+    g_switch_model_target = session;
+    openAiList(); // sets visibility flags + mode .manage
+    g_ai_list_mode = .switch_model;
+    g_ai_list_selected = @min(g_ai_list_selected, aiListRowCount() - 1);
+}
+
+/// `/model <name>`: match by name and apply directly; on no match, note the
+/// available profiles in the transcript and fall back to opening the picker.
+pub fn switchModelByName(session: *AppWindow.ai_chat.Session, name: []const u8) void {
+    loadAiProfiles();
+    var names: [AI_PROFILE_MAX][]const u8 = undefined;
+    for (0..g_ai_profile_count) |i| names[i] = aiProfileField(&g_ai_profiles[i], .name);
+    if (ai_model_switch.matchProfileByName(names[0..g_ai_profile_count], name)) |idx| {
+        _ = applyProfileToSession(session, idx);
+        return;
+    }
+    session.appendLocalToolMessage(i18n.s().ai_model_unknown_profile);
+    openSwitchModelPicker(session);
 }
 
 /// Build a standalone copilot Session from the default AI profile (Issue #98).
@@ -3564,7 +4008,7 @@ fn saveSshProfilesChecked(allocator: std.mem.Allocator) bool {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
-    out.appendSlice(allocator, "# WispTerm SSH profiles. Fields are hex encoded: name, host, user, password, port, proxy_jump.\n") catch return false;
+    out.appendSlice(allocator, "# WispTerm SSH profiles. Fields are hex encoded: name, host, user, password, port, proxy_jump, auth_method, identity_file.\n") catch return false;
     for (g_ssh_profiles[0..g_ssh_profile_count]) |profile| {
         for (0..SSH_FIELD_COUNT) |i| {
             if (i > 0) out.append(allocator, '\t') catch return false;
@@ -3645,6 +4089,7 @@ fn sessionLauncherTitle() []const u8 {
             .manage => i18n.s().sl_llm_providers,
             .edit_select => i18n.s().sl_edit_llm_provider,
             .delete_select => i18n.s().sl_delete_llm_provider,
+            .switch_model => i18n.s().sl_switch_model_title,
         };
     }
     if (g_ssh_form_visible) return i18n.s().sl_ssh_server;
@@ -3654,6 +4099,7 @@ fn sessionLauncherTitle() []const u8 {
             .edit_select => i18n.s().sl_edit_ssh_server,
             .delete_select => i18n.s().sl_delete_ssh_server,
             .ai_history_select => "Sessions SSH Profile",
+            .tmux_connect => "tmux SSH Profile",
         };
     }
     return i18n.s().sl_new_session;
@@ -3669,6 +4115,7 @@ fn sessionLauncherHint() []const u8 {
             .manage => i18n.s().sl_hint_ai_manage,
             .edit_select => i18n.s().sl_hint_choose_profile_edit,
             .delete_select => i18n.s().sl_hint_choose_profile_delete,
+            .switch_model => i18n.s().sl_switch_model_hint,
         };
     }
     if (g_ssh_form_visible) return i18n.s().sl_hint_ssh_form;
@@ -3679,6 +4126,7 @@ fn sessionLauncherHint() []const u8 {
             .edit_select => if (has_filter) i18n.s().sl_hint_ssh_filter_choose_edit else i18n.s().sl_hint_choose_server_edit,
             .delete_select => if (has_filter) i18n.s().sl_hint_ssh_filter_choose_delete else i18n.s().sl_hint_choose_server_delete,
             .ai_history_select => if (has_filter) "Filter profiles" else "Choose a profile or go back",
+            .tmux_connect => if (has_filter) "Filter profiles" else "Choose a profile or go back",
         };
     }
     return i18n.s().sl_hint_main;
@@ -3714,6 +4162,8 @@ fn sessionDesiredBoxWidth() f32 {
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_password, sshField(.password)));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_port, sshField(.port)));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_jump_host, sshField(.proxy_jump)));
+        desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_auth_method, sshField(.auth_method)));
+        desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_identity_file, sshField(.identity_file)));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_save_connect, platform_pty_command.sshLauncherDetail()));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_save, i18n.s().sl_v_profile));
         desired = @max(desired, sessionTwoColumnWidth(sessionLauncherCancelLabel(), "Esc"));
@@ -3740,7 +4190,7 @@ fn sessionDesiredBoxWidth() f32 {
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_delete_llm_provider, if (g_ai_profile_count > 0) i18n.s().sl_v_choose else i18n.s().sl_v_no_profile));
                 desired = @max(desired, sessionTwoColumnWidth(sessionLauncherCancelLabel(), "Esc"));
             },
-            .edit_select, .delete_select => {
+            .edit_select, .delete_select, .switch_model => {
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_back, i18n.s().sl_v_manage));
             },
         }
@@ -3776,6 +4226,9 @@ fn sessionDesiredBoxWidth() f32 {
             .ai_history_select => {
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_back, i18n.s().sl_sessions));
             },
+            .tmux_connect => {
+                desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_back, "tmux"));
+            },
         }
         return desired;
     }
@@ -3800,15 +4253,9 @@ fn sessionDesiredBoxWidth() f32 {
     return desired;
 }
 
-fn sessionLayout(window_width: f32, window_height: f32, top_offset: f32) SessionLayout {
-    const content_height = @max(1, window_height - top_offset);
-    const min_box_w: f32 = if (g_ssh_form_visible or g_ssh_list_visible or g_ai_form_visible or g_ai_list_visible) 460 else 360;
-    const max_box_w = @max(260.0, @min(760.0, window_width - 48.0));
-    const box_w: f32 = @round(@min(@max(min_box_w, sessionDesiredBoxWidth()), max_box_w));
-    const row_h = overlayRowHeight(38);
-    const header_h = @round(18 + overlayLineHeight() * 2 + 12);
-    const bottom_pad = @round(@max(20.0, overlayTextHeight() * 0.55));
-    const row_count: usize = if (g_ai_form_visible)
+/// Total rows in the currently active session-launcher mode.
+fn sessionActiveRowCount() usize {
+    return if (g_ai_form_visible)
         AI_FIELD_COUNT + 3
     else if (g_ai_list_visible)
         aiListRowCount()
@@ -3819,8 +4266,72 @@ fn sessionLayout(window_width: f32, window_height: f32, top_offset: f32) Session
     else if (g_ssh_list_visible)
         sshListRowCount()
     else
-        command_center_state.SESSION_LAUNCHER_ROW_COUNT;
-    const box_h = @round(header_h + row_h * @as(f32, @floatFromInt(row_count)) + bottom_pad);
+        platform_pty_command.sessionLauncherRowCount();
+}
+
+/// Selected/focused row of the currently active session-launcher mode.
+fn sessionActiveSelection() usize {
+    return if (g_ai_form_visible)
+        g_ai_focus
+    else if (g_ai_list_visible)
+        g_ai_list_selected
+    else if (g_ai_history_source_visible)
+        g_ai_history_source_selected
+    else if (g_ssh_form_visible)
+        g_ssh_focus
+    else if (g_ssh_list_visible)
+        g_ssh_list_selected
+    else
+        g_session_launcher_selected;
+}
+
+/// Mutable pointer to the active mode's selection (for the mouse wheel).
+fn sessionActiveSelectionPtr() *usize {
+    return if (g_ai_form_visible)
+        &g_ai_focus
+    else if (g_ai_list_visible)
+        &g_ai_list_selected
+    else if (g_ai_history_source_visible)
+        &g_ai_history_source_selected
+    else if (g_ssh_form_visible)
+        &g_ssh_focus
+    else if (g_ssh_list_visible)
+        &g_ssh_list_selected
+    else
+        &g_session_launcher_selected;
+}
+
+/// Rows that fit within the box for the given window height. Mirrors
+/// commandPaletteRowCapacity().
+fn sessionRowCapacity(content_height: f32, base_h: f32, row_h: f32, row_count: usize) usize {
+    if (row_count == 0) return 0;
+    const usable_h = @max(row_h, content_height - 32.0 - base_h);
+    if (usable_h <= row_h) return 1;
+    const fit: usize = @intFromFloat(@max(1.0, @floor(usable_h / row_h)));
+    return @min(row_count, fit);
+}
+
+/// First row to render so the selected row stays visible. Mirrors
+/// commandPaletteFirstVisibleIndex().
+fn sessionFirstVisibleRow(selection: usize, visible_rows: usize, row_count: usize) usize {
+    if (visible_rows == 0 or row_count <= visible_rows) return 0;
+    const sel = @min(selection, row_count - 1);
+    if (sel < visible_rows) return 0;
+    return @min(sel - visible_rows + 1, row_count - visible_rows);
+}
+
+fn sessionLayout(window_width: f32, window_height: f32, top_offset: f32) SessionLayout {
+    const content_height = @max(1, window_height - top_offset);
+    const min_box_w: f32 = if (g_ssh_form_visible or g_ssh_list_visible or g_ai_form_visible or g_ai_list_visible) 460 else 360;
+    const max_box_w = @max(260.0, @min(760.0, window_width - 48.0));
+    const box_w: f32 = @round(@min(@max(min_box_w, sessionDesiredBoxWidth()), max_box_w));
+    const row_h = overlayRowHeight(38);
+    const header_h = @round(18 + overlayLineHeight() * 2 + 12);
+    const bottom_pad = @round(@max(20.0, overlayTextHeight() * 0.55));
+    const row_count = sessionActiveRowCount();
+    const visible_rows = sessionRowCapacity(content_height, header_h + bottom_pad, row_h, row_count);
+    const scroll = sessionFirstVisibleRow(sessionActiveSelection(), visible_rows, row_count);
+    const box_h = @round(clampOverlayBoxHeight(header_h + row_h * @as(f32, @floatFromInt(visible_rows)) + bottom_pad, content_height));
     const box_x = @round(@max(16, (window_width - box_w) / 2));
     const box_top_px = @round(top_offset + @max(16, (content_height - box_h) / 2));
     return .{
@@ -3831,6 +4342,9 @@ fn sessionLayout(window_width: f32, window_height: f32, top_offset: f32) Session
         .header_h = header_h,
         .first_row_top_px = box_top_px + header_h,
         .row_h = row_h,
+        .row_count = row_count,
+        .visible_rows = visible_rows,
+        .scroll = scroll,
     };
 }
 
@@ -3840,7 +4354,9 @@ fn sessionHitTest(xpos: f64, ypos: f64, window_width: f32, window_height: f32, t
     const y: f32 = @floatCast(ypos);
     if (x < layout.box_x or x > layout.box_x + layout.box_w) return null;
     if (y < layout.first_row_top_px) return null;
-    const row: usize = @intFromFloat(@floor((y - layout.first_row_top_px) / layout.row_h));
+    const visible_index: usize = @intFromFloat(@floor((y - layout.first_row_top_px) / layout.row_h));
+    if (visible_index >= layout.visible_rows) return null;
+    const row = visible_index + layout.scroll;
 
     if (g_ai_history_source_visible) {
         if (row >= aiHistorySourceRowCount()) return null;
@@ -3881,15 +4397,16 @@ fn sessionHitTest(xpos: f64, ypos: f64, window_width: f32, window_height: f32, t
     }
 
     if (!g_ssh_form_visible and !g_ai_form_visible) {
-        if (row >= command_center_state.SESSION_LAUNCHER_ROW_COUNT) return null;
+        if (row >= platform_pty_command.sessionLauncherRowCount()) return null;
         g_session_launcher_selected = row;
         if (row == 0) return .local_shell;
         if (row == 1) return .ssh;
+        if (row == command_center_state.SESSION_LAUNCHER_ROW_TMUX) return .tmux;
         if (platform_pty_command.sessionLauncherWslRow()) |wsl_row| {
             if (row == wsl_row) return .wsl;
         }
-        if (row == command_center_state.SESSION_LAUNCHER_ROW_AI_AGENT) return .ai_chat;
-        if (row == command_center_state.SESSION_LAUNCHER_ROW_AI_HISTORY) return .ai_history;
+        if (row == platform_pty_command.sessionLauncherAiAgentRow()) return .ai_chat;
+        if (row == platform_pty_command.sessionLauncherAiHistoryRow()) return .ai_history;
         return null;
     }
 
@@ -3921,7 +4438,11 @@ fn sessionHitTest(xpos: f64, ypos: f64, window_width: f32, window_height: f32, t
 }
 
 fn renderSessionRow(layout: SessionLayout, window_height: f32, row: usize, left: []const u8, right: []const u8, selected: bool) void {
-    const row_top = @round(layout.first_row_top_px + @as(f32, @floatFromInt(row)) * layout.row_h);
+    // Skip rows scrolled out of view above or below the visible window.
+    if (row < layout.scroll) return;
+    const visible_index = row - layout.scroll;
+    if (visible_index >= layout.visible_rows) return;
+    const row_top = @round(layout.first_row_top_px + @as(f32, @floatFromInt(visible_index)) * layout.row_h);
     const row_y = @round(window_height - row_top - layout.row_h);
     const x = layout.box_x + 18;
     const w = layout.box_w - 36;
@@ -4026,6 +4547,26 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
     renderRoundedQuadAlpha(layout.box_x - 1, box_y - 1, layout.box_w + 2, layout.box_h + 2, 11, border_color, 0.24);
     renderRoundedQuadAlpha(layout.box_x, box_y, layout.box_w, layout.box_h, 10, panel_color, 0.96);
 
+    // Scrollbar indicator when more rows exist than fit (short windows or long
+    // lists). The list scrolls via keyboard/click selection-follow and the wheel.
+    if (layout.row_count > layout.visible_rows and layout.visible_rows > 0) {
+        const total_f: f32 = @floatFromInt(layout.row_count);
+        const vis_f: f32 = @floatFromInt(layout.visible_rows);
+        const track_h = layout.row_h * vis_f;
+        const track_top_px = layout.first_row_top_px;
+        const sb_w: f32 = 3;
+        const sb_x = layout.box_x + layout.box_w - sb_w - 7;
+        const track_gl_y = @round(window_height - track_top_px - track_h);
+        ui_pipeline.fillQuadAlpha(sb_x, track_gl_y, sb_w, track_h, mixColor(bg, fg, 0.25), 0.30);
+
+        const thumb_h = @max(24.0, @round(track_h * vis_f / total_f));
+        const max_scroll_f: f32 = @floatFromInt(layout.row_count - layout.visible_rows);
+        const scroll_f: f32 = @floatFromInt(layout.scroll);
+        const thumb_offset = if (max_scroll_f > 0) @round((track_h - thumb_h) * (scroll_f / max_scroll_f)) else 0;
+        const thumb_gl_y = @round(window_height - (track_top_px + thumb_offset) - thumb_h);
+        ui_pipeline.fillQuadAlpha(sb_x, thumb_gl_y, sb_w, thumb_h, accent, 0.55);
+    }
+
     const title = sessionLauncherTitle();
     const hint = sessionLauncherHint();
     const title_y = textYFromTop(window_height, layout.box_top_px + 18);
@@ -4062,7 +4603,7 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
                     row += 1;
                     renderSessionRow(layout, window_height, row, sessionLauncherCancelLabel(), "Esc", g_ai_list_selected == row);
                 },
-                .edit_select, .delete_select => {
+                .edit_select, .delete_select, .switch_model => {
                     renderSessionRow(layout, window_height, row, i18n.s().sl_back, i18n.s().sl_v_manage, g_ai_list_selected == row);
                 },
             }
@@ -4095,6 +4636,9 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
                 .ai_history_select => {
                     renderSessionRow(layout, window_height, row, i18n.s().sl_back, i18n.s().sl_sessions, g_ssh_list_selected == row);
                 },
+                .tmux_connect => {
+                    renderSessionRow(layout, window_height, row, i18n.s().sl_back, "tmux", g_ssh_list_selected == row);
+                },
             }
             return;
         }
@@ -4103,13 +4647,15 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
         row += 1;
         renderSessionRow(layout, window_height, row, "SSH", i18n.s().sl_v_connect_server, g_session_launcher_selected == row);
         row += 1;
+        renderSessionRow(layout, window_height, command_center_state.SESSION_LAUNCHER_ROW_TMUX, "tmux", "Alive session", g_session_launcher_selected == command_center_state.SESSION_LAUNCHER_ROW_TMUX);
+        row += 1;
         if (platform_pty_command.sessionLauncherWslRow()) |wsl_row| {
             row = wsl_row;
             renderSessionRow(layout, window_height, row, "WSL", platform_pty_command.wslLauncherDetail(), g_session_launcher_selected == row);
             row += 1;
         }
-        renderSessionRow(layout, window_height, command_center_state.SESSION_LAUNCHER_ROW_AI_AGENT, i18n.s().sl_ai_agent, defaultAiModeLabel(), g_session_launcher_selected == command_center_state.SESSION_LAUNCHER_ROW_AI_AGENT);
-        renderSessionRow(layout, window_height, command_center_state.SESSION_LAUNCHER_ROW_AI_HISTORY, i18n.s().sl_sessions, i18n.s().sl_sessions_detail, g_session_launcher_selected == command_center_state.SESSION_LAUNCHER_ROW_AI_HISTORY);
+        renderSessionRow(layout, window_height, platform_pty_command.sessionLauncherAiAgentRow(), i18n.s().sl_ai_agent, defaultAiModeLabel(), g_session_launcher_selected == platform_pty_command.sessionLauncherAiAgentRow());
+        renderSessionRow(layout, window_height, platform_pty_command.sessionLauncherAiHistoryRow(), i18n.s().sl_sessions, i18n.s().sl_sessions_detail, g_session_launcher_selected == platform_pty_command.sessionLauncherAiHistoryRow());
         return;
     }
 
@@ -4138,6 +4684,8 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
     renderSessionField(layout, window_height, @intFromEnum(SshField.password), i18n.s().sl_ssh_password, sshField(.password), true);
     renderSessionField(layout, window_height, @intFromEnum(SshField.port), i18n.s().sl_ssh_port, sshField(.port), false);
     renderSessionField(layout, window_height, @intFromEnum(SshField.proxy_jump), i18n.s().sl_ssh_jump_host, sshField(.proxy_jump), false);
+    renderSessionField(layout, window_height, @intFromEnum(SshField.auth_method), i18n.s().sl_ssh_auth_method, sshField(.auth_method), false);
+    renderSessionField(layout, window_height, @intFromEnum(SshField.identity_file), i18n.s().sl_ssh_identity_file, sshField(.identity_file), false);
     renderSessionRow(layout, window_height, SSH_FIELD_COUNT, i18n.s().sl_save_connect, platform_pty_command.sshLauncherDetail(), g_ssh_focus == SSH_FIELD_COUNT);
     renderSessionRow(layout, window_height, SSH_FIELD_COUNT + 1, i18n.s().sl_save, i18n.s().sl_v_profile, g_ssh_focus == SSH_FIELD_COUNT + 1);
     renderSessionRow(layout, window_height, SSH_FIELD_COUNT + 2, sessionLauncherCancelLabel(), "Esc", g_ssh_focus == SSH_FIELD_COUNT + 2);
@@ -4193,6 +4741,10 @@ const SettingsLayout = struct {
     footer_h: f32,
     row_top_px: f32,
     row_h: f32,
+    /// Number of rows that fit in the box for the current window height.
+    visible_rows: usize,
+    /// Index of the first rendered row (scroll offset).
+    scroll: usize,
 };
 
 pub threadlocal var g_settings_visible: bool = false;
@@ -4262,13 +4814,34 @@ pub fn settingsPageExecuteAt(xpos: f64, ypos: f64, window_width: f32, window_hei
     return true;
 }
 
+/// Number of settings rows that fit within the box for the given window height,
+/// leaving room for the header and footer. Mirrors commandPaletteRowCapacity().
+fn settingsRowCapacity(content_height: f32, base_h: f32, row_h: f32) usize {
+    const usable_h = @max(row_h, content_height - 32.0 - base_h);
+    if (usable_h <= row_h) return 1;
+    const count_f = @floor(usable_h / row_h);
+    const count: usize = @intFromFloat(@max(1.0, count_f));
+    return @min(count, SETTINGS_ROW_COUNT);
+}
+
+/// First row to render so the focused row stays visible (scroll offset).
+/// Mirrors commandPaletteFirstVisibleIndex().
+fn settingsFirstVisibleRow(visible_rows: usize) usize {
+    if (visible_rows == 0 or SETTINGS_ROW_COUNT <= visible_rows) return 0;
+    const focus = @min(g_settings_focus, SETTINGS_ROW_COUNT - 1);
+    if (focus < visible_rows) return 0;
+    return @min(focus - visible_rows + 1, SETTINGS_ROW_COUNT - visible_rows);
+}
+
 fn settingsLayout(window_width: f32, window_height: f32, top_offset: f32) SettingsLayout {
     const content_height = @max(1, window_height - top_offset);
     const box_w = @round(@min(@max(420, window_width - 48), 760));
     const row_h = overlayRowHeight(42);
     const header_h = @round(18 + overlayLineHeight() * 2 + 12);
     const footer_h = @round(@max(52.0, overlayTextHeight() + 28.0));
-    const box_h = @round(header_h + row_h * SETTINGS_ROW_COUNT + footer_h);
+    const visible_rows = settingsRowCapacity(content_height, header_h + footer_h, row_h);
+    const scroll = settingsFirstVisibleRow(visible_rows);
+    const box_h = @round(clampOverlayBoxHeight(header_h + row_h * @as(f32, @floatFromInt(visible_rows)) + footer_h, content_height));
     const box_x = @round(@max(16, (window_width - box_w) / 2));
     const box_top_px = @round(top_offset + @max(16, (content_height - box_h) / 2));
     const row_top_px = @round(box_top_px + header_h);
@@ -4281,6 +4854,8 @@ fn settingsLayout(window_width: f32, window_height: f32, top_offset: f32) Settin
         .footer_h = footer_h,
         .row_top_px = row_top_px,
         .row_h = row_h,
+        .visible_rows = visible_rows,
+        .scroll = scroll,
     };
 }
 
@@ -4296,7 +4871,9 @@ fn settingsHitTest(xpos: f64, ypos: f64, window_width: f32, window_height: f32, 
 
     if (x < layout.box_x + 18 or x > layout.box_x + layout.box_w - 18) return null;
     if (y < layout.row_top_px) return null;
-    const row: usize = @intFromFloat(@floor((y - layout.row_top_px) / layout.row_h));
+    const visible_index: usize = @intFromFloat(@floor((y - layout.row_top_px) / layout.row_h));
+    if (visible_index >= layout.visible_rows) return null;
+    const row = visible_index + layout.scroll;
     if (row >= SETTINGS_ROW_COUNT) return null;
     g_settings_focus = row;
 
@@ -4359,6 +4936,15 @@ fn executeSettingsAction(action: SettingsAction) void {
         .close => settingsPageClose(),
     }
     settingsPageReloadCfg();
+
+    // Apply the change to the running terminal right away instead of waiting for
+    // the config-file watcher's debounce (mirrors applyEmbeddedThemeFromPalette).
+    // cycle_theme already applies via cycleThemePreset; the excluded actions open
+    // an editor/confirm dialog or close the page and write nothing to apply.
+    switch (action) {
+        .cycle_theme, .open_raw_config, .restore_defaults, .close => {},
+        else => AppWindow.reloadConfigImmediate(allocator),
+    }
 }
 
 fn writeConfigInt(key: []const u8, value: u32) void {
@@ -4446,6 +5032,9 @@ fn cycleThemePreset(delta: i32) void {
     const next = @mod(current + delta, count);
     applyThemePreset(@intCast(next));
     settingsPageReloadCfg();
+    // Theme rows reach here directly from the focus handlers (not via
+    // executeSettingsAction), so apply the new theme to the terminal immediately.
+    AppWindow.reloadConfigImmediate(allocator);
 }
 
 fn themePresetIsActive(cfg: *const Config, preset: ThemePreset) bool {
@@ -4503,7 +5092,11 @@ fn languageSettingText(setting: i18n.LanguageSetting) []const u8 {
 }
 
 fn renderSettingsRow(layout: SettingsLayout, window_height: f32, row: usize, title: []const u8, value: []const u8, hint: []const u8, clickable: bool, selected: bool) void {
-    const row_y = @round(@as(f32, @floatFromInt(row)) * layout.row_h);
+    // Skip rows scrolled out of view above or below the visible window.
+    if (row < layout.scroll) return;
+    const visible_index = row - layout.scroll;
+    if (visible_index >= layout.visible_rows) return;
+    const row_y = @round(@as(f32, @floatFromInt(visible_index)) * layout.row_h);
     const y_top_px = layout.row_top_px + row_y;
     const gl_y = @round(window_height - y_top_px - layout.row_h);
     const x = layout.box_x + 18;
@@ -4603,6 +5196,38 @@ pub fn renderSettingsPage(window_width: f32, window_height: f32, top_offset: f32
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 9, i18n.s().settings_raw_config, i18n.s().settings_value_open, i18n.s().settings_hint_advanced_editor, true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 9);
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 10, i18n.s().settings_restore_defaults, "Enter", "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 10);
     renderSettingsRow(layout, window_height, SETTINGS_CONTROL_ROW_START + 11, i18n.s().settings_close, "Esc", "", true, g_settings_focus == SETTINGS_CONTROL_ROW_START + 11);
+
+    // Scrollbar indicator when not all rows fit (short windows). The list is
+    // scrolled via keyboard/click focus-follow and the mouse wheel.
+    if (layout.visible_rows < SETTINGS_ROW_COUNT) {
+        const total: f32 = @floatFromInt(SETTINGS_ROW_COUNT);
+        const vis: f32 = @floatFromInt(layout.visible_rows);
+        const track_h = layout.row_h * vis;
+        const track_top_px = layout.row_top_px;
+        const sb_w: f32 = 3;
+        const sb_x = layout.box_x + layout.box_w - sb_w - 7;
+        const track_gl_y = @round(window_height - track_top_px - track_h);
+        ui_pipeline.fillQuadAlpha(sb_x, track_gl_y, sb_w, track_h, mixColor(bg, fg, 0.25), 0.30);
+
+        const thumb_h = @max(24.0, @round(track_h * vis / total));
+        const max_scroll_f: f32 = @floatFromInt(SETTINGS_ROW_COUNT - layout.visible_rows);
+        const scroll_f: f32 = @floatFromInt(layout.scroll);
+        const thumb_offset = if (max_scroll_f > 0) @round((track_h - thumb_h) * (scroll_f / max_scroll_f)) else 0;
+        const thumb_gl_y = @round(window_height - (track_top_px + thumb_offset) - thumb_h);
+        ui_pipeline.fillQuadAlpha(sb_x, thumb_gl_y, sb_w, thumb_h, accent, 0.55);
+    }
+}
+
+/// Mouse-wheel handling for the settings page. The list scrolls by moving the
+/// focused row (which the view follows), matching the keyboard navigation model.
+/// Positive delta scrolls toward the top, mirroring whatsNewHandleScroll().
+pub fn settingsPageHandleScroll(delta_y: f64) void {
+    if (!g_settings_visible) return;
+    if (delta_y > 0) {
+        if (g_settings_focus > 0) g_settings_focus -= 1;
+    } else if (delta_y < 0) {
+        if (g_settings_focus + 1 < SETTINGS_ROW_COUNT) g_settings_focus += 1;
+    }
 }
 
 // ============================================================================
@@ -4744,6 +5369,54 @@ pub fn renderSplitDividers(active_tab: *const TabState, content_x: i32, content_
                 }
             },
         }
+    }
+}
+
+/// Draw a small filled dot at the top-right corner of each split pane that has
+/// a visible agent running. The dot is colored by agentBadgeColor(state) and is
+/// additive — it does not replace the existing focused-surface titlebar badge.
+///
+/// Coordinate system: OpenGL Y=0 is bottom. content_x/y/w/h are in framebuffer
+/// pixels (same as renderSplitDividers). window_height is the framebuffer height.
+pub fn renderPaneAgentDots(active_tab: *const TabState, content_x: i32, content_y: i32, content_w: i32, content_h: i32, window_height: f32) void {
+    if (!active_tab.tree.isSplit()) {
+        // Single-pane tab — no per-pane dot needed (focused badge in titlebar covers it).
+        return;
+    }
+
+    const allocator = AppWindow.g_allocator orelse return;
+
+    var spatial = active_tab.tree.spatial(allocator) catch return;
+    defer spatial.deinit(allocator);
+
+    const dot_size: f32 = 6; // diameter of the dot square
+    const dot_margin: f32 = 4; // inset from the pane corner
+
+    var it = active_tab.tree.surfaces();
+    while (it.next()) |entry| {
+        const det = entry.surface.agent_detection;
+        if (!det.visible()) continue;
+
+        const idx = @intFromEnum(entry.handle);
+        if (idx >= spatial.slots.len) continue;
+        const slot = spatial.slots[idx];
+
+        // Convert normalized slot to framebuffer pixel rect.
+        const px: f32 = @as(f32, @floatCast(slot.x)) * @as(f32, @floatFromInt(content_w)) + @as(f32, @floatFromInt(content_x));
+        const py: f32 = @as(f32, @floatCast(slot.y)) * @as(f32, @floatFromInt(content_h)) + @as(f32, @floatFromInt(content_y));
+        const pw: f32 = @as(f32, @floatCast(slot.width)) * @as(f32, @floatFromInt(content_w));
+
+        // Top-right corner in GL coords (Y=0 at bottom). py is top-down from the
+        // framebuffer top, so the pane spans GL-Y [window_height - py - ph,
+        // window_height - py]; its visual top edge is the higher value
+        // (window_height - py). fillQuad's y is the quad's bottom edge (it extends
+        // upward by dot_size), so inset the dot below the top edge by the margin.
+        const gl_pane_top = window_height - py;
+        const dot_x = px + pw - dot_size - dot_margin;
+        const dot_y = gl_pane_top - dot_size - dot_margin;
+
+        const color = titlebar.agentBadgeColor(det.state);
+        ui_pipeline.fillQuad(dot_x, dot_y, dot_size, dot_size, color);
     }
 }
 
@@ -4953,6 +5626,135 @@ test "macOS UI smoke: settings toggles WeChat direct" {
     defer allocator.free(content);
 
     try std.testing.expect(std.mem.indexOf(u8, content, "weixin-direct-enabled = true") != null);
+}
+
+test "overlays: settings page caps visible rows and scrolls to keep focus visible on short windows" {
+    const row_h = overlayRowHeight(42);
+    const header_h = @round(18 + overlayLineHeight() * 2 + 12);
+    const footer_h = @round(@max(52.0, overlayTextHeight() + 28.0));
+    const base_h = header_h + footer_h;
+
+    // A tall window fits every row, so no scrolling is needed.
+    try std.testing.expectEqual(SETTINGS_ROW_COUNT, settingsRowCapacity(2000, base_h, row_h));
+
+    // The reported short window (~522px tall) cannot fit all rows.
+    const short_rows = settingsRowCapacity(522, base_h, row_h);
+    try std.testing.expect(short_rows >= 1);
+    try std.testing.expect(short_rows < SETTINGS_ROW_COUNT);
+
+    const saved_focus = g_settings_focus;
+    defer g_settings_focus = saved_focus;
+
+    // Focus near the top keeps the list pinned to the top.
+    g_settings_focus = 0;
+    try std.testing.expectEqual(@as(usize, 0), settingsFirstVisibleRow(short_rows));
+
+    // Focusing the last row (the close action that was clipped in the report)
+    // scrolls just far enough to reveal it as the bottom visible row.
+    g_settings_focus = SETTINGS_ROW_COUNT - 1;
+    const scroll = settingsFirstVisibleRow(short_rows);
+    try std.testing.expectEqual(SETTINGS_ROW_COUNT - short_rows, scroll);
+    try std.testing.expect(g_settings_focus >= scroll);
+    try std.testing.expect(g_settings_focus < scroll + short_rows);
+}
+
+test "overlays: command center mouse wheel moves selection without wrapping" {
+    commandPaletteOpen();
+    defer commandPaletteClose();
+
+    // Default command mode with an empty filter lists many commands.
+    const count = commandPaletteVisibleCount();
+    try std.testing.expect(count >= 2);
+
+    g_command_palette_selected = 0;
+    // Positive delta scrolls toward the top; negative toward the bottom
+    // (mirrors whatsNewHandleScroll / the wheel sign convention).
+    commandPaletteHandleScroll(-1);
+    try std.testing.expectEqual(@as(usize, 1), g_command_palette_selected);
+
+    commandPaletteHandleScroll(1);
+    try std.testing.expectEqual(@as(usize, 0), g_command_palette_selected);
+
+    // At the top, scrolling up does not wrap to the bottom.
+    commandPaletteHandleScroll(1);
+    try std.testing.expectEqual(@as(usize, 0), g_command_palette_selected);
+
+    // At the bottom, scrolling down does not wrap to the top.
+    g_command_palette_selected = count - 1;
+    commandPaletteHandleScroll(-1);
+    try std.testing.expectEqual(count - 1, g_command_palette_selected);
+}
+
+test "overlays: session launcher caps rows and scrolls to keep selection visible on short windows" {
+    const row_h = overlayRowHeight(38);
+    const header_h = @round(18 + overlayLineHeight() * 2 + 12);
+    const bottom_pad = @round(@max(20.0, overlayTextHeight() * 0.55));
+    const base_h = header_h + bottom_pad;
+
+    // The tallest mode is the AI form (12 fields + 3 action rows = 15 rows).
+    const total: usize = AI_FIELD_COUNT + 3;
+
+    // A tall window fits every row.
+    try std.testing.expectEqual(total, sessionRowCapacity(2000, base_h, row_h, total));
+
+    // The reported short window cannot fit all rows.
+    const short_vis = sessionRowCapacity(522, base_h, row_h, total);
+    try std.testing.expect(short_vis >= 1);
+    try std.testing.expect(short_vis < total);
+
+    // Selection near the top keeps the list pinned to the top.
+    try std.testing.expectEqual(@as(usize, 0), sessionFirstVisibleRow(0, short_vis, total));
+
+    // Selecting the last row scrolls just far enough to reveal it.
+    const scroll = sessionFirstVisibleRow(total - 1, short_vis, total);
+    try std.testing.expectEqual(total - short_vis, scroll);
+    try std.testing.expect(total - 1 >= scroll);
+    try std.testing.expect(total - 1 < scroll + short_vis);
+}
+
+test "overlays: session launcher mouse wheel moves selection without wrapping" {
+    sessionLauncherOpen();
+    defer sessionLauncherClose();
+
+    const count = platform_pty_command.sessionLauncherRowCount();
+    try std.testing.expect(count >= 2);
+
+    g_session_launcher_selected = 0;
+    sessionLauncherHandleScroll(-1);
+    try std.testing.expectEqual(@as(usize, 1), g_session_launcher_selected);
+
+    sessionLauncherHandleScroll(1);
+    try std.testing.expectEqual(@as(usize, 0), g_session_launcher_selected);
+
+    // At the top, scrolling up does not wrap.
+    sessionLauncherHandleScroll(1);
+    try std.testing.expectEqual(@as(usize, 0), g_session_launcher_selected);
+
+    // At the bottom, scrolling down does not wrap.
+    g_session_launcher_selected = count - 1;
+    sessionLauncherHandleScroll(-1);
+    try std.testing.expectEqual(count - 1, g_session_launcher_selected);
+}
+
+test "overlays: short-window overlay boxes stay within the window" {
+    // A window far too short to hold the full box must still keep the panel
+    // inside the content area (never paint past the bottom edge).
+    {
+        const layout = settingsLayout(800, 120, 0);
+        try std.testing.expect(layout.box_top_px + layout.box_h <= 120);
+    }
+    {
+        sessionLauncherOpen();
+        defer sessionLauncherClose();
+        const layout = sessionLayout(800, 120, 0);
+        try std.testing.expect(layout.box_top_px + layout.box_h <= 120);
+    }
+    {
+        commandPaletteOpen();
+        defer commandPaletteClose();
+        const layout = commandPaletteLayout(800, 120, 0);
+        try std.testing.expect(layout.box_top_px + layout.box_h <= 120);
+    }
 }
 
 test "overlays: active download toast can be clicked for interruption" {
@@ -5266,10 +6068,12 @@ pub fn renderWindowCloseConfirm(window_width: f32, window_height: f32) void {
     const title_text = switch (g_close_confirm_variant) {
         .running_program => "A program is still running",
         .window_generic => "Close WispTerm?",
+        .terminal_split => "Close this terminal?",
     };
     const body_text = switch (g_close_confirm_variant) {
         .running_program => "Closing now will end it.",
         .window_generic => "Running panels in this window will be terminated.",
+        .terminal_split => "This terminal pane will be closed.",
     };
     const hint_text = "Press Enter or Close to proceed, Esc to cancel.";
     renderTitlebarTextStrongLimited(title_text, text_x, title_y, fg, text_right - text_x);
@@ -5550,6 +6354,9 @@ pub fn anyOverlayActive(now: i64) bool {
     if (now < g_close_shortcut_confirm_until_ms) return true;
     if (now < g_remote_key_copied_until_ms) return true;
     if (now < resize.g_split_resize_overlay_until) return true;
+
+    // Copilot edge handle: shimmer / reveal-fade / hover-tooltip dwell.
+    if (copilot_edge_handle.isAnimating()) return true;
 
     // FPS 叠层开启时每秒刷新
     if (g_debug_fps) return true;
@@ -5904,6 +6711,77 @@ pub fn openLatestRelease() void {
     var url_buf: [256]u8 = undefined;
     const url = latestReleaseUrl(&url_buf);
     _ = platform_open_url.open(allocator, .{ .url = url });
+}
+
+/// Read the Claude Code hook settings file (empty string if absent), call
+/// claude_integration.install, write atomically, show a toast.
+fn installClaudeCodeIntegration() void {
+    const allocator = AppWindow.g_allocator orelse return;
+    applyClaudeIntegration(allocator, true);
+}
+
+/// Read the Claude Code hook settings file (empty string if absent), call
+/// claude_integration.uninstall, write atomically, show a toast.
+fn removeClaudeCodeIntegration() void {
+    const allocator = AppWindow.g_allocator orelse return;
+    applyClaudeIntegration(allocator, false);
+}
+
+fn applyClaudeIntegration(allocator: std.mem.Allocator, comptime do_install: bool) void {
+    // Resolve the Claude Code settings file path via platform_dirs.
+    const settings_path = platform_dirs.agentHookSettingsPath(allocator) catch |err| {
+        std.log.warn("claude integration: cannot resolve settings path: {}", .{err});
+        showStatusToast("Claude Code integration: cannot resolve home directory");
+        return;
+    };
+    defer allocator.free(settings_path);
+
+    // Read existing content; treat missing file as "".
+    const existing = std.fs.cwd().readFileAlloc(allocator, settings_path, 16 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => allocator.dupe(u8, "") catch {
+            showStatusToast("Claude Code integration: out of memory");
+            return;
+        },
+        else => {
+            std.log.warn("claude integration: read {s}: {}", .{ settings_path, err });
+            showStatusToast("Claude Code integration: failed to read settings.json");
+            return;
+        },
+    };
+    defer allocator.free(existing);
+
+    // Apply install or uninstall (pure, no IO).
+    const new_content = if (do_install)
+        claude_integration.install(allocator, existing)
+    else
+        claude_integration.uninstall(allocator, existing);
+    const result = new_content catch |err| {
+        std.log.warn("claude integration: transform failed: {}", .{err});
+        showStatusToast("Claude Code integration: settings.json parse error");
+        return;
+    };
+    defer allocator.free(result);
+
+    // Ensure the settings directory exists.
+    const settings_dir = std.fs.path.dirname(settings_path) orelse settings_path;
+    std.fs.cwd().makePath(settings_dir) catch |err| {
+        std.log.warn("claude integration: makePath {s}: {}", .{ settings_dir, err });
+        showStatusToast("Claude Code integration: cannot create settings directory");
+        return;
+    };
+
+    // Write atomically (temp file + rename via platform helper).
+    platform_atomic_file.writeFileReplaceSafe(settings_path, result) catch |err| {
+        std.log.warn("claude integration: write {s}: {}", .{ settings_path, err });
+        showStatusToast("Claude Code integration: failed to write settings.json");
+        return;
+    };
+
+    if (do_install) {
+        showStatusToast("Claude Code agent integration installed");
+    } else {
+        showStatusToast("Claude Code agent integration removed");
+    }
 }
 
 fn openStoredPromptUrl() void {

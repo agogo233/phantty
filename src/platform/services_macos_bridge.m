@@ -76,6 +76,61 @@ char *wispterm_macos_clipboard_copy_text(void) {
     }
 }
 
+// Read an image off the general pasteboard, transcode it to PNG, and write it
+// to `<dir>/wispterm-clipboard-<ms>.png`. Returns the malloc'd path (free with
+// wispterm_macos_services_free) or NULL when the clipboard holds no image.
+char *wispterm_macos_clipboard_image_png_path(const char *dir) {
+    @autoreleasepool {
+        if (dir == NULL) return NULL;
+        NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+
+        // Prefer a ready-made PNG (some apps put image/png directly on the board).
+        NSData *png = [pasteboard dataForType:NSPasteboardTypePNG];
+        if (png == nil) {
+            // Fall back to TIFF (the native macOS screenshot format) or any
+            // NSImage object, then transcode to PNG via NSBitmapImageRep.
+            NSData *tiff = [pasteboard dataForType:NSPasteboardTypeTIFF];
+            if (tiff == nil) {
+                NSArray *images = [pasteboard readObjectsForClasses:@[[NSImage class]]
+                                                            options:nil];
+                if (images.count > 0) {
+                    NSImage *image = images.firstObject;
+                    tiff = [image TIFFRepresentation];
+                }
+            }
+            if (tiff != nil) {
+                NSBitmapImageRep *rep = [NSBitmapImageRep imageRepWithData:tiff];
+                if (rep != nil) {
+                    png = [rep representationUsingType:NSBitmapImageFileTypePNG
+                                            properties:@{}];
+                }
+            }
+        }
+        if (png == nil) return NULL;
+
+        NSString *dir_str = [NSString stringWithUTF8String:dir];
+        if (dir_str == nil) return NULL;
+        long long ms = (long long)([[NSDate date] timeIntervalSince1970] * 1000.0);
+        NSString *name = [NSString stringWithFormat:@"wispterm-clipboard-%lld.png", ms];
+        NSString *path = [dir_str stringByAppendingPathComponent:name];
+
+        if (![png writeToFile:path atomically:YES]) return NULL;
+        return wispterm_macos_copy_nsstring(path);
+    }
+}
+
+// Place raw PNG bytes on the general pasteboard as image/png. Used by the
+// native clipboard smoke tests to stage an image for the paste path.
+bool wispterm_macos_clipboard_write_image_png(const char *bytes, int32_t len) {
+    @autoreleasepool {
+        if (bytes == NULL || len <= 0) return false;
+        NSData *data = [NSData dataWithBytes:bytes length:(NSUInteger)len];
+        NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+        [pasteboard clearContents];
+        return [pasteboard setData:data forType:NSPasteboardTypePNG];
+    }
+}
+
 void wispterm_macos_cursor_set(uint32_t shape) {
     @autoreleasepool {
         switch (shape) {
@@ -290,13 +345,36 @@ static bool wispterm_macos_install_hotkey_handler(void) {
     return status == noErr;
 }
 
-char *wispterm_macos_open_file_dialog(const char *title) {
+// Parse a ';'-joined list of bare extensions (e.g. "md" or "png;jpg") into the
+// NSArray<NSString *> that NSOpenPanel/NSSavePanel.allowedFileTypes expects, or
+// nil when there is nothing to constrain.
+static NSArray<NSString *> *wispterm_macos_allowed_file_types(const char *exts) {
+    if (exts == NULL) return nil;
+    NSString *joined = [NSString stringWithUTF8String:exts];
+    if (joined == nil || joined.length == 0) return nil;
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (NSString *raw in [joined componentsSeparatedByString:@";"]) {
+        NSString *ext = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (ext.length == 0 || [ext isEqualToString:@"*"]) continue;
+        if (![out containsObject:ext]) [out addObject:ext];
+    }
+    return out.count > 0 ? out : nil;
+}
+
+char *wispterm_macos_open_file_dialog(const char *title, const char *allowed_exts) {
     @autoreleasepool {
         NSOpenPanel *panel = [NSOpenPanel openPanel];
         panel.canChooseFiles = YES;
         panel.canChooseDirectories = NO;
         panel.allowsMultipleSelection = NO;
         if (title != NULL) panel.title = [NSString stringWithUTF8String:title];
+        NSArray<NSString *> *types = wispterm_macos_allowed_file_types(allowed_exts);
+        if (types != nil) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            panel.allowedFileTypes = types;
+#pragma clang diagnostic pop
+        }
         if ([panel runModal] != NSModalResponseOK) return NULL;
         return wispterm_macos_copy_nsstring(panel.URL.path);
     }
@@ -314,7 +392,7 @@ char *wispterm_macos_pick_folder_dialog(const char *title) {
     }
 }
 
-char *wispterm_macos_save_file_dialog(const char *title, const char *initial_dir, const char *default_filename) {
+char *wispterm_macos_save_file_dialog(const char *title, const char *initial_dir, const char *default_filename, const char *allowed_exts, const char *default_ext) {
     @autoreleasepool {
         NSSavePanel *panel = [NSSavePanel savePanel];
         if (title != NULL) panel.title = [NSString stringWithUTF8String:title];
@@ -323,6 +401,27 @@ char *wispterm_macos_save_file_dialog(const char *title, const char *initial_dir
             if (dir != nil) panel.directoryURL = [NSURL fileURLWithPath:dir];
         }
         if (default_filename != NULL) panel.nameFieldStringValue = [NSString stringWithUTF8String:default_filename];
+
+        // Restrict to the filter extensions (auto-appends when the user omits
+        // one); make sure the requested default extension is the primary type.
+        NSMutableArray<NSString *> *types = [NSMutableArray array];
+        NSArray<NSString *> *filter_types = wispterm_macos_allowed_file_types(allowed_exts);
+        if (filter_types != nil) [types addObjectsFromArray:filter_types];
+        if (default_ext != NULL) {
+            NSString *ext = [[NSString stringWithUTF8String:default_ext]
+                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (ext.length > 0 && ![ext isEqualToString:@"*"]) {
+                [types removeObject:ext];
+                [types insertObject:ext atIndex:0];
+            }
+        }
+        if (types.count > 0) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            panel.allowedFileTypes = types;
+#pragma clang diagnostic pop
+        }
+
         if ([panel runModal] != NSModalResponseOK) return NULL;
         return wispterm_macos_copy_nsstring(panel.URL.path);
     }

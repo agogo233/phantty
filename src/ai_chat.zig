@@ -17,6 +17,7 @@ const command_registry = @import("command_registry.zig");
 const markdown_text = @import("markdown_text.zig");
 const ai_chat_protocol = @import("ai_chat_protocol.zig");
 const ai_chat_composer = @import("ai_chat_composer.zig");
+const ai_model_switch = @import("ai_model_switch.zig");
 const ai_chat_skills = @import("ai_chat_skills.zig");
 const ai_skill_distill = @import("ai_skill_distill.zig");
 const ai_chat_types = @import("ai_chat_types.zig");
@@ -92,6 +93,9 @@ pub const Message = struct {
     persist_to_history: bool = true,
     content_collapsed: bool = false,
     content_auto_expand: bool = false,
+    /// Synthetic "上文摘要" card produced by a model switch. Rendered like a
+    /// collapsible tool card but sent to the model as a normal user message.
+    is_context_summary: bool = false,
     reasoning_collapsed: bool = true,
     reasoning_auto_expand: bool = false,
 
@@ -226,6 +230,30 @@ pub const WebSearchRequest = struct {
     }
 };
 
+/// Self-contained background job for the post-switch context summary. Owns the
+/// inner `ChatRequest` plus the pre-switch message `boundary` and the source
+/// (OLD) model name, so the worker can splice the result without re-reading
+/// possibly-changed session state.
+pub const SummaryRequest = struct {
+    allocator: std.mem.Allocator,
+    req: *ChatRequest,
+    boundary: usize,
+    from_model_buf: [128]u8 = undefined,
+    from_model_len: usize = 0,
+
+    pub fn setFromModel(self: *SummaryRequest, value: []const u8) void {
+        self.from_model_len = @min(value.len, self.from_model_buf.len);
+        @memcpy(self.from_model_buf[0..self.from_model_len], value[0..self.from_model_len]);
+    }
+    pub fn fromModel(self: *const SummaryRequest) []const u8 {
+        return self.from_model_buf[0..self.from_model_len];
+    }
+    pub fn deinit(self: *SummaryRequest) void {
+        self.req.deinit();
+        self.allocator.destroy(self);
+    }
+};
+
 /// Lightweight background job for a `$webread` user command. Owns its target.
 /// Mirrors `WebSearchRequest`; joined by `Session.deinit` via `request_thread`.
 pub const WebReadRequest = struct {
@@ -298,6 +326,7 @@ const PendingHistoryChange = struct {
 const DeferredAction = union(enum) {
     none,
     resume_picker,
+    model_switch_picker,
     export_markdown: MarkdownExportMode,
 };
 
@@ -312,10 +341,13 @@ const BuiltinResult = struct {
 /// Fires a deferred built-in side-effect. Call ONLY after `self.mutex` has been
 /// unlocked: `resume_picker`/`export_markdown` re-enter the session through the
 /// app layer and would deadlock if fired while the mutex is held.
-fn fireDeferredAction(action: DeferredAction) void {
+fn fireDeferredAction(session: *Session, action: DeferredAction) void {
     switch (action) {
         .none => {},
         .resume_picker => if (g_session_resume_trigger) |t| t(),
+        // Targets the session that submitted `/model` (copilot sidebar OR a tab),
+        // not the active tab — they can differ.
+        .model_switch_picker => if (g_model_switch_trigger) |t| t(session),
         .export_markdown => |mode| if (g_markdown_export_trigger) |t| t(mode),
     }
 }
@@ -327,15 +359,9 @@ var g_access_rules: ?*const ai_agent_access.AccessRules = null;
 var g_default_working_dir_buf: [WORKING_DIR_MAX_BYTES]u8 = undefined;
 var g_default_working_dir_len: usize = 0;
 var g_session_id_counter = std.atomic.Value(u64).init(1);
-var g_skill_update_trigger: ?*const fn () void = null;
 var g_session_resume_trigger: ?*const fn () void = null;
 var g_markdown_export_trigger: ?*const fn (MarkdownExportMode) void = null;
-
-/// Wire the callback that the `/update-skills` slash command fires. Set once at
-/// startup by the app layer (mirrors `configureAgent` / `setToolHost`).
-pub fn setSkillUpdateTrigger(cb: *const fn () void) void {
-    g_skill_update_trigger = cb;
-}
+var g_model_switch_trigger: ?*const fn (*Session) void = null;
 
 /// Resolved credentials for the `ai-subagent-profile` config key. Owned
 /// strings; freed by ChatRequest.deinit.
@@ -361,7 +387,7 @@ var g_subagent_profile_resolver: ?SubagentProfileResolver = null;
 
 /// Wire the UI-thread resolver that maps the `ai-subagent-profile` config key
 /// to concrete profile credentials. Registered at startup by the app layer
-/// (mirrors setSkillUpdateTrigger). Resolution happens in buildRequestLocked
+/// (mirrors the other startup trigger setters). Resolution happens in buildRequestLocked
 /// on the UI thread; the worker only reads the owned copy on its ChatRequest.
 pub fn setSubagentProfileResolver(cb: ?SubagentProfileResolver) void {
     g_subagent_profile_resolver = cb;
@@ -377,6 +403,12 @@ fn resolveSubagentProfileForRequest(allocator: std.mem.Allocator, agent_enabled:
 /// Fired AFTER the session mutex unlocks (the picker lives in the app layer).
 pub fn setSessionResumeTrigger(cb: ?*const fn () void) void {
     g_session_resume_trigger = cb;
+}
+
+/// Wire the callback that `/model` fires (after unlock) to either switch by the
+/// pending name or open the profile picker. Lives in the app layer.
+pub fn setModelSwitchTrigger(cb: ?*const fn (*Session) void) void {
+    g_model_switch_trigger = cb;
 }
 
 /// Wire the callback that `/export [full|clean]` fires to write the conversation
@@ -517,7 +549,6 @@ fn slashCommandOutput(allocator: std.mem.Allocator, command: SlashCommand) ![]u8
         .commands => ai_chat_skills.slashCommandListOutput(allocator),
         .reload_skills => allocator.dupe(u8, "Skills will be re-read from disk on the next skill call."),
         .reload_commands => allocator.dupe(u8, "Custom commands will be re-read from the commands directory."),
-        .update_skills => allocator.dupe(u8, "Downloading the latest skills from GitHub in the background..."),
         .clear => allocator.dupe(u8, "Cleared the conversation context."),
         .rewind_picker => allocator.dupe(u8, "No previous user messages to rewind."),
         .resume_session => allocator.dupe(u8, "Opening saved conversation history..."),
@@ -533,6 +564,9 @@ fn slashCommandOutput(allocator: std.mem.Allocator, command: SlashCommand) ![]u8
         // .remember, .memory, .forget suppress output and emit their own messages;
         // this path is never reached, but the arm is required for exhaustiveness.
         .remember, .memory, .forget => allocator.dupe(u8, ""),
+        // .model_switch suppresses output and defers to the picker / by-name path;
+        // this path is never reached, but the arm is required for exhaustiveness.
+        .model_switch => allocator.dupe(u8, ""),
     };
 }
 
@@ -581,6 +615,11 @@ pub const Session = struct {
     input_scroll_row: usize = 0,
     input_scroll_follow_cursor: bool = true,
     input_select_all: bool = false,
+    composer_history_active: bool = false,
+    composer_history_selected: usize = 0,
+    composer_history_draft_buf: [INPUT_PROMPT_MAX_BYTES]u8 = undefined,
+    composer_history_draft_len: usize = 0,
+    composer_history_draft_cursor: usize = 0,
     suggestion_selected: usize = 0,
     skill_suggestions: []skill_registry.SkillMeta = &.{},
     skill_suggestions_loaded: bool = false,
@@ -654,6 +693,9 @@ pub const Session = struct {
     bound_surface_id_len: usize = 0,
     working_dir_buf: [WORKING_DIR_MAX_BYTES]u8 = undefined,
     working_dir_len: usize = 0,
+    summary_thread: ?std.Thread = null,
+    pending_model_switch_name_buf: [128]u8 = undefined,
+    pending_model_switch_name_len: usize = 0,
 
     pub const RequestState = struct {
         inflight: bool,
@@ -896,6 +938,10 @@ pub const Session = struct {
             thread.join();
             self.title_thread = null;
         }
+        if (self.summary_thread) |thread| {
+            thread.join();
+            self.summary_thread = null;
+        }
         for (self.messages.items) |msg| {
             msg.deinit(self.allocator);
         }
@@ -931,6 +977,23 @@ pub const Session = struct {
 
     pub fn missingApiKey(self: *const Session) bool {
         return self.api_key_len == 0;
+    }
+
+    /// Stash the `/model <name>` argument so the app-layer trigger can read it
+    /// after the mutex unlocks. Empty arg => open the picker.
+    fn setPendingModelSwitchNameLocked(self: *Session, name: []const u8) void {
+        self.pending_model_switch_name_len = @min(name.len, self.pending_model_switch_name_buf.len);
+        @memcpy(self.pending_model_switch_name_buf[0..self.pending_model_switch_name_len], name[0..self.pending_model_switch_name_len]);
+    }
+
+    /// Read + clear the pending `/model` name. Returns a slice into the buffer
+    /// valid until the next mutate; copy if you need to keep it.
+    pub fn takePendingModelSwitchName(self: *Session) []const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const out = self.pending_model_switch_name_buf[0..self.pending_model_switch_name_len];
+        self.pending_model_switch_name_len = 0;
+        return out;
     }
 
     pub fn thinkingConfigValue(self: *const Session) []const u8 {
@@ -1199,6 +1262,7 @@ pub const Session = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.clearComposerHistoryNavigationLocked();
         if (self.input_select_all) {
             self.input_len = 0;
             self.input_cursor = 0;
@@ -1216,6 +1280,7 @@ pub const Session = struct {
     pub fn appendInputText(self: *Session, text: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.clearComposerHistoryNavigationLocked();
         if (self.input_select_all) {
             self.input_len = 0;
             self.input_cursor = 0;
@@ -1238,6 +1303,7 @@ pub const Session = struct {
         defer self.mutex.unlock();
         if (!self.input_select_all or self.input_len == 0) return null;
         const text = try allocator.dupe(u8, self.input_buf[0..self.input_len]);
+        self.clearComposerHistoryNavigationLocked();
         self.input_len = 0;
         self.input_cursor = 0;
         self.input_scroll_row = 0;
@@ -1351,6 +1417,7 @@ pub const Session = struct {
         }
         if (ev.ctrl and !ev.alt and ev.key == .key_u) {
             self.mutex.lock();
+            self.clearComposerHistoryNavigationLocked();
             self.input_len = 0;
             self.input_cursor = 0;
             self.input_scroll_row = 0;
@@ -1370,8 +1437,12 @@ pub const Session = struct {
             .delete => self.deleteInput(),
             .arrow_left => self.moveInputCursorLeft(),
             .arrow_right => self.moveInputCursorRight(),
-            .arrow_up => if (!self.moveComposerSuggestionSelection(-1)) self.moveInputCursorVertical(max_cols, -1),
-            .arrow_down => if (!self.moveComposerSuggestionSelection(1)) self.moveInputCursorVertical(max_cols, 1),
+            .arrow_up => if (!self.moveComposerSuggestionSelection(-1)) {
+                if (!self.navigateComposerHistory(max_cols, -1)) self.moveInputCursorVertical(max_cols, -1);
+            },
+            .arrow_down => if (!self.moveComposerSuggestionSelection(1)) {
+                if (!self.navigateComposerHistory(max_cols, 1)) self.moveInputCursorVertical(max_cols, 1);
+            },
             .home => self.moveInputCursorHome(),
             .end => self.moveInputCursorEnd(),
             .tab => _ = self.completeComposerSuggestion(.tab),
@@ -1613,7 +1684,7 @@ pub const Session = struct {
         defer self.mutex.unlock();
         if (message_index >= self.messages.items.len) return;
         var msg = &self.messages.items[message_index];
-        if (msg.role != .tool) return;
+        if (msg.role != .tool and !msg.is_context_summary) return;
         msg.content_collapsed = !msg.content_collapsed;
         msg.content_auto_expand = false;
     }
@@ -1802,7 +1873,7 @@ pub const Session = struct {
             self.clearPendingWeixinReplyContextLocked();
             self.mutex.unlock();
             self.notifyHistoryChange(r.history_change);
-            fireDeferredAction(r.deferred);
+            fireDeferredAction(self, r.deferred);
             return;
         }
         // 2) Custom command, matched by first token.
@@ -1814,7 +1885,7 @@ pub const Session = struct {
                     self.clearPendingWeixinReplyContextLocked();
                     self.mutex.unlock();
                     self.notifyHistoryChange(r.history_change);
-                    fireDeferredAction(r.deferred);
+                    fireDeferredAction(self, r.deferred);
                     return;
                 }
             }
@@ -1828,7 +1899,7 @@ pub const Session = struct {
                 self.clearPendingWeixinReplyContextLocked();
                 self.mutex.unlock();
                 self.notifyHistoryChange(r.history_change);
-                fireDeferredAction(r.deferred);
+                fireDeferredAction(self, r.deferred);
                 return;
             }
         }
@@ -2120,8 +2191,6 @@ pub const Session = struct {
             .clear => result.history_change = self.clearMessagesLocked(),
             .reload_commands => self.reloadCustomCommands(),
             .reload_skills => self.freeSkillSuggestions(),
-            // update_skills only spawns a background thread, so it is safe inline.
-            .update_skills => if (g_skill_update_trigger) |trigger| trigger(),
             .rewind_picker => {
                 const count = self.rewindPointCountLocked();
                 self.clearSubmittedInputLocked();
@@ -2154,6 +2223,13 @@ pub const Session = struct {
             },
             .forget => {
                 self.applyForgetLocked(arg);
+                result.suppress_output = true;
+            },
+            .model_switch => {
+                self.setPendingModelSwitchNameLocked(arg);
+                result.deferred = .model_switch_picker;
+                self.clearSubmittedInputLocked();
+                self.setStatusLocked("Ready");
                 result.suppress_output = true;
             },
             else => {},
@@ -2714,6 +2790,7 @@ pub const Session = struct {
     fn backspaceInput(self: *Session) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.clearComposerHistoryNavigationLocked();
         if (self.input_select_all) {
             self.input_len = 0;
             self.input_cursor = 0;
@@ -2736,6 +2813,7 @@ pub const Session = struct {
     fn deleteInput(self: *Session) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.clearComposerHistoryNavigationLocked();
         if (self.input_select_all) {
             self.input_len = 0;
             self.input_cursor = 0;
@@ -2806,6 +2884,42 @@ pub const Session = struct {
         self.suggestion_selected = 0;
     }
 
+    fn navigateComposerHistory(self: *Session, max_cols_raw: usize, delta: i32) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const prompt_count = self.composerHistoryPromptCountLocked();
+        if (prompt_count == 0 or delta == 0) return false;
+        self.clampInputCursorLocked();
+
+        const max_cols = @max(@as(usize, 1), max_cols_raw);
+        const text = self.input();
+        const current = visualCursorPosition(text, self.input_cursor, max_cols);
+        const rows = inputWrappedLineCount(text, max_cols);
+
+        if (delta < 0) {
+            if (current.row != 0) return false;
+            if (!self.composer_history_active) {
+                self.saveComposerHistoryDraftLocked();
+                self.composer_history_active = true;
+                self.composer_history_selected = prompt_count - 1;
+            } else if (self.composer_history_selected > 0) {
+                self.composer_history_selected -= 1;
+            }
+            return self.restoreComposerHistoryPromptLocked(self.composer_history_selected);
+        }
+
+        if (current.row + 1 < rows or !self.composer_history_active) return false;
+        if (self.composer_history_selected + 1 < prompt_count) {
+            self.composer_history_selected += 1;
+            return self.restoreComposerHistoryPromptLocked(self.composer_history_selected);
+        }
+
+        self.restoreComposerHistoryDraftLocked();
+        self.clearComposerHistoryNavigationLocked();
+        return true;
+    }
+
     fn moveComposerSuggestionSelection(self: *Session, delta: i32) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2843,6 +2957,7 @@ pub const Session = struct {
         const suffix_len = self.input_len - prefix.token_end;
         if (replacement.len + suffix_len > self.input_buf.len) return false;
 
+        self.clearComposerHistoryNavigationLocked();
         if (replacement.len > prefix.token_end) {
             std.mem.copyBackwards(
                 u8,
@@ -2921,6 +3036,7 @@ pub const Session = struct {
     }
 
     fn clearSubmittedInputLocked(self: *Session) void {
+        self.clearComposerHistoryNavigationLocked();
         self.input_len = 0;
         self.input_cursor = 0;
         self.input_scroll_row = 0;
@@ -2931,6 +3047,11 @@ pub const Session = struct {
 
     /// 用 text 覆盖输入框内容，光标置于末尾。纯缓冲区操作、无 IO。
     fn setInputTextLocked(self: *Session, text: []const u8) void {
+        self.clearComposerHistoryNavigationLocked();
+        self.replaceInputTextLocked(text);
+    }
+
+    fn replaceInputTextLocked(self: *Session, text: []const u8) void {
         self.input_len = 0;
         self.input_cursor = 0;
         self.input_scroll_row = 0;
@@ -2938,6 +3059,55 @@ pub const Session = struct {
         self.suggestion_selected = 0;
         self.clearSelectionLocked();
         self.insertInputBytesLocked(text);
+    }
+
+    fn clearComposerHistoryNavigationLocked(self: *Session) void {
+        self.composer_history_active = false;
+        self.composer_history_selected = 0;
+        self.composer_history_draft_len = 0;
+        self.composer_history_draft_cursor = 0;
+    }
+
+    fn saveComposerHistoryDraftLocked(self: *Session) void {
+        const len = @min(self.input_len, self.composer_history_draft_buf.len);
+        if (len > 0) @memcpy(self.composer_history_draft_buf[0..len], self.input_buf[0..len]);
+        self.composer_history_draft_len = len;
+        self.composer_history_draft_cursor = @min(self.input_cursor, len);
+    }
+
+    fn restoreComposerHistoryDraftLocked(self: *Session) void {
+        const draft = self.composer_history_draft_buf[0..self.composer_history_draft_len];
+        const cursor = self.composer_history_draft_cursor;
+        self.replaceInputTextLocked(draft);
+        self.input_cursor = @min(cursor, self.input_len);
+        self.clampInputCursorLocked();
+        self.input_scroll_follow_cursor = true;
+    }
+
+    fn composerHistoryPromptCountLocked(self: *Session) usize {
+        var n: usize = 0;
+        for (self.messages.items) |msg| {
+            if (msg.role == .user) n += 1;
+        }
+        return n;
+    }
+
+    fn composerHistoryPromptMessageIndexLocked(self: *Session, n: usize) usize {
+        var seen: usize = 0;
+        for (self.messages.items, 0..) |msg, i| {
+            if (msg.role == .user) {
+                if (seen == n) return i;
+                seen += 1;
+            }
+        }
+        return self.messages.items.len;
+    }
+
+    fn restoreComposerHistoryPromptLocked(self: *Session, selected: usize) bool {
+        const idx = self.composerHistoryPromptMessageIndexLocked(selected);
+        if (idx >= self.messages.items.len) return false;
+        self.replaceInputTextLocked(self.messages.items[idx].content);
+        return true;
     }
 
     /// 打开回溯选择器：仅在空闲且至少有一个回溯点时；默认选中最近一条。
@@ -3789,6 +3959,185 @@ pub fn applyGeneratedTitle(session: *Session, raw: []const u8) void {
     _ = session.setTitleIfDefault(cleaned);
 }
 
+/// Swap the live session to a different provider/model (session-only; does not
+/// touch the global default). Then, if there is prior conversation, kick off a
+/// background summary against the NEW model. The session's system prompt /
+/// persona is intentionally left unchanged.
+pub fn applyProviderProfile(
+    session: *Session,
+    base_url: []const u8,
+    api_key: []const u8,
+    model_name: []const u8,
+    protocol_str: []const u8,
+    thinking_str: []const u8,
+    reasoning_effort: []const u8,
+    max_tokens: u32,
+    vision_str: []const u8,
+) void {
+    // Join any prior summary worker before starting a new switch, so its thread
+    // handle isn't lost (it would otherwise leak and could race deinit / UAF the
+    // session). Taken out under the lock, joined OUTSIDE it to avoid deadlocking
+    // against the worker's own applySummaryResult (which locks the same mutex).
+    session.mutex.lock();
+    const prior_summary = session.summary_thread;
+    session.summary_thread = null;
+    session.mutex.unlock();
+    if (prior_summary) |t| t.join();
+
+    var sreq: ?*SummaryRequest = null;
+    session.mutex.lock();
+    locked: {
+        // Capture the OLD model name BEFORE swapping, for the summary card marker.
+        var old_model_buf: [128]u8 = undefined;
+        const old_model_len = @min(session.model().len, old_model_buf.len);
+        @memcpy(old_model_buf[0..old_model_len], session.model()[0..old_model_len]);
+        const old_model = old_model_buf[0..old_model_len];
+
+        session.copyBaseUrl(base_url);
+        session.copyApiKey(api_key);
+        session.copyModel(model_name);
+        session.protocol = ApiProtocol.parse(protocol_str);
+        session.thinking_enabled = !std.mem.eql(u8, thinking_str, "disabled");
+        session.copyReasoningEffort(reasoning_effort);
+        session.max_tokens = max_tokens;
+        session.vision_enabled = std.mem.eql(u8, vision_str, "on") or std.mem.eql(u8, vision_str, "enabled") or std.mem.eql(u8, vision_str, "true");
+
+        // Build the summary snapshot from the messages that exist now.
+        const boundary = session.messages.items.len;
+        const turns = session.allocator.alloc(ai_model_switch.TurnMessage, boundary) catch break :locked;
+        defer session.allocator.free(turns);
+        for (session.messages.items, 0..) |m, i| turns[i] = .{ .role = m.role, .content = m.content };
+        if (!ai_model_switch.shouldSummarize(turns)) {
+            session.setStatusLocked("Model switched");
+            break :locked;
+        }
+        sreq = buildSummaryRequestLocked(session, turns, boundary, old_model) catch break :locked;
+        session.setStatusLocked("Summarizing previous context…");
+    }
+    session.mutex.unlock();
+
+    const req = sreq orelse return;
+    const thread = std.Thread.spawn(.{}, ai_chat_request.summaryThreadMain, .{req}) catch {
+        req.deinit();
+        session.mutex.lock();
+        session.setStatusLocked("Ready");
+        session.mutex.unlock();
+        return;
+    };
+    session.mutex.lock();
+    session.summary_thread = thread;
+    session.mutex.unlock();
+}
+
+fn buildSummaryRequestLocked(session: *Session, turns: []const ai_model_switch.TurnMessage, boundary: usize, from_model: []const u8) !*SummaryRequest {
+    const allocator = session.allocator;
+    const req = try allocator.create(ChatRequest);
+    errdefer allocator.destroy(req);
+
+    const base_url = try allocator.dupe(u8, session.baseUrl());
+    errdefer allocator.free(base_url);
+    const api_key = try allocator.dupe(u8, session.apiKey());
+    errdefer allocator.free(api_key);
+    const model = try allocator.dupe(u8, session.model());
+    errdefer allocator.free(model);
+    const system_prompt = try allocator.dupe(u8, ai_model_switch.system_prompt);
+    errdefer allocator.free(system_prompt);
+    const reasoning_effort = try allocator.dupe(u8, "low");
+    errdefer allocator.free(reasoning_effort);
+
+    const user_content = try ai_model_switch.buildSummaryUserContent(allocator, turns);
+    errdefer allocator.free(user_content);
+
+    const messages = try allocator.alloc(RequestMessage, 1);
+    errdefer allocator.free(messages);
+    messages[0] = .{ .role = .user, .content = user_content };
+
+    req.* = .{
+        .allocator = allocator,
+        .session = session,
+        .base_url = base_url,
+        .api_key = api_key,
+        .model = model,
+        .protocol = session.protocol,
+        .system_prompt = system_prompt,
+        .messages = messages,
+        .thinking_enabled = false,
+        .reasoning_effort = reasoning_effort,
+        .stream = false,
+        .max_tokens = 1024,
+        .agent_enabled = false,
+        .copilot = false,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .started_ms = 0,
+    };
+
+    const sreq = try allocator.create(SummaryRequest);
+    sreq.* = .{ .allocator = allocator, .req = req, .boundary = boundary };
+    sreq.setFromModel(from_model);
+    return sreq;
+}
+
+/// Apply a completed summary: replace messages[0..boundary] with one collapsible
+/// "上文摘要" card (role .user, is_context_summary), preserving messages[boundary..].
+/// Runs under the mutex; safe even if a request is in flight because each request
+/// snapshots its messages under the mutex at start.
+pub fn applySummaryResult(session: *Session, summary: []const u8, boundary: usize, from_model: []const u8) void {
+    if (session.closing.load(.acquire)) return;
+    const allocator = session.allocator;
+    var history_change: ?PendingHistoryChange = null;
+    session.mutex.lock();
+    defer {
+        session.mutex.unlock();
+        session.notifyHistoryChange(history_change);
+    }
+    if (session.closing.load(.acquire)) return;
+    if (boundary > session.messages.items.len) {
+        session.setStatusLocked("Ready");
+        return; // stale (e.g. /clear happened) — keep raw history
+    }
+    const content = ai_model_switch.composeCardContent(allocator, from_model, summary) catch {
+        session.setStatusLocked("Ready");
+        return;
+    };
+    var new_list: std.ArrayListUnmanaged(Message) = .empty;
+    new_list.append(allocator, .{
+        .role = .user,
+        .content = content,
+        .is_context_summary = true,
+        .content_collapsed = true,
+        .persist_to_history = true,
+    }) catch {
+        allocator.free(content);
+        session.setStatusLocked("Ready");
+        return;
+    };
+    new_list.appendSlice(allocator, session.messages.items[boundary..]) catch {
+        // OOM: free the summary we just made, keep raw history intact.
+        new_list.items[0].deinit(allocator);
+        new_list.deinit(allocator);
+        session.setStatusLocked("Ready");
+        return;
+    };
+    // Free only the collapsed pre-switch messages; tail structs were copied by
+    // value into new_list (pointer ownership moved).
+    for (session.messages.items[0..boundary]) |m| m.deinit(allocator);
+    session.messages.deinit(allocator);
+    session.messages = new_list;
+    session.scroll_px = 1_000_000;
+    session.setStatusLocked("Context summarized");
+    history_change = session.captureHistoryChangeLocked();
+}
+
+/// Summary request failed (e.g. the new model is also overloaded): keep the full
+/// raw history, just clear the in-progress status.
+pub fn failSummaryResult(session: *Session) void {
+    if (session.closing.load(.acquire)) return;
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    session.setStatusLocked("Summary unavailable — kept full history");
+}
+
 /// Build a standalone, tool-free, non-streaming ChatRequest for title
 /// generation, reusing the session's endpoint/key/model/protocol. Must be
 /// called with `session.mutex` held (reads session config + first turn).
@@ -4398,7 +4747,6 @@ test "ai chat recognizes local slash commands" {
     try std.testing.expect(parseSlashCommand("/skills").? == .skills);
     try std.testing.expect(parseSlashCommand("/commands").? == .commands);
     try std.testing.expect(parseSlashCommand("/reload-skills").? == .reload_skills);
-    try std.testing.expect(parseSlashCommand("/update-skills").? == .update_skills);
     try std.testing.expect(parseSlashCommand("/unknown").? == .unknown);
     try std.testing.expect(parseSlashCommand("hello") == null);
 }
@@ -5238,7 +5586,10 @@ test "ai chat responses endpoint normalization" {
 }
 
 test "ai chat default system prompt comes from platform agent prompt" {
-    try std.testing.expect(DEFAULT_SYSTEM_PROMPT.len < 3200);
+    // Length budget: the system prompt ships on every AI API call, so this guards
+    // against silent bloat. The Windows variant is the longest (it adds the WSL
+    // tool guidance); keep headroom above it for future additions.
+    try std.testing.expect(DEFAULT_SYSTEM_PROMPT.len < 4000);
     try std.testing.expect(std.mem.indexOf(u8, DEFAULT_SYSTEM_PROMPT, "wispterm_docs") != null);
     try std.testing.expectEqualStrings(platform_agent_prompt.defaultSystemPrompt, DEFAULT_SYSTEM_PROMPT);
     try std.testing.expect(std.mem.indexOf(u8, DEFAULT_SYSTEM_PROMPT, "uv") != null);
@@ -5729,6 +6080,79 @@ test "ai chat input cursor moves vertically across wrapped rows" {
 
     session.handleKeyWithWrapCols(.{ .key = input_key.Key.arrow_up }, 5);
     try std.testing.expectEqual(@as(usize, 7), session.inputCursor());
+}
+
+test "ai chat composer history recalls prompts at visual boundaries" {
+    const allocator = std.testing.allocator;
+    var session = Session{ .allocator = allocator };
+    defer {
+        for (session.messages.items) |msg| msg.deinit(allocator);
+        session.messages.deinit(allocator);
+    }
+    try session.messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "first prompt") });
+    try session.messages.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "first reply") });
+    try session.messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "second prompt") });
+
+    session.appendInputText("draft");
+    session.handleKey(.{ .key = input_key.Key.home });
+    session.handleKeyWithWrapCols(.{ .key = input_key.Key.arrow_up }, 80);
+    try std.testing.expectEqualStrings("second prompt", session.input());
+    try std.testing.expectEqual(@as(usize, "second prompt".len), session.inputCursor());
+
+    session.handleKeyWithWrapCols(.{ .key = input_key.Key.arrow_up }, 80);
+    try std.testing.expectEqualStrings("first prompt", session.input());
+    try std.testing.expectEqual(@as(usize, "first prompt".len), session.inputCursor());
+
+    session.handleKeyWithWrapCols(.{ .key = input_key.Key.arrow_down }, 80);
+    try std.testing.expectEqualStrings("second prompt", session.input());
+
+    session.handleKeyWithWrapCols(.{ .key = input_key.Key.arrow_down }, 80);
+    try std.testing.expectEqualStrings("draft", session.input());
+    try std.testing.expectEqual(@as(usize, 0), session.inputCursor());
+}
+
+test "ai chat composer history preserves multiline vertical editing" {
+    const allocator = std.testing.allocator;
+    var session = Session{ .allocator = allocator };
+    defer {
+        for (session.messages.items) |msg| msg.deinit(allocator);
+        session.messages.deinit(allocator);
+    }
+    try session.messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "previous prompt") });
+
+    session.appendInputText("abc\ndefg\nhi");
+    session.handleKey(.{ .key = input_key.Key.home });
+    session.handleKey(.{ .key = input_key.Key.arrow_down });
+    try std.testing.expectEqual(@as(usize, 4), session.inputCursor());
+
+    session.handleKeyWithWrapCols(.{ .key = input_key.Key.arrow_up }, 80);
+    try std.testing.expectEqualStrings("abc\ndefg\nhi", session.input());
+    try std.testing.expectEqual(@as(usize, 0), session.inputCursor());
+
+    session.handleKeyWithWrapCols(.{ .key = input_key.Key.arrow_up }, 80);
+    try std.testing.expectEqualStrings("previous prompt", session.input());
+}
+
+test "ai chat composer history exits after editing recalled prompt" {
+    const allocator = std.testing.allocator;
+    var session = Session{ .allocator = allocator };
+    defer {
+        for (session.messages.items) |msg| msg.deinit(allocator);
+        session.messages.deinit(allocator);
+    }
+    try session.messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "old prompt") });
+
+    session.appendInputText("draft");
+    session.handleKey(.{ .key = input_key.Key.home });
+    session.handleKeyWithWrapCols(.{ .key = input_key.Key.arrow_up }, 80);
+    try std.testing.expectEqualStrings("old prompt", session.input());
+
+    session.handleChar('!');
+    try std.testing.expectEqualStrings("old prompt!", session.input());
+
+    session.handleKey(.{ .key = input_key.Key.home });
+    session.handleKeyWithWrapCols(.{ .key = input_key.Key.arrow_down }, 80);
+    try std.testing.expectEqualStrings("old prompt!", session.input());
 }
 
 test "ai chat composer wrapped row count grows with explicit lines and wrapping" {
@@ -7196,4 +7620,47 @@ test "composeSystemPromptWithMemory appends the index block when enabled" {
     const without = try composeSystemPromptWithMemory(a, "BASE", false, "");
     defer a.free(without);
     try std.testing.expectEqualStrings("BASE", without);
+}
+
+test "is_context_summary messages are collapsible" {
+    var session = try Session.initWithVision(std.testing.allocator, "T", "https://x", "k", "m", "chat_completions", "sp", "enabled", "low", "false", "false", "false");
+    defer session.deinit();
+    const content = try std.testing.allocator.dupe(u8, "summary body");
+    try session.messages.append(std.testing.allocator, .{
+        .role = .user,
+        .content = content,
+        .is_context_summary = true,
+        .content_collapsed = true,
+    });
+    try std.testing.expect(session.messages.items[0].content_collapsed);
+    session.toggleToolMessageCollapsed(0);
+    try std.testing.expect(!session.messages.items[0].content_collapsed);
+}
+
+test "applySummaryResult collapses pre-switch messages into one summary card" {
+    var session = try Session.initWithVision(std.testing.allocator, "T", "https://x", "k", "m", "chat_completions", "sp", "enabled", "low", "false", "false", "false");
+    defer session.deinit();
+    inline for (.{ "u1", "a1", "u2" }) |t| {
+        try session.messages.append(std.testing.allocator, .{
+            .role = .user,
+            .content = try std.testing.allocator.dupe(u8, t),
+        });
+    }
+    // boundary = 2 means: collapse the first 2 messages, preserve message[2..].
+    applySummaryResult(session, "SUMMARY", 2, "glm-5.2");
+    try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
+    try std.testing.expect(session.messages.items[0].is_context_summary);
+    try std.testing.expectEqual(Role.user, session.messages.items[0].role);
+    try std.testing.expect(std.mem.indexOf(u8, session.messages.items[0].content, "SUMMARY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.messages.items[0].content, "glm-5.2") != null);
+    try std.testing.expectEqualStrings("u2", session.messages.items[1].content);
+}
+
+test "applySummaryResult is a no-op when boundary exceeds message count" {
+    var session = try Session.initWithVision(std.testing.allocator, "T", "https://x", "k", "m", "chat_completions", "sp", "enabled", "low", "false", "false", "false");
+    defer session.deinit();
+    try session.messages.append(std.testing.allocator, .{ .role = .user, .content = try std.testing.allocator.dupe(u8, "only") });
+    applySummaryResult(session, "S", 5, "X"); // stale boundary (e.g. after /clear)
+    try std.testing.expectEqual(@as(usize, 1), session.messages.items.len);
+    try std.testing.expectEqualStrings("only", session.messages.items[0].content);
 }

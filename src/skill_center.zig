@@ -6,6 +6,7 @@
 //! sibling modules.
 const std = @import("std");
 const scan = @import("skill_scan.zig");
+const install = @import("skill_install.zig");
 
 /// Target software — a skills root under $HOME on the target machine. Both use
 /// the same SKILL.md directory format, so a library skill deploys to either.
@@ -22,10 +23,16 @@ pub const Software = enum {
 
 /// A deploy/import destination: a machine × a software root.
 pub const Target = struct {
-    machine_id: []u8, // owned: "local" or "ssh:<profile>"
+    machine_id: []u8, // owned: "local", "ssh:<profile>", or "wsl"
     machine_label: []u8, // owned display name
     software: Software,
     is_local: bool,
+    /// A WSL distro reached on the Windows host via `wsl.exe --exec sh -lc`.
+    /// Mutually exclusive with `is_local`/SSH: a WSL target is neither local nor
+    /// an SSH connection, so guards must check this before falling back to a
+    /// "needs an SSH connection" error. `dupe` defaults it false; `clone`
+    /// preserves it.
+    is_wsl: bool = false,
 
     pub fn dupe(
         allocator: std.mem.Allocator,
@@ -40,7 +47,16 @@ pub const Target = struct {
         return .{ .machine_id = id, .machine_label = label, .software = software, .is_local = is_local };
     }
     pub fn clone(self: Target, allocator: std.mem.Allocator) !Target {
-        return dupe(allocator, self.machine_id, self.machine_label, self.software, self.is_local);
+        var t = try dupe(allocator, self.machine_id, self.machine_label, self.software, self.is_local);
+        t.is_wsl = self.is_wsl;
+        return t;
+    }
+    /// True when reaching this target requires an SSH connection (i.e. it is a
+    /// remote SSH profile, not the local host and not a WSL distro). Centralizes
+    /// the picker/scan/transfer guards so a WSL target is never rejected for
+    /// "no connection".
+    pub fn requiresSshConn(self: Target) bool {
+        return !self.is_local and !self.is_wsl;
     }
     pub fn deinit(self: *Target, allocator: std.mem.Allocator) void {
         allocator.free(self.machine_id);
@@ -152,12 +168,89 @@ pub const ConfirmState = struct {
     }
 };
 
+/// Editable single-line URL buffer for the "install from GitHub" overlay.
+pub const UrlInputState = struct {
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    pub fn insertSlice(self: *UrlInputState, allocator: std.mem.Allocator, bytes: []const u8) void {
+        self.buf.appendSlice(allocator, bytes) catch {};
+    }
+    pub fn backspace(self: *UrlInputState) void {
+        if (self.buf.items.len > 0) self.buf.items.len -= 1;
+    }
+    pub fn text(self: *const UrlInputState) []const u8 {
+        return self.buf.items;
+    }
+    fn deinit(self: *UrlInputState, allocator: std.mem.Allocator) void {
+        self.buf.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Checklist of skills enumerated from a GitHub URL. Owns the resolved RepoRef
+/// (with its ref filled in) and the entry list; `checked` is parallel to
+/// `entries`. `sel` is the cursor row.
+pub const InstallPickState = struct {
+    repo: install.RepoRef,
+    entries: []install.SkillEntry,
+    checked: []bool,
+    sel: usize = 0,
+
+    pub fn toggle(self: *InstallPickState) void {
+        if (self.sel < self.checked.len) self.checked[self.sel] = !self.checked[self.sel];
+    }
+    pub fn setAll(self: *InstallPickState, value: bool) void {
+        for (self.checked) |*c| c.* = value;
+    }
+    pub fn anyChecked(self: *const InstallPickState) bool {
+        for (self.checked) |c| if (c) return true;
+        return false;
+    }
+    /// Owned clone of just the checked entries (caller frees via freeEntries).
+    pub fn selectedEntries(self: *const InstallPickState, allocator: std.mem.Allocator) ![]install.SkillEntry {
+        var out: std.ArrayListUnmanaged(install.SkillEntry) = .empty;
+        errdefer {
+            for (out.items) |*e| e.deinit(allocator);
+            out.deinit(allocator);
+        }
+        for (self.entries, 0..) |e, i| {
+            if (i < self.checked.len and self.checked[i]) try out.append(allocator, try e.clone(allocator));
+        }
+        return out.toOwnedSlice(allocator);
+    }
+    fn deinit(self: *InstallPickState, allocator: std.mem.Allocator) void {
+        self.repo.deinit(allocator);
+        install.freeEntries(allocator, self.entries);
+        allocator.free(self.checked);
+        self.* = undefined;
+    }
+};
+
+/// Scrollable in-panel preview of a skill's SKILL.md (the Skill Center is a
+/// non-terminal tab, so it can't host a split preview pane — it shows the text
+/// in this overlay instead). `scroll` is a wrapped-line offset; the renderer
+/// clamps it against the actual wrapped height each frame.
+pub const TextPreviewState = struct {
+    title: []u8, // owned
+    content: []u8, // owned
+    scroll: usize = 0,
+
+    fn deinit(self: *TextPreviewState, allocator: std.mem.Allocator) void {
+        allocator.free(self.title);
+        allocator.free(self.content);
+        self.* = undefined;
+    }
+};
+
 pub const Overlay = union(enum) {
     none,
     picker: PickerState,
     import_list: ImportState,
     confirm: ConfirmState,
     busy: []u8, // owned message
+    url_input: UrlInputState,
+    install_pick: InstallPickState,
+    text_preview: TextPreviewState,
 
     pub fn deinit(self: *Overlay, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -166,23 +259,13 @@ pub const Overlay = union(enum) {
             .import_list => |*i| i.deinit(allocator),
             .confirm => |*c| c.deinit(allocator),
             .busy => |m| allocator.free(m),
+            .text_preview => |*t| t.deinit(allocator),
+            .url_input => |*u| u.deinit(allocator),
+            .install_pick => |*p| p.deinit(allocator),
         }
         self.* = .none;
     }
 };
-
-/// Build a `cat '<path>'` command for an absolute path (the library skill's
-/// SKILL.md). Single-quote-escaped.
-pub fn catCommand(allocator: std.mem.Allocator, abs_path: []const u8) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "cat '");
-    for (abs_path) |c| {
-        if (c == '\'') try buf.appendSlice(allocator, "'\\''") else try buf.append(allocator, c);
-    }
-    try buf.append(allocator, '\'');
-    return buf.toOwnedSlice(allocator);
-}
 
 /// Panel state: the library list, selection, and the active overlay.
 pub const PanelModel = struct {
@@ -235,6 +318,34 @@ pub const PanelModel = struct {
         self.overlay.deinit(self.allocator);
     }
 
+    /// Open the scrollable SKILL.md preview overlay (owns copies of the strings).
+    pub fn openTextPreview(self: *PanelModel, title: []const u8, content: []const u8) !void {
+        const t = try self.allocator.dupe(u8, title);
+        errdefer self.allocator.free(t);
+        const c = try self.allocator.dupe(u8, content);
+        self.setOverlay(.{ .text_preview = .{ .title = t, .content = c } });
+    }
+
+    pub fn isTextPreview(self: *const PanelModel) bool {
+        return self.overlay == .text_preview;
+    }
+
+    /// Scroll the text preview by `delta` wrapped lines (saturating at 0; the
+    /// upper bound is clamped by the renderer against the wrapped height).
+    pub fn scrollTextPreview(self: *PanelModel, delta: isize) void {
+        switch (self.overlay) {
+            .text_preview => |*tp| {
+                if (delta < 0) {
+                    const d: usize = @intCast(-delta);
+                    tp.scroll = if (tp.scroll > d) tp.scroll - d else 0;
+                } else {
+                    tp.scroll +|= @intCast(delta);
+                }
+            },
+            else => {},
+        }
+    }
+
     pub fn deinit(self: *PanelModel) void {
         self.overlay.deinit(self.allocator);
         self.freeLibraryList();
@@ -263,6 +374,10 @@ pub const OpResult = union(enum) {
     transfer: struct { is_import: bool, ok: bool, err_summary: ?[]u8 },
     /// preview finished: show the fetched SKILL.md in the markdown preview panel.
     preview: struct { title: []u8, content: []u8 },
+    /// install-enumerate finished: show the checklist built from `entries`.
+    install_enumerate: struct { repo: install.RepoRef, entries: []install.SkillEntry, truncated: bool },
+    /// install-download finished: report counts via toast.
+    install_done: struct { installed: usize, overwritten: usize, failed: usize },
     /// generic failure before work could run (e.g. lost connection).
     failed,
 
@@ -285,6 +400,11 @@ pub const OpResult = union(enum) {
                 allocator.free(v.title);
                 allocator.free(v.content);
             },
+            .install_enumerate => |*v| {
+                v.repo.deinit(allocator);
+                install.freeEntries(allocator, v.entries);
+            },
+            .install_done => {},
             .failed => {},
         }
         self.* = .failed;
@@ -560,6 +680,54 @@ test "skill_center: overlay set/clear frees owned data (no leak)" {
     try std.testing.expect(m.overlay == .none);
 }
 
+test "skill_center: UrlInputState edits and frees" {
+    const a = std.testing.allocator;
+    var m = PanelModel.init(a);
+    defer m.deinit();
+    m.setOverlay(.{ .url_input = .{} });
+    switch (m.overlay) {
+        .url_input => |*u| {
+            u.insertSlice(a, "https://github.com/o/r");
+            u.backspace();
+            try std.testing.expectEqualStrings("https://github.com/o/", u.text());
+        },
+        else => return error.WrongOverlay,
+    }
+    // PanelModel.deinit frees the overlay buffer; testing allocator catches leaks.
+}
+
+test "skill_center: InstallPickState toggle/setAll/selectedEntries" {
+    const a = std.testing.allocator;
+    var repo = try install.parseGithubUrl(a, "https://github.com/o/r/tree/main/skills");
+    errdefer repo.deinit(a);
+    var entries = try a.alloc(install.SkillEntry, 2);
+    inline for (.{ "a", "b" }, 0..) |nm, i| {
+        var files = try a.alloc([]u8, 1);
+        files[0] = try std.fmt.allocPrint(a, "skills/{s}/SKILL.md", .{nm});
+        entries[i] = .{ .name = try a.dupe(u8, nm), .root_path = try std.fmt.allocPrint(a, "skills/{s}", .{nm}), .files = files };
+    }
+    const checked = try a.alloc(bool, 2);
+    checked[0] = false;
+    checked[1] = false;
+
+    var m = PanelModel.init(a);
+    defer m.deinit();
+    m.setOverlay(.{ .install_pick = .{ .repo = repo, .entries = entries, .checked = checked } });
+    switch (m.overlay) {
+        .install_pick => |*p| {
+            p.sel = 1;
+            p.toggle();
+            try std.testing.expect(p.anyChecked());
+            const sel = try p.selectedEntries(a);
+            defer install.freeEntries(a, sel);
+            try std.testing.expectEqual(@as(usize, 1), sel.len);
+            try std.testing.expectEqualStrings("b", sel[0].name);
+            p.setAll(true);
+        },
+        else => return error.WrongOverlay,
+    }
+}
+
 test "skill_center: libraryFromRows moves ownership" {
     const a = std.testing.allocator;
     const rows = try a.alloc(scan.SkillRow, 1);
@@ -571,11 +739,26 @@ test "skill_center: libraryFromRows moves ownership" {
     try std.testing.expectEqualStrings("h", lib[0].agg_hash.?);
 }
 
-test "skill_center: catCommand quotes an absolute path" {
+test "skill_center: text preview overlay opens, scrolls, and frees" {
     const a = std.testing.allocator;
-    const cmd = try catCommand(a, "/cfg/skills/pdf/SKILL.md");
-    defer a.free(cmd);
-    try std.testing.expectEqualStrings("cat '/cfg/skills/pdf/SKILL.md'", cmd);
+    var m = PanelModel.init(a);
+    defer m.deinit();
+
+    try m.openTextPreview("pdf-tools / SKILL.md", "line1\nline2\nline3\n");
+    try std.testing.expect(m.isTextPreview());
+    try std.testing.expectEqual(@as(usize, 0), m.overlay.text_preview.scroll);
+
+    m.scrollTextPreview(3);
+    try std.testing.expectEqual(@as(usize, 3), m.overlay.text_preview.scroll);
+    m.scrollTextPreview(-1);
+    try std.testing.expectEqual(@as(usize, 2), m.overlay.text_preview.scroll);
+    m.scrollTextPreview(-100); // saturates at 0
+    try std.testing.expectEqual(@as(usize, 0), m.overlay.text_preview.scroll);
+
+    // scrolling a non-preview overlay is a no-op (doesn't crash)
+    m.clearOverlay();
+    try std.testing.expect(!m.isTextPreview());
+    m.scrollTextPreview(5);
 }
 
 test "skill_center: Session.finishScan publishes then discards stale (no leak)" {
@@ -648,6 +831,34 @@ test "startOp rejects a second op while one is in flight" {
     session.op_done.store(true, .release);
 }
 
+test "Target.clone preserves the WSL discriminator" {
+    const a = std.testing.allocator;
+    var t = try Target.dupe(a, "wsl", "WSL", .claude, false);
+    t.is_wsl = true;
+    defer t.deinit(a);
+    var c = try t.clone(a);
+    defer c.deinit(a);
+    try std.testing.expect(c.is_wsl);
+    try std.testing.expectEqualStrings("wsl", c.machine_id);
+    try std.testing.expect(!c.is_local);
+}
+
+test "Target.requiresSshConn is true only for non-local non-WSL targets" {
+    const a = std.testing.allocator;
+    var local = try Target.dupe(a, "local", "Local", .claude, true);
+    defer local.deinit(a);
+    try std.testing.expect(!local.requiresSshConn());
+
+    var ssh = try Target.dupe(a, "ssh:web", "web", .codex, false);
+    defer ssh.deinit(a);
+    try std.testing.expect(ssh.requiresSshConn());
+
+    var wsl = try Target.dupe(a, "wsl", "WSL", .claude, false);
+    wsl.is_wsl = true;
+    defer wsl.deinit(a);
+    try std.testing.expect(!wsl.requiresSshConn());
+}
+
 test "importScanResult: unreachable source becomes failed (not an empty import list)" {
     const a = std.testing.allocator;
     var outcome = scan.ScanOutcome{ .reachable = false, .rows = &.{} };
@@ -689,4 +900,26 @@ test "OpResult.preview deinit frees title and content" {
     } };
     r.deinit(a); // must free both; testing allocator catches a leak
     try std.testing.expect(r == .failed); // deinit resets to .failed
+}
+
+test "skill_center: OpResult.install_enumerate deinit frees repo and entries" {
+    const a = std.testing.allocator;
+    var repo = try install.parseGithubUrl(a, "https://github.com/o/r/tree/main/skills");
+    errdefer repo.deinit(a);
+    var entries = try a.alloc(install.SkillEntry, 1);
+    {
+        var files = try a.alloc([]u8, 1);
+        files[0] = try a.dupe(u8, "skills/foo/SKILL.md");
+        entries[0] = .{ .name = try a.dupe(u8, "foo"), .root_path = try a.dupe(u8, "skills/foo"), .files = files };
+    }
+    var r: OpResult = .{ .install_enumerate = .{ .repo = repo, .entries = entries, .truncated = false } };
+    r.deinit(a); // testing allocator catches a leak
+    try std.testing.expect(r == .failed);
+}
+
+test "skill_center: OpResult.install_done deinit is a no-op" {
+    const a = std.testing.allocator;
+    var r: OpResult = .{ .install_done = .{ .installed = 3, .overwritten = 1, .failed = 0 } };
+    r.deinit(a);
+    try std.testing.expect(r == .failed);
 }

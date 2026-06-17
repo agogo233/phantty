@@ -126,6 +126,64 @@ pub threadlocal var g_dpi: u32 = platform_display.default_dpi;
 pub threadlocal var g_cjk_font_family: ?[]const u8 = null;
 pub threadlocal var g_fallback_font_families: ?[]const u8 = null;
 
+// The globals above must never alias config-owned memory: the config that
+// carries these strings is deinit'd right after a reload is applied, and the
+// globals are read lazily on the next fallback-face lookup. Set them only
+// through these setters, which copy into the thread's own buffers.
+threadlocal var g_cjk_font_family_buf: [256]u8 = undefined;
+threadlocal var g_fallback_font_families_buf: [1024]u8 = undefined;
+
+pub fn setCjkFontFamily(family: ?[]const u8) void {
+    const value = family orelse {
+        g_cjk_font_family = null;
+        return;
+    };
+    const n = @min(value.len, g_cjk_font_family_buf.len);
+    @memcpy(g_cjk_font_family_buf[0..n], value[0..n]);
+    g_cjk_font_family = g_cjk_font_family_buf[0..n];
+}
+
+pub fn setFallbackFontFamilies(csv: ?[]const u8) void {
+    const value = csv orelse {
+        g_fallback_font_families = null;
+        return;
+    };
+    const n = @min(value.len, g_fallback_font_families_buf.len);
+    @memcpy(g_fallback_font_families_buf[0..n], value[0..n]);
+    g_fallback_font_families = g_fallback_font_families_buf[0..n];
+}
+
+test "fallback family setters keep a private copy of config-owned strings" {
+    // Regression: config reload assigned cfg-owned slices directly to the
+    // globals, which dangled once the reloaded Config was deinit'd. The
+    // setters must copy, so clobbering the source must not change the values.
+    var src: [16]u8 = undefined;
+    @memcpy(src[0..6], "Sarasa");
+    setCjkFontFamily(src[0..6]);
+    @memset(&src, 'x');
+    try std.testing.expectEqualStrings("Sarasa", g_cjk_font_family.?);
+
+    @memcpy(src[0..8], "AA, B, C");
+    setFallbackFontFamilies(src[0..8]);
+    @memset(&src, 'y');
+    try std.testing.expectEqualStrings("AA, B, C", g_fallback_font_families.?);
+
+    setCjkFontFamily(null);
+    try std.testing.expect(g_cjk_font_family == null);
+    setFallbackFontFamilies(null);
+    try std.testing.expect(g_fallback_font_families == null);
+}
+
+test "fallback family setters truncate values longer than their buffers" {
+    const long = "x" ** 2000;
+    setCjkFontFamily(long);
+    try std.testing.expect(g_cjk_font_family.?.len < long.len);
+    setFallbackFontFamilies(long);
+    try std.testing.expect(g_fallback_font_families.?.len < long.len);
+    setCjkFontFamily(null);
+    setFallbackFontFamilies(null);
+}
+
 // HarfBuzz shaping state
 pub threadlocal var g_hb_buf: ?harfbuzz.Buffer = null;
 pub threadlocal var g_hb_font: ?harfbuzz.Font = null; // HB font for primary face
@@ -203,7 +261,7 @@ const MeasuredFaceMetrics = struct {
 
 fn glyphBitmapHeight(face: freetype.Face, codepoint: u32) ?f64 {
     const glyph_index = face.getCharIndex(codepoint) orelse return null;
-    face.loadGlyph(glyph_index, .{ .target = .normal }) catch return null;
+    face.loadGlyph(glyph_index, .{ .target = .normal, .no_autohint = true }) catch return null;
     face.renderGlyph(.normal) catch return null;
     return @floatFromInt(face.handle.*.glyph.*.bitmap.rows);
 }
@@ -215,7 +273,7 @@ fn measureAsciiHeight(face: freetype.Face) f64 {
 
     for (32..127) |cp| {
         const glyph_index = face.getCharIndex(@intCast(cp)) orelse continue;
-        face.loadGlyph(glyph_index, .{ .target = .normal }) catch continue;
+        face.loadGlyph(glyph_index, .{ .target = .normal, .no_autohint = true }) catch continue;
         face.renderGlyph(.normal) catch continue;
 
         const glyph = face.handle.*.glyph;
@@ -307,7 +365,7 @@ fn measureFaceMetrics(face: freetype.Face) MeasuredFaceMetrics {
     var max_advance: f64 = 0;
     for (32..127) |cp| {
         const glyph_index = face.getCharIndex(@intCast(cp)) orelse continue;
-        face.loadGlyph(glyph_index, .{ .target = .normal }) catch continue;
+        face.loadGlyph(glyph_index, .{ .target = .normal, .no_autohint = true }) catch continue;
         const advance = f26dot6ToF64(face.handle.*.glyph.*.advance.x);
         max_advance = @max(max_advance, advance);
     }
@@ -320,7 +378,7 @@ fn measureFaceMetrics(face: freetype.Face) MeasuredFaceMetrics {
     };
     const ic_width = blk: {
         const glyph_index = face.getCharIndex(0x6C34) orelse break :blk @min(ascii_height, 2.0 * max_advance);
-        face.loadGlyph(glyph_index, .{ .target = .normal }) catch break :blk @min(ascii_height, 2.0 * max_advance);
+        face.loadGlyph(glyph_index, .{ .target = .normal, .no_autohint = true }) catch break :blk @min(ascii_height, 2.0 * max_advance);
         break :blk f26dot6ToF64(face.handle.*.glyph.*.advance.x);
     };
 
@@ -776,6 +834,7 @@ pub fn loadGlyph(codepoint: u32) ?Character {
     face_to_use.loadGlyph(@intCast(glyph_index), .{
         .target = target,
         .color = is_color_face,
+        .no_autohint = true,
     }) catch return null;
     face_to_use.renderGlyph(if (isCjkCodepoint(codepoint)) .normal else .light) catch return null;
 
@@ -969,6 +1028,7 @@ pub fn loadGraphemeGlyph(base_cp: u21, extra_cps: []const u21) ?Character {
     face_to_use.loadGlyph(@intCast(shaped_glyph_index), .{
         .target = target,
         .color = is_color_face,
+        .no_autohint = true,
     }) catch return null;
     face_to_use.renderGlyph(if (isCjkCodepoint(@intCast(base_cp))) .normal else .light) catch return null;
 
@@ -1112,7 +1172,7 @@ pub fn loadTitlebarGlyph(codepoint: u32) ?Character {
     }
 
     const target = glyphTargetForCodepoint(codepoint);
-    face_to_use.loadGlyph(@intCast(glyph_index), .{ .target = target }) catch return null;
+    face_to_use.loadGlyph(@intCast(glyph_index), .{ .target = target, .no_autohint = true }) catch return null;
     face_to_use.renderGlyph(if (isCjkCodepoint(codepoint)) .normal else .light) catch return null;
 
     const glyph = face_to_use.handle.*.glyph;
@@ -1150,8 +1210,9 @@ pub fn loadIconGlyph(codepoint: u32) ?Character {
     const glyph_index = face.getCharIndex(codepoint) orelse return null;
     if (glyph_index == 0) return null;
 
-    // Use mono hinting for crisp icon rendering (snaps to pixel grid)
-    face.loadGlyph(@intCast(glyph_index), .{ .target = .normal }) catch return null;
+    // Native (non-autofit) hinting for the icon font. no_autohint avoids the
+    // FreeType autofitter, which faults (af_*_metrics_init) on macOS x86_64.
+    face.loadGlyph(@intCast(glyph_index), .{ .target = .normal, .no_autohint = true }) catch return null;
     face.renderGlyph(.normal) catch return null;
 
     const glyph = face.handle.*.glyph;
@@ -1214,7 +1275,7 @@ pub fn loadBellEmoji() ?BellCache {
     const glyph_index = face.getCharIndex(bell_cp) orelse return null;
     if (glyph_index == 0) return null;
 
-    face.loadGlyph(@intCast(glyph_index), .{ .target = .light, .color = true }) catch return null;
+    face.loadGlyph(@intCast(glyph_index), .{ .target = .light, .color = true, .no_autohint = true }) catch return null;
     face.renderGlyph(.light) catch return null;
 
     const glyph = face.handle.*.glyph;

@@ -11,6 +11,34 @@
 以及下文所述的自动端口转发。在本地 shell 里敲 `ssh user@host` **得不到**这些功能 ——
 见 [[文件浏览器与预览|File-Explorer-zh]]。
 
+## 认证方式
+
+在会话启动器里保存或编辑 SSH profile 时，**认证方式**字段决定它如何认证 —— 可设为
+`password`、`key` 或 `credentials`：
+
+- `password` —— 把密码随 profile 一起保存（此前的行为）。
+- `key` —— 用私钥认证。在**密钥文件**字段填入私钥路径，WispTerm 会以 `ssh -i <路径>`
+  传入。
+- `credentials` —— 什么都不保存，交给你已有的 SSH 配置来认证：OpenSSH 配置
+  （`~/.ssh/config`）、默认密钥、`ssh-agent`，或平台凭据助手。
+
+已有的密码 profile 保持不变；通过 **Load OpenSSH Config** 导入的 profile 默认使用
+`credentials`，从而复用你的密钥和 agent。Copilot 的 `ssh_profile_save` 工具也接受同样的
+`auth_method` 和 `identity_file` 选项。
+
+## 用 tmux 保持会话不掉（`tmux -CC`）
+
+如果远程主机装了 `tmux`，可以通过 tmux 控制模式连接，让会话在**关闭 App 或网络掉线后依然存活**。
+打开会话启动器（`Ctrl+Shift+T`），选择 **Connect with tmux (keep alive)**，再选用与普通 SSH
+会话相同的 SSH profile —— 无需在 profile 里单独设置，同一台服务器仍可作为普通 SSH 会话打开。
+
+WispTerm 本身就是 tmux 客户端，所以看不到 tmux 状态栏或前缀键：远程 tmux 的**窗口变成标签页**、
+**窗格变成原生分屏**。分屏、关闭窗格、新建标签都会驱动服务器上的 tmux，且每个窗格各自保留自己的
+工作目录、文件预览和 agent 状态圆点。
+
+由于会话存活在服务器上，你可以退出 WispTerm（或断网），之后通过同一个 tmux 入口**重新连接**，
+回到离开时的状态。只有服务器需要装 tmux —— 本地无需任何安装。
+
 ## 上报工作目录（OSC 7）
 
 SSH profile 会话中的拖拽上传，会在 shell 用 OSC 7 上报时使用当前远程工作目录（与
