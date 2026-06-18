@@ -76,6 +76,43 @@ Copilot 头部的模型标签。
 WispTerm 会让新模型在后台总结此前对话，并把交接内容显示为可折叠的 **Conversation
 summary / 上文摘要** 卡片；如果摘要失败，则保留完整原始历史。
 
+## 怎么生成诊断报告？
+
+Windows 发布包已经内置 `wispterm-diagnostics` skill。正常反馈问题时，打开 WispTerm
+的 AI Chat 标签或 Copilot 侧栏，让这个内置 skill 收集环境、分析问题，并生成可直接贴到
+GitHub issue 的 Markdown：
+
+如果没有这个 skill，或版本较旧，可以先打开 **Skill Center** 从 GitHub 下载/更新最新技能。
+
+```text
+$wispterm-diagnostics
+Problem type: ssh-disconnect
+Symptom: SSH Profile 空闲 5-10 分钟后断开，显示 "Connection reset"。
+Repro steps: 连接保存的 SSH profile，空闲等待，然后运行 ls。
+What I already tried: 外部 ssh.exe 加 ServerAliveInterval 后不断。
+```
+
+如果问题类型明确，请在提示里写上更具体的 problem type：
+
+- `ssh-image-preview`：SSH 图片预览失败，但 Markdown/文本预览正常。
+- `html-preview`：本地、WSL 或 SSH 环境里的 `.html` 预览 / 浏览器面板失败。
+- `ssh-disconnect`：SSH 掉线，并出现 `ssh_packet_write_poll`、`eother`
+  或空闲后的 `Connection reset` 等错误。
+- `startup/crash`、`rendering/DPI`、`high-cpu`、`keyboard/input`、
+  `selection/copy/scrolling`、`SSH/SCP`、`file explorer`、
+  `WebView2/browser panel`、`updater` 或 `remote console`。
+
+skill 会输出 Markdown 报告，包含 WispTerm 版本、发布包文件、Windows/OpenSSH/WebView2/GPU
+信息、脱敏后的配置、相关日志、你的现象/复现步骤和针对该问题的下一步排查建议。公开发布前
+请先检查内容；不要在公开 issue 中包含密码、私钥、token 或 crash dump。
+
+兜底方式：如果 WispTerm 无法启动，或 AI Agent 不可用，再从已解压/安装的 WispTerm
+目录手动运行诊断脚本。该目录需要包含 `plugins\skills\wispterm-diagnostics`：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\plugins\skills\wispterm-diagnostics\scripts\collect_wispterm_diagnostics.ps1 -ProblemType "other"
+```
+
 ## 怎么反馈崩溃或卡死？（Windows 调试版本）
 
 每个 Windows 版本在 [Releases](https://github.com/xuzhougeng/wispterm/releases) 页面都会附带一个

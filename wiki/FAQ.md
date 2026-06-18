@@ -98,6 +98,48 @@ summarize the prior transcript in the background and shows that handoff as a
 collapsible **Conversation summary** card; if the summary fails, the full raw
 history stays available.
 
+## How do I generate a diagnostic report?
+
+Windows release packages include the `wispterm-diagnostics` skill. For normal
+bug reports, open a WispTerm AI Chat tab or Copilot sidebar and ask the bundled
+skill to collect the environment, analyze the issue, and draft a GitHub issue
+body:
+
+If the skill is missing or outdated, open **Skill Center** and download/update
+the latest skills from GitHub first.
+
+```text
+$wispterm-diagnostics
+Problem type: ssh-disconnect
+Symptom: SSH Profile disconnects after 5-10 minutes idle with "Connection reset".
+Repro steps: connect to the saved SSH profile, leave it idle, then run ls.
+What I already tried: external ssh.exe with ServerAliveInterval works.
+```
+
+Use a more specific problem type when it matches your issue:
+
+- `ssh-image-preview` — SSH image preview fails while Markdown/text preview works.
+- `html-preview` — local/WSL/SSH `.html` preview or the browser panel fails.
+- `ssh-disconnect` — SSH drops with errors such as `ssh_packet_write_poll`,
+  `eother`, or idle-time `Connection reset`.
+- `startup/crash`, `rendering/DPI`, `high-cpu`, `keyboard/input`,
+  `selection/copy/scrolling`, `SSH/SCP`, `file explorer`,
+  `WebView2/browser panel`, `updater`, or `remote console`.
+
+The skill generates a Markdown report with WispTerm version, package files,
+Windows/OpenSSH/WebView2/GPU details, sanitized config, relevant logs, your
+symptom/repro steps, and issue-specific next steps. Paste that Markdown into the
+GitHub issue after reviewing it; do not include passwords, private keys, tokens,
+or crash dumps in a public issue.
+
+Fallback: if WispTerm cannot start, or the AI Agent is unavailable, run the
+collector manually from the installed/extracted WispTerm folder that contains
+`plugins\skills\wispterm-diagnostics`:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\plugins\skills\wispterm-diagnostics\scripts\collect_wispterm_diagnostics.ps1 -ProblemType "other"
+```
+
 ## How do I report a crash or freeze? (Windows debug build)
 
 Every Windows release also ships a **`wispterm-windows-debug-<version>.zip`** on
