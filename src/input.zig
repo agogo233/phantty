@@ -54,6 +54,7 @@ const clipboard = @import("input/clipboard.zig");
 const click_tracker = @import("input/click_tracker.zig");
 const hit_test = @import("input/hit_test.zig");
 const preview_source = @import("input/preview_source.zig");
+const preview_diagnostics = @import("preview_diagnostics.zig");
 const ls_path_context = @import("input/ls_path_context.zig");
 const terminal_link_action = @import("input/terminal_link_action.zig");
 const underline_span = @import("input/underline_span.zig");
@@ -710,12 +711,19 @@ threadlocal var g_scrollbar_drag_top_pad: f32 = 0;
 threadlocal var g_ai_input_scroll_dragging: bool = false;
 threadlocal var g_ai_input_scroll_chat: ?*AppWindow.ai_chat.Session = null;
 threadlocal var g_ai_input_scroll_drag_offset: f32 = 0;
+const AiTranscriptPanel = enum {
+    active_chat,
+    copilot_sidebar,
+};
+const AiTranscriptPanelGeometry = ai_sidebar.PanelGeometry;
 threadlocal var g_ai_transcript_scroll_dragging: bool = false;
 threadlocal var g_ai_transcript_scroll_chat: ?*AppWindow.ai_chat.Session = null;
 threadlocal var g_ai_transcript_scroll_drag_offset: f32 = 0;
+threadlocal var g_ai_transcript_scroll_panel: AiTranscriptPanel = .active_chat;
 threadlocal var g_ai_transcript_selecting: bool = false;
 threadlocal var g_ai_transcript_select_chat: ?*AppWindow.ai_chat.Session = null;
 threadlocal var g_ai_transcript_select_auto_copy: bool = false;
+threadlocal var g_ai_transcript_select_panel: AiTranscriptPanel = .active_chat;
 threadlocal var g_port_forwarding_suppress_command_char: ?u21 = null;
 threadlocal var g_skill_center_suppress_command_char: ?u21 = null;
 pub threadlocal var g_sidebar_resize_hover: bool = false; // Mouse is over the sidebar resize edge
@@ -866,9 +874,11 @@ pub fn cancelTransientMouseState(win: anytype) void {
     g_ai_transcript_scroll_chat = null;
     AppWindow.ai_chat_renderer.g_transcript_scrollbar_dragging = false;
     AppWindow.ai_chat_renderer.g_transcript_scrollbar_hover = false;
+    g_ai_transcript_scroll_panel = .active_chat;
     g_ai_transcript_selecting = false;
     g_ai_transcript_select_chat = null;
     g_ai_transcript_select_auto_copy = false;
+    g_ai_transcript_select_panel = .active_chat;
     window_backend.clearTransientInput(win);
 }
 
@@ -1655,8 +1665,51 @@ fn logicalKeyFromCode(key_code: platform_input.KeyCode) input_key.Key {
     };
 }
 
+fn aiTranscriptPanelGeometryForBounds(window_width: i32, window_height: i32, bounds: ai_sidebar.Bounds) AiTranscriptPanelGeometry {
+    return ai_sidebar.panelGeometryForBounds(window_width, window_height, bounds);
+}
+
+fn aiTranscriptPanelGeometry(panel: AiTranscriptPanel) ?AiTranscriptPanelGeometry {
+    const win = AppWindow.g_window orelse return null;
+    const fb = window_backend.framebufferSize(win);
+    return switch (panel) {
+        .active_chat => .{
+            .window_width = @floatFromInt(fb.width),
+            .window_height = @floatFromInt(fb.height),
+            .chat_x = AppWindow.leftPanelsWidth(),
+            .chat_w = @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
+        },
+        .copilot_sidebar => blk: {
+            if (!AppWindow.aiCopilotVisible()) return null;
+            const bounds = ai_sidebar.boundsForWindow(
+                @intCast(fb.width),
+                @intCast(fb.height),
+                @floatCast(titlebarHeight()),
+                AppWindow.leftPanelsWidth(),
+                0,
+            );
+            break :blk aiTranscriptPanelGeometryForBounds(@intCast(fb.width), @intCast(fb.height), bounds);
+        },
+    };
+}
+
 test "input: logical key mapping includes session launcher H mnemonic" {
     try std.testing.expectEqual(input_key.Key.key_h, logicalKeyFromCode(0x48));
+}
+
+test "input: copilot transcript panel geometry uses sidebar bounds" {
+    const bounds = ai_sidebar.Bounds{
+        .left = 1120,
+        .top = 30,
+        .right = 1600,
+        .bottom = 900,
+    };
+    const geometry = aiTranscriptPanelGeometryForBounds(1600, 900, bounds);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1600), geometry.window_width, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 900), geometry.window_height, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1120), geometry.chat_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 480), geometry.chat_w, 0.001);
 }
 
 fn actionIs(action: ?keybind.Action, expected: keybind.Action) bool {
@@ -3510,7 +3563,17 @@ fn openUrl(surface: *Surface, url: []const u8) bool {
     defer allocator.free(target);
 
     const handle = AppWindow.currentNativeHandle();
-    switch (link_open.destinationForUrlClick(browser_panel.embeddedBrowserAvailable(), g_url_open_mode)) {
+    const embedded_available = browser_panel.embeddedBrowserAvailable();
+    const destination = link_open.destinationForUrlClick(embedded_available, g_url_open_mode);
+    preview_diagnostics.debug("url", &.{
+        .{ .key = "stage", .value = "open" },
+        .{ .key = "launch", .value = @tagName(surface.launch_kind) },
+        .{ .key = "mode", .value = @tagName(g_url_open_mode) },
+        .{ .key = "embedded_available", .value = if (embedded_available) "true" else "false" },
+        .{ .key = "destination", .value = @tagName(destination) },
+        .{ .key = "target", .value = target },
+    });
+    switch (destination) {
         .embedded_browser => {
             if (!browser_panel.openForSurface(allocator, handle, target, surface)) return false;
             if (AppWindow.g_window) |win| {
@@ -3523,6 +3586,11 @@ fn openUrl(surface: *Surface, url: []const u8) bool {
         .system_browser => {
             const external_target = browser_panel.externalUrlForSurface(allocator, target, surface) orelse return false;
             defer allocator.free(external_target);
+            preview_diagnostics.debug("url", &.{
+                .{ .key = "stage", .value = "system-browser" },
+                .{ .key = "target", .value = target },
+                .{ .key = "external", .value = external_target },
+            });
             return platform_open_url.open(allocator, .{ .url = external_target });
         },
     }
@@ -3547,10 +3615,21 @@ fn openHtmlPanelForCell(surface: *Surface, cell_pos: CellPos) bool {
 
     var ls_prefix_buf: [256]u8 = undefined;
     const ls_prefix = lsPrefixForCell(surface, cell_pos, &ls_prefix_buf);
+    preview_diagnostics.debug("html", &.{
+        .{ .key = "stage", .value = "click" },
+        .{ .key = "launch", .value = @tagName(surface.launch_kind) },
+        .{ .key = "path", .value = path },
+        .{ .key = "ls_prefix", .value = ls_prefix orelse "" },
+    });
 
     switch (html_server.openForSurface(allocator, surface, path, ls_prefix)) {
         .url => |url| {
             defer allocator.free(url);
+            preview_diagnostics.debug("html", &.{
+                .{ .key = "stage", .value = "open-browser" },
+                .{ .key = "path", .value = path },
+                .{ .key = "url", .value = url },
+            });
             const parent = AppWindow.currentNativeHandle();
             browser_panel.open(parent, url);
             if (AppWindow.g_window) |win| syncPanelGridFromWindow(win);
@@ -3559,6 +3638,11 @@ fn openHtmlPanelForCell(surface: *Surface, cell_pos: CellPos) bool {
             return true;
         },
         .err => |err| {
+            preview_diagnostics.debug("html", &.{
+                .{ .key = "stage", .value = "failed" },
+                .{ .key = "path", .value = path },
+                .{ .key = "err", .value = @errorName(err) },
+            });
             file_explorer.setTransferStatus(.failed, switch (err) {
                 error.CwdUnavailable => "HTML cwd unknown",
                 error.ServerUnavailable => "Install Python 3 in this environment",
@@ -3734,16 +3818,43 @@ fn openPreviewPanelForCell(surface: *Surface, cell_pos: CellPos, shift: bool) bo
     const ls_prefix = lsPrefixForCell(surface, cell_pos, &ls_prefix_buf);
 
     if (markdown_preview.detectKind(path)) |kind| {
-        const resolved_path = resolveTerminalPreviewPath(allocator, surface, path, ls_prefix) catch {
+        preview_diagnostics.debug("preview", &.{
+            .{ .key = "stage", .value = "click" },
+            .{ .key = "launch", .value = @tagName(surface.launch_kind) },
+            .{ .key = "kind", .value = @tagName(kind) },
+            .{ .key = "path", .value = path },
+            .{ .key = "ls_prefix", .value = ls_prefix orelse "" },
+        });
+        const resolved_path = resolveTerminalPreviewPath(allocator, surface, path, ls_prefix) catch |err| {
+            preview_diagnostics.debug("preview", &.{
+                .{ .key = "stage", .value = "resolve-failed" },
+                .{ .key = "kind", .value = @tagName(kind) },
+                .{ .key = "path", .value = path },
+                .{ .key = "err", .value = @errorName(err) },
+            });
             file_explorer.setTransferStatus(.failed, "Preview failed");
             return true;
         };
         defer allocator.free(resolved_path);
 
         const source_kind = terminalPreviewSourceKind(surface) orelse {
+            preview_diagnostics.debug("preview", &.{
+                .{ .key = "stage", .value = "source-kind-failed" },
+                .{ .key = "kind", .value = @tagName(kind) },
+                .{ .key = "path", .value = path },
+                .{ .key = "resolved", .value = resolved_path },
+            });
             file_explorer.setTransferStatus(.failed, "Preview failed");
             return true;
         };
+        preview_diagnostics.debug("preview", &.{
+            .{ .key = "stage", .value = "open-pane" },
+            .{ .key = "kind", .value = @tagName(kind) },
+            .{ .key = "path", .value = path },
+            .{ .key = "resolved", .value = resolved_path },
+            .{ .key = "source", .value = previewSourceKindName(source_kind) },
+            .{ .key = "new_pane", .value = if (shift) "true" else "false" },
+        });
 
         if (shift) {
             return openPreviewNew(kind, basenameForPreview(path), resolved_path, source_kind, false);
@@ -3758,6 +3869,14 @@ fn openPreviewPanelForCell(surface: *Surface, cell_pos: CellPos, shift: bool) bo
     const preview_surface = AppWindow.splitFocusedReturningSurface(.right) orelse return false;
     writeTextToSurfacePty(preview_surface, command);
     return true;
+}
+
+fn previewSourceKindName(kind: markdown_preview_panel.PreviewSourceKind) []const u8 {
+    return switch (kind) {
+        .local => "local",
+        .wsl => "wsl",
+        .remote => "ssh",
+    };
 }
 
 fn buildRemotePathKindCommand(buf: []u8, remote_path: []const u8) ?[]const u8 {
@@ -4221,10 +4340,9 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             // a click inside its rect focuses the copilot and routes one-shot
             // interactions (stop / missing-api-key / message toggle / copy /
             // permission chip). A click outside the panel blurs the copilot and
-            // falls through to normal terminal handling. Drag-based interactions
-            // (transcript text selection, scrollbar drags) are intentionally not
-            // wired here: their continue-handlers recompute the full-tab rect and
-            // would mis-track against the narrower sidebar rect.
+            // falls through to normal terminal handling. Transcript selection
+            // and scrollbar drags record that they started in the sidebar, so
+            // their continue-handlers keep using the narrower panel geometry.
             if (AppWindow.aiCopilotVisible()) {
                 if (AppWindow.activeCopilotSessionForInput()) |chat| {
                     const win = AppWindow.g_window orelse return;
@@ -4294,6 +4412,11 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                                     AppWindow.g_force_rebuild = true;
                                     AppWindow.g_cells_valid = false;
                                 },
+                                .question_option => |idx| {
+                                    _ = chat.resolveQuestionOption(idx);
+                                    AppWindow.g_force_rebuild = true;
+                                    AppWindow.g_cells_valid = false;
+                                },
                             }
                             return;
                         }
@@ -4321,6 +4444,48 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                         )) {
                             toggleAiAgentPermission();
                             return;
+                        }
+                        if (AppWindow.ai_chat_renderer.transcriptScrollbarHitTest(
+                            chat,
+                            xpos,
+                            ypos,
+                            @floatFromInt(fb.width),
+                            @floatFromInt(fb.height),
+                            @floatCast(titlebarHeight()),
+                            chat_x,
+                            chat_w,
+                        )) |drag_offset| {
+                            g_ai_transcript_scroll_dragging = true;
+                            g_ai_transcript_scroll_chat = chat;
+                            g_ai_transcript_scroll_drag_offset = drag_offset;
+                            g_ai_transcript_scroll_panel = .copilot_sidebar;
+                            AppWindow.ai_chat_renderer.g_transcript_scrollbar_dragging = true;
+                            applyAiTranscriptScrollbarDrag(chat, ypos);
+                            AppWindow.g_force_rebuild = true;
+                            AppWindow.g_cells_valid = false;
+                            return;
+                        }
+                        if (!ev.ctrl and !ev.alt) {
+                            if (AppWindow.ai_chat_renderer.transcriptTextHitTest(
+                                chat,
+                                xpos,
+                                ypos,
+                                @floatFromInt(fb.width),
+                                @floatFromInt(fb.height),
+                                @floatCast(titlebarHeight()),
+                                chat_x,
+                                chat_w,
+                            )) |hit| {
+                                chat.beginTranscriptSelection(hit.message_index, hit.byte_offset);
+                                g_ai_transcript_selecting = true;
+                                g_ai_transcript_select_chat = chat;
+                                g_ai_transcript_select_auto_copy = ev.shift;
+                                g_ai_transcript_select_panel = .copilot_sidebar;
+                                platform_cursor.set(.ibeam);
+                                AppWindow.g_force_rebuild = true;
+                                AppWindow.g_cells_valid = false;
+                                return;
+                            }
                         }
                         // Click landed in the panel but not on an interactive
                         // element: keep focus, clear any selection, consume it.
@@ -4387,6 +4552,11 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                             AppWindow.g_force_rebuild = true;
                             AppWindow.g_cells_valid = false;
                         },
+                        .question_option => |idx| {
+                            _ = chat.resolveQuestionOption(idx);
+                            AppWindow.g_force_rebuild = true;
+                            AppWindow.g_cells_valid = false;
+                        },
                     }
                     return;
                 }
@@ -4428,6 +4598,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     g_ai_transcript_scroll_dragging = true;
                     g_ai_transcript_scroll_chat = chat;
                     g_ai_transcript_scroll_drag_offset = drag_offset;
+                    g_ai_transcript_scroll_panel = .active_chat;
                     AppWindow.ai_chat_renderer.g_transcript_scrollbar_dragging = true;
                     applyAiTranscriptScrollbarDrag(chat, ypos);
                     AppWindow.g_force_rebuild = true;
@@ -4449,6 +4620,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                         g_ai_transcript_selecting = true;
                         g_ai_transcript_select_chat = chat;
                         g_ai_transcript_select_auto_copy = ev.shift;
+                        g_ai_transcript_select_panel = .active_chat;
                         platform_cursor.set(.ibeam);
                         AppWindow.g_force_rebuild = true;
                         AppWindow.g_cells_valid = false;
@@ -4577,6 +4749,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             g_ai_input_scroll_chat = null;
             g_ai_transcript_scroll_dragging = false;
             g_ai_transcript_scroll_chat = null;
+            g_ai_transcript_scroll_panel = .active_chat;
             AppWindow.ai_chat_renderer.g_transcript_scrollbar_dragging = false;
             if (g_ai_transcript_selecting) {
                 if (g_ai_transcript_select_chat) |chat| {
@@ -4585,6 +4758,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                 g_ai_transcript_selecting = false;
                 g_ai_transcript_select_chat = null;
                 g_ai_transcript_select_auto_copy = false;
+                g_ai_transcript_select_panel = .active_chat;
                 AppWindow.g_force_rebuild = true;
                 AppWindow.g_cells_valid = false;
                 platform_cursor.set(.arrow);
@@ -4788,16 +4962,15 @@ fn applyAiInputScrollbarDrag(chat: *AppWindow.ai_chat.Session, ypos: f64) void {
 }
 
 fn applyAiTranscriptScrollbarDrag(chat: *AppWindow.ai_chat.Session, ypos: f64) void {
-    const win = AppWindow.g_window orelse return;
-    const size = clientSize(win);
+    const geometry = aiTranscriptPanelGeometry(g_ai_transcript_scroll_panel) orelse return;
     if (AppWindow.ai_chat_renderer.transcriptScrollbarScrollPxAt(
         chat,
         ypos,
-        @floatFromInt(size.width),
-        @floatFromInt(size.height),
+        geometry.window_width,
+        geometry.window_height,
         @floatCast(titlebarHeight()),
-        AppWindow.leftPanelsWidth(),
-        @as(f32, @floatFromInt(size.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(size.width),
+        geometry.chat_x,
+        geometry.chat_w,
         g_ai_transcript_scroll_drag_offset,
     )) |px| {
         chat.scrollToPx(px);
@@ -4807,17 +4980,16 @@ fn applyAiTranscriptScrollbarDrag(chat: *AppWindow.ai_chat.Session, ypos: f64) v
 }
 
 fn updateAiTranscriptSelectionDrag(chat: *AppWindow.ai_chat.Session, xpos: f64, ypos: f64) void {
-    const win = AppWindow.g_window orelse return;
-    const fb = window_backend.framebufferSize(win);
+    const geometry = aiTranscriptPanelGeometry(g_ai_transcript_select_panel) orelse return;
     if (AppWindow.ai_chat_renderer.transcriptTextHitTest(
         chat,
         xpos,
         ypos,
-        @floatFromInt(fb.width),
-        @floatFromInt(fb.height),
+        geometry.window_width,
+        geometry.window_height,
         @floatCast(titlebarHeight()),
-        AppWindow.leftPanelsWidth(),
-        @as(f32, @floatFromInt(fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(fb.width),
+        geometry.chat_x,
+        geometry.chat_w,
     )) |hit| {
         chat.updateTranscriptSelection(hit.message_index, hit.byte_offset);
         AppWindow.g_force_rebuild = true;

@@ -76,6 +76,7 @@ test {
     _ = @import("png_dimensions.zig");
     _ = @import("pdf_preview.zig");
     _ = @import("preview_gallery.zig");
+    _ = @import("preview_diagnostics.zig");
     _ = @import("file_backend.zig");
     _ = @import("file_explorer.zig");
     _ = @import("i18n.zig");
@@ -83,6 +84,7 @@ test {
     _ = @import("ai_chat_composer_layout.zig");
     _ = @import("ai_chat_input_text.zig");
     _ = @import("ai_chat_composer.zig");
+    _ = @import("composer_detail_wrap.zig");
     _ = @import("web_search.zig");
     _ = @import("agent_prompt_answer.zig");
     _ = @import("web_read.zig");
@@ -141,6 +143,7 @@ test {
     _ = @import("weixin/media.zig");
     _ = @import("weixin/binding.zig");
     _ = @import("weixin/approval_reply.zig");
+    _ = @import("weixin/question_reply.zig");
     _ = @import("ai_chat_title.zig");
     _ = @import("ai_model_switch.zig");
     _ = @import("command_registry.zig");

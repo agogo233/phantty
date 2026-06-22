@@ -79,6 +79,28 @@ on that machine — both the lag and the black screen disappear. Running on a
 discrete or external GPU avoids the slow path entirely. To opt out manually
 at any time, set `wispterm-d3d-present = false`.
 
+## What Should I Do If the First Launch Opens a Black Window?
+
+On weak integrated-GPU machines, the first launch after installing or upgrading
+can still hit the DXGI bring-up path before WispTerm has learned that the
+machine needs the GDI fallback. Close all WispTerm windows and start it again;
+the next launch should use the recorded fallback path.
+
+If it still opens black, disable the DXGI presenter manually. Create or edit
+`%APPDATA%\wispterm\config` and add:
+
+```conf
+wispterm-d3d-present = false
+```
+
+If WispTerm cannot stay open long enough to use `Ctrl+,`, run this from
+PowerShell and then reopen WispTerm:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:APPDATA\wispterm" | Out-Null
+Add-Content -Path "$env:APPDATA\wispterm\config" -Value "wispterm-d3d-present = false"
+```
+
 ## Why Does WispTerm Remote Mirror the Local Terminal Size on Phones?
 
 WispTerm Remote mirrors the local WispTerm window because the desktop app is the
@@ -192,3 +214,10 @@ it crashes). To help diagnose a hard-to-reproduce issue — for example a crash
 when opening the WeChat connection, or a freeze when Ctrl+clicking a remote
 file — download it, reproduce the problem, then attach `wispterm-debug.log` (and
 any `crash-*.txt`) to your report.
+
+For Ctrl+click preview/browser issues, the debug log also includes copyable
+single-line records that begin with `preview-diagnostic`. After reproducing the
+problem, paste the nearby `preview-diagnostic` lines into the issue if the full
+log is too large. They cover preview path resolution, async file reads, image
+decode, HTML server startup, SSH browser tunnels, URL routing, and the embedded
+browser panel.

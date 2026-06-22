@@ -8,6 +8,7 @@ const i18n = @import("../i18n.zig");
 const composer_layout = @import("../ai_chat_composer_layout.zig");
 const scrollbar_model = @import("../ai_chat_scrollbar_model.zig");
 const md = @import("../markdown_text.zig");
+const detail_wrap = @import("../composer_detail_wrap.zig");
 
 // Transcript scrollbar interaction state (one mouse). Set by input.zig,
 // read by the fade computation in renderTranscriptScrollbar.
@@ -62,13 +63,26 @@ const SUGGESTION_MAX_W: f32 = 1120;
 const SUGGESTION_COMMAND_W: f32 = 420;
 const SUGGESTION_PAD_X: f32 = 18;
 const SUGGESTION_COLUMN_GAP: f32 = 34;
+// Vertical padding around the divider that separates the suggestion list from
+// the selected item's full-description detail panel.
+const SUGGESTION_DETAIL_GAP: f32 = 8;
+// Gap kept between the top of the suggestion popup and the chat header bar, so a
+// long skill/tool list caps its row count instead of growing under the header.
+const SUGGESTION_TOP_GAP: f32 = 8;
 const MISSING_API_KEY_ACTION_TEXT = "Missing API key. Click to configure";
 
 pub const HitTarget = union(enum) {
     copy_message: usize,
     toggle_tool: usize,
     toggle_reasoning: usize,
+    /// Click on the Nth (zero-based) visible option of a pending ask_user card.
+    question_option: usize,
 };
+
+/// Visible option rows in the question card before it scrolls. Beyond this, the
+/// extra options are still answerable by typing the option number in the
+/// composer (consistent with the WeChat digit reply).
+const MAX_VISIBLE_QUESTION_OPTIONS: usize = 6;
 
 pub const TranscriptTextHit = struct {
     message_index: usize,
@@ -291,9 +305,14 @@ pub fn render(
 
     const approval = session.approvalView();
     const approval_h: f32 = if (approval) |view| approvalCardHeight(view) + APPROVAL_GAP else 0;
+    // A pending question shares the footer slot with approval; they are mutually
+    // exclusive (the worker blocks on one tool at a time), so at most one is set.
+    const question = if (approval == null) session.questionView() else null;
+    const question_h: f32 = if (question) |view| questionCardHeight(view) + APPROVAL_GAP else 0;
+    const card_footer_h = approval_h + question_h;
 
     const transcript_top = top + HEADER_H + 18;
-    const transcript_bottom = input_h + approval_h + 18;
+    const transcript_bottom = input_h + card_footer_h + 18;
     const transcript_h = @max(1.0, window_height - transcript_top - transcript_bottom);
     const content_w = w - LINE_PAD_X * 2;
     const content_x = x + LINE_PAD_X;
@@ -364,11 +383,13 @@ pub fn render(
 
     if (approval) |view| {
         renderApprovalCard(view, x + LINE_PAD_X, input_h + APPROVAL_GAP, w - LINE_PAD_X * 2, approvalCardHeight(view));
+    } else if (question) |view| {
+        renderQuestionCard(view, x + LINE_PAD_X, input_h + APPROVAL_GAP, w - LINE_PAD_X * 2, questionCardHeight(view));
     }
     if (session.rewind_open) {
         renderRewindPicker(session, layout);
     } else {
-        renderComposerSuggestions(session, layout, window_width);
+        renderComposerSuggestions(session, layout, window_width, header_y);
     }
 }
 
@@ -392,13 +413,32 @@ pub fn interactionHitTest(
 
     const approval = session.approvalView();
     const approval_h: f32 = if (approval) |view| approvalCardHeight(view) + APPROVAL_GAP else 0;
+    const question = if (approval == null) session.questionView() else null;
+    const question_h: f32 = if (question) |view| questionCardHeight(view) + APPROVAL_GAP else 0;
     const input_h = inputLayout(x, w, session.input()).input_h;
     const transcript_top = titlebar_offset + HEADER_H + 18;
-    const transcript_bottom = input_h + approval_h + 18;
+    const transcript_bottom = input_h + approval_h + question_h + 18;
     const transcript_h = @max(1.0, window_height - transcript_top - transcript_bottom);
     const viewport_bottom_top_px = window_height - transcript_bottom;
     const content_w = w - LINE_PAD_X * 2;
     const content_x = x + LINE_PAD_X;
+
+    const px: f32 = @floatCast(xpos);
+    const py: f32 = @floatCast(ypos);
+
+    // Clicks on a visible option row of the question card resolve the question.
+    if (question) |qv| {
+        const cell_h = font.g_titlebar_cell_height;
+        const card_y = input_h + APPROVAL_GAP; // y-up bottom edge, matches the renderer
+        const lay = ai_chat_layout.questionLayout(cell_h, qv.options.len, MAX_VISIBLE_QUESTION_OPTIONS);
+        var k: usize = 0;
+        while (k < lay.visible_options) : (k += 1) {
+            const baseline = card_y + lay.first_option_y - @as(f32, @floatFromInt(k)) * lay.option_pitch;
+            const top_px = window_height - baseline - cell_h;
+            const rect = Rect{ .x = content_x, .top_px = top_px - 2, .w = content_w, .h = cell_h + 4 };
+            if (pointInRect(px, py, rect)) return .{ .question_option = k };
+        }
+    }
 
     var content_h: f32 = 0;
     for (session.messages.items) |msg| {
@@ -414,8 +454,6 @@ pub fn interactionHitTest(
 
     const scroll_px = @min(session.scroll_px, @max(0.0, content_h - transcript_h));
     const gravity_offset = @max(0.0, transcript_h - content_h);
-    const px: f32 = @floatCast(xpos);
-    const py: f32 = @floatCast(ypos);
     var cursor_top = transcript_top + gravity_offset - scroll_px;
 
     for (session.messages.items, 0..) |msg, message_index| {
@@ -472,9 +510,10 @@ pub fn transcriptTextHitTest(
 
     const approval = session.approvalView();
     const approval_h: f32 = if (approval) |view| approvalCardHeight(view) + APPROVAL_GAP else 0;
+    const question_h: f32 = if (approval == null) (if (session.questionView()) |view| questionCardHeight(view) + APPROVAL_GAP else 0) else 0;
     const input_h = inputLayout(x, w, session.input()).input_h;
     const transcript_top = titlebar_offset + HEADER_H + 18;
-    const transcript_bottom = input_h + approval_h + 18;
+    const transcript_bottom = input_h + approval_h + question_h + 18;
     const transcript_h = @max(1.0, window_height - transcript_top - transcript_bottom);
     const viewport_bottom_top_px = window_height - transcript_bottom;
     const content_w = w - LINE_PAD_X * 2;
@@ -743,9 +782,10 @@ fn transcriptLayoutLocked(
 
     const approval = session.approvalView();
     const approval_h: f32 = if (approval) |view| approvalCardHeight(view) + APPROVAL_GAP else 0;
+    const question_h: f32 = if (approval == null) (if (session.questionView()) |view| questionCardHeight(view) + APPROVAL_GAP else 0) else 0;
     const input_h = inputLayout(x, w, session.input()).input_h;
     const transcript_top = titlebar_offset + HEADER_H + 18;
-    const transcript_bottom = input_h + approval_h + 18;
+    const transcript_bottom = input_h + approval_h + question_h + 18;
     const transcript_h = @max(1.0, window_height - transcript_top - transcript_bottom);
     const content_w = w - LINE_PAD_X * 2;
 
@@ -1299,7 +1339,7 @@ fn renderRewindPicker(session: *ai_chat.Session, layout: InputLayout) void {
     }
 }
 
-fn renderComposerSuggestions(session: *ai_chat.Session, layout: InputLayout, window_width: f32) void {
+fn renderComposerSuggestions(session: *ai_chat.Session, layout: InputLayout, window_width: f32, ceiling_y: f32) void {
     const input_text = session.input();
     const count = ai_chat.composerSuggestionCountForInput(input_text, session.input_cursor, session.skill_suggestions, session.custom_command_suggestions);
     if (count == 0) return;
@@ -1313,10 +1353,30 @@ fn renderComposerSuggestions(session: *ai_chat.Session, layout: InputLayout, win
     const popup_y = layout.field_y + layout.field_h + SUGGESTION_GAP;
     const row_h = @round(@max(SUGGESTION_ROW_H, font.g_titlebar_cell_height + 14.0));
     const command_w = @min(@max(SUGGESTION_COMMAND_W, font.g_titlebar_cell_width * 16.0), popup_w * 0.58);
-    const popup_h = SUGGESTION_PAD_Y * 2 + row_h * @as(f32, @floatFromInt(count));
     const popup_bg = mixColor(bg, fg, 0.105);
     const border = mixColor(bg, accent, 0.36);
     const selected = @min(session.suggestion_selected, count - 1);
+
+    // Detail panel: the selected item's full description, wrapped under the
+    // list (capped at detail_wrap.MAX_LINES so the popup never grows unbounded).
+    const detail_w = popup_w - SUGGESTION_PAD_X * 2;
+    const selected_suggestion = ai_chat.composerSuggestionAtForInput(input_text, session.input_cursor, session.skill_suggestions, session.custom_command_suggestions, selected);
+    const detail_desc: []const u8 = if (selected_suggestion) |s| s.description else "";
+    const detail_line_h = lineHeight();
+    const detail = if (detail_desc.len > 0 and detail_w > 0)
+        detail_wrap.wrap(detail_desc, detail_w, detail_wrap.MAX_LINES, &glyphAdvance)
+    else
+        detail_wrap.WrapResult{ .lines = undefined, .count = 0, .truncated = false };
+    const detail_content_h: f32 = @as(f32, @floatFromInt(detail.count)) * detail_line_h;
+    const detail_block: f32 = if (detail.count > 0) detail_content_h + SUGGESTION_DETAIL_GAP * 2 + 1 else 0;
+
+    // The popup grows *upward* from the input field; cap the visible rows to the
+    // space below the chat header so a long skill/tool list can never overflow
+    // the top of the window. Overflow scrolls to keep the selection in view.
+    const avail_list_h = ceiling_y - SUGGESTION_TOP_GAP - popup_y - SUGGESTION_PAD_Y * 2 - detail_block;
+    const win = ai_chat_layout.composerSuggestionWindow(count, selected, row_h, avail_list_h);
+    const list_h = win.list_h;
+    const popup_h = SUGGESTION_PAD_Y * 2 + list_h + detail_block;
 
     ui_pipeline.fillQuadAlpha(popup_x, popup_y, popup_w, popup_h, popup_bg, 0.98);
     ui_pipeline.fillQuadAlpha(popup_x, popup_y + popup_h - 1, popup_w, 1, border, 0.78);
@@ -1325,8 +1385,10 @@ fn renderComposerSuggestions(session: *ai_chat.Session, layout: InputLayout, win
     ui_pipeline.fillQuadAlpha(popup_x + popup_w - 1, popup_y, 1, popup_h, mixColor(bg, fg, 0.16), 0.72);
 
     const top = popup_y + popup_h - SUGGESTION_PAD_Y;
-    for (0..count) |i| {
-        const row_y = top - @as(f32, @floatFromInt(i + 1)) * row_h;
+    var row: usize = 0;
+    while (row < win.visible) : (row += 1) {
+        const i = win.first + row;
+        const row_y = top - @as(f32, @floatFromInt(row + 1)) * row_h;
         if (i == selected) {
             ui_pipeline.fillQuadAlpha(popup_x + 5, row_y + 4, popup_w - 10, row_h - 8, mixColor(bg, accent, 0.20), 0.90);
             ui_pipeline.fillQuadAlpha(popup_x + 5, row_y + 4, 3, row_h - 8, accent, 0.82);
@@ -1353,6 +1415,46 @@ fn renderComposerSuggestions(session: *ai_chat.Session, layout: InputLayout, win
             );
         }
     }
+
+    // Scrollbar shown only while the list is windowed, so the user can tell more
+    // suggestions exist above/below and where the selection sits.
+    if (count > win.visible and win.visible > 0) {
+        const sb_w: f32 = 3;
+        const sb_x = popup_x + popup_w - sb_w - 4;
+        ui_pipeline.fillQuadAlpha(sb_x, top - list_h, sb_w, list_h, mixColor(bg, fg, 0.14), 0.5);
+        const count_f: f32 = @floatFromInt(count);
+        const vis_f: f32 = @floatFromInt(win.visible);
+        const first_f: f32 = @floatFromInt(win.first);
+        const thumb_h = @max(20.0, @round(list_h * vis_f / count_f));
+        const max_scroll = count_f - vis_f;
+        const scroll_frac = if (max_scroll > 0) first_f / max_scroll else 0;
+        const thumb_top = top - (list_h - thumb_h) * scroll_frac;
+        ui_pipeline.fillQuadAlpha(sb_x, thumb_top - thumb_h, sb_w, thumb_h, mixColor(bg, accent, 0.5), 0.85);
+    }
+
+    if (detail.count > 0) {
+        const detail_color = mixColor(bg, fg, 0.72);
+        const content_top = popup_y + SUGGESTION_PAD_Y + detail_content_h;
+        const divider_y = content_top + SUGGESTION_DETAIL_GAP;
+        ui_pipeline.fillQuadAlpha(popup_x + SUGGESTION_PAD_X, divider_y, detail_w, 1, mixColor(bg, fg, 0.16), 0.7);
+
+        for (0..detail.count) |k| {
+            const line_y = content_top - @as(f32, @floatFromInt(k + 1)) * detail_line_h + @round((detail_line_h - font.g_titlebar_cell_height) / 2);
+            const line = detail.lines[k];
+            const is_last = k + 1 == detail.count;
+            // On the truncated final line, hand renderTextLimited the remaining
+            // text so it clips to width and appends its own overflow ellipsis.
+            const slice = if (is_last and detail.truncated)
+                detail_desc[line.start..]
+            else
+                detail_desc[line.start..line.end];
+            _ = titlebar.renderTextLimited(slice, popup_x + SUGGESTION_PAD_X, line_y, detail_color, detail_w);
+        }
+    }
+}
+
+fn glyphAdvance(cp: u21) f32 {
+    return titlebar.titlebarGlyphAdvance(@as(u32, cp));
 }
 
 fn suggestionLabel(buf: []u8, suggestion: ai_chat.ComposerSuggestion) []const u8 {
@@ -1367,6 +1469,48 @@ fn suggestionLabel(buf: []u8, suggestion: ai_chat.ComposerSuggestion) []const u8
 /// it stay aligned.
 fn approvalCardHeight(view: ai_chat.ApprovalView) f32 {
     return ai_chat_layout.approvalLayout(font.g_titlebar_cell_height, view.reason.len > 0).height;
+}
+
+fn questionCardHeight(view: ai_chat.QuestionView) f32 {
+    return ai_chat_layout.questionLayout(font.g_titlebar_cell_height, view.options.len, MAX_VISIBLE_QUESTION_OPTIONS).height;
+}
+
+fn renderQuestionCard(view: ai_chat.QuestionView, x: f32, y: f32, w: f32, h: f32) void {
+    const bg = AppWindow.g_theme.background;
+    const fg = AppWindow.g_theme.foreground;
+    const accent = AppWindow.g_theme.cursor_color;
+    const card_bg = mixColor(bg, accent, 0.08);
+    ui_pipeline.fillQuadAlpha(x, y, w, h, card_bg, 0.98);
+    ui_pipeline.fillQuadAlpha(x, y + h - 1, w, 1, accent, 0.65);
+    ui_pipeline.fillQuadAlpha(x, y, w, 1, mixColor(bg, fg, 0.18), 0.8);
+    ui_pipeline.fillQuadAlpha(x, y, 4, h, accent, 0.85);
+
+    const cell_h = font.g_titlebar_cell_height;
+    const lay = ai_chat_layout.questionLayout(cell_h, view.options.len, MAX_VISIBLE_QUESTION_OPTIONS);
+
+    var title_buf: [320]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "❓ {s}", .{view.question}) catch view.question;
+    _ = titlebar.renderTextLimited(title, x + 16, y + lay.title_y, mixColor(fg, accent, 0.20), w - 32);
+
+    var k: usize = 0;
+    while (k < lay.visible_options) : (k += 1) {
+        const opt = view.options[k];
+        const row_y = y + lay.first_option_y - @as(f32, @floatFromInt(k)) * lay.option_pitch;
+        // Subtle row background so each option reads as a clickable target.
+        ui_pipeline.fillQuadAlpha(x + 12, row_y - 2, w - 24, cell_h + 4, mixColor(bg, fg, 0.06), 0.9);
+        var row_buf: [320]u8 = undefined;
+        const line = if (opt.description.len != 0)
+            std.fmt.bufPrint(&row_buf, "{d}. {s} — {s}", .{ k + 1, opt.label, opt.description }) catch opt.label
+        else
+            std.fmt.bufPrint(&row_buf, "{d}. {s}", .{ k + 1, opt.label }) catch opt.label;
+        _ = titlebar.renderTextLimited(line, x + 20, row_y, fg, w - 40);
+    }
+
+    const hint = if (view.options.len > lay.visible_options)
+        "点选项，或在下方输入序号/你的答案"
+    else
+        "点选项，或在下方直接输入你的答案";
+    _ = titlebar.renderTextLimited(hint, x + 16, y + lay.hint_y, mixColor(bg, fg, 0.62), w - 32);
 }
 
 fn renderApprovalCard(view: ai_chat.ApprovalView, x: f32, y: f32, w: f32, h: f32) void {
