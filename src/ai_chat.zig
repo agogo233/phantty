@@ -14,6 +14,7 @@ const platform_pty_command = @import("platform/pty_command.zig");
 const agent_history = @import("agent_history.zig");
 const skill_registry = @import("skill_registry.zig");
 const command_registry = @import("command_registry.zig");
+const tool_registry = @import("tool_registry.zig");
 const markdown_text = @import("markdown_text.zig");
 const ai_chat_protocol = @import("ai_chat_protocol.zig");
 const ai_chat_composer = @import("ai_chat_composer.zig");
@@ -28,6 +29,7 @@ const ai_chat_markdown = @import("ai_chat_markdown.zig");
 const weixin_types = @import("weixin/types.zig");
 const ai_loop_store = @import("ai_loop_store.zig");
 const ai_loop_schedule = @import("ai_loop_schedule.zig");
+const first_party_tools = @import("first_party_tools.zig");
 
 pub const AgentSettings = ai_chat_types.AgentSettings;
 pub const AgentPermission = ai_chat_types.AgentPermission;
@@ -169,6 +171,9 @@ pub const ChatRequest = struct {
     max_tokens: u32 = 8192,
     agent_enabled: bool,
     memory_enabled: bool = false,
+    dynamic_tools: []const ai_chat_protocol.DynamicToolSpec = &.{},
+    dynamic_binary_tools: []const ai_chat_types.DynamicBinaryTool = &.{},
+    disabled_first_party_tools: []const []const u8 = &.{},
     copilot: bool = false,
     tool_host: ?ToolHost,
     tool_snapshot: ?ToolSnapshot,
@@ -191,6 +196,9 @@ pub const ChatRequest = struct {
         self.allocator.free(self.reasoning_effort);
         for (self.messages) |msg| msg.deinit(self.allocator);
         self.allocator.free(self.messages);
+        freeOwnedDynamicToolSpecs(self.allocator, self.dynamic_tools);
+        freeOwnedDynamicBinaryTools(self.allocator, self.dynamic_binary_tools);
+        freeOwnedStringList(self.allocator, self.disabled_first_party_tools);
         if (self.tool_snapshot) |snapshot| snapshot.deinit(self.allocator);
         if (self.weixin_reply_context) |*ctx| ctx.deinit(self.allocator);
         if (self.subagent_profile) |profile| profile.deinit(self.allocator);
@@ -207,6 +215,8 @@ pub const ChatRequest = struct {
             .stream = self.stream,
             .max_tokens = self.max_tokens,
             .memory_enabled = self.memory_enabled,
+            .dynamic_tools = self.dynamic_tools,
+            .disabled_first_party_tools = self.disabled_first_party_tools,
             .toolset = self.toolset,
         };
     }
@@ -329,6 +339,7 @@ const PendingHistoryChange = struct {
 const DeferredAction = union(enum) {
     none,
     resume_picker,
+    copilot_conversation_picker,
     model_switch_picker,
     export_markdown: MarkdownExportMode,
 };
@@ -348,10 +359,13 @@ fn fireDeferredAction(session: *Session, action: DeferredAction) void {
     switch (action) {
         .none => {},
         .resume_picker => if (g_session_resume_trigger) |t| t(),
+        .copilot_conversation_picker => if (g_copilot_picker_trigger) |t| t(),
         // Targets the session that submitted `/model` (copilot sidebar OR a tab),
         // not the active tab — they can differ.
         .model_switch_picker => if (g_model_switch_trigger) |t| t(session),
-        .export_markdown => |mode| if (g_markdown_export_trigger) |t| t(mode),
+        // Targets the session that submitted `/export` (copilot sidebar OR a tab),
+        // not the active tab — they can differ.
+        .export_markdown => |mode| if (g_markdown_export_trigger) |t| t(session, mode),
     }
 }
 
@@ -363,8 +377,15 @@ var g_default_working_dir_buf: [WORKING_DIR_MAX_BYTES]u8 = undefined;
 var g_default_working_dir_len: usize = 0;
 var g_session_id_counter = std.atomic.Value(u64).init(1);
 var g_session_resume_trigger: ?*const fn () void = null;
-var g_markdown_export_trigger: ?*const fn (MarkdownExportMode) void = null;
+var g_copilot_picker_trigger: ?*const fn () void = null;
+var g_markdown_export_trigger: ?*const fn (*Session, MarkdownExportMode) void = null;
 var g_model_switch_trigger: ?*const fn (*Session) void = null;
+threadlocal var g_dynamic_tool_specs: []ai_chat_protocol.DynamicToolSpec = &.{};
+threadlocal var g_dynamic_tool_specs_owned: bool = false;
+threadlocal var g_dynamic_binary_tools: []ai_chat_types.DynamicBinaryTool = &.{};
+threadlocal var g_dynamic_binary_tools_owned: bool = false;
+threadlocal var g_first_party_disabled_tools: []const []const u8 = &.{};
+threadlocal var g_first_party_disabled_tools_owned: bool = false;
 
 /// Resolved credentials for the `ai-subagent-profile` config key. Owned
 /// strings; freed by ChatRequest.deinit.
@@ -408,6 +429,12 @@ pub fn setSessionResumeTrigger(cb: ?*const fn () void) void {
     g_session_resume_trigger = cb;
 }
 
+/// Wire the callback that `/resume` fires in a Copilot sidebar session to open
+/// the Copilot conversation picker. Fired AFTER the session mutex unlocks.
+pub fn setCopilotPickerTrigger(cb: ?*const fn () void) void {
+    g_copilot_picker_trigger = cb;
+}
+
 /// Wire the callback that `/model` fires (after unlock) to either switch by the
 /// pending name or open the profile picker. Lives in the app layer.
 pub fn setModelSwitchTrigger(cb: ?*const fn (*Session) void) void {
@@ -417,10 +444,176 @@ pub fn setModelSwitchTrigger(cb: ?*const fn (*Session) void) void {
 /// Wire the callback that `/export [full|clean]` fires to write the conversation
 /// Markdown. Fired AFTER the session mutex unlocks, because the export reads the
 /// session under the SAME mutex (`allocMarkdownExport`) and would otherwise deadlock.
-pub fn setMarkdownExportTrigger(cb: ?*const fn (MarkdownExportMode) void) void {
+pub fn setMarkdownExportTrigger(cb: ?*const fn (*Session, MarkdownExportMode) void) void {
     g_markdown_export_trigger = cb;
 }
 threadlocal var g_tool_host: ?ToolHost = null;
+
+pub fn setDynamicToolSpecsForTest(specs: []ai_chat_protocol.DynamicToolSpec) void {
+    g_dynamic_tool_specs = specs;
+    g_dynamic_tool_specs_owned = false;
+}
+
+pub fn setDynamicBinaryToolsForTest(tools: []ai_chat_types.DynamicBinaryTool) void {
+    g_dynamic_binary_tools = tools;
+    g_dynamic_binary_tools_owned = false;
+}
+
+fn freeOwnedStringList(allocator: std.mem.Allocator, list: []const []const u8) void {
+    if (list.len == 0) return;
+    for (list) |item| allocator.free(item);
+    allocator.free(list);
+}
+
+fn cloneStringList(allocator: std.mem.Allocator, list: []const []const u8) ![]const []const u8 {
+    if (list.len == 0) return &.{};
+    const out = try allocator.alloc([]const u8, list.len);
+    var written: usize = 0;
+    errdefer {
+        for (out[0..written]) |item| allocator.free(item);
+        allocator.free(out);
+    }
+    for (list) |item| {
+        out[written] = try allocator.dupe(u8, item);
+        written += 1;
+    }
+    return out;
+}
+
+fn freeDynamicToolSpecsSlice(allocator: std.mem.Allocator, specs: []ai_chat_protocol.DynamicToolSpec) void {
+    freeOwnedDynamicToolSpecs(allocator, specs);
+}
+
+fn freeOwnedDynamicToolSpecs(allocator: std.mem.Allocator, specs: []const ai_chat_protocol.DynamicToolSpec) void {
+    if (specs.len == 0) return;
+    for (specs) |spec| {
+        allocator.free(spec.name);
+        allocator.free(spec.description);
+    }
+    allocator.free(specs);
+}
+
+fn freeOwnedDynamicBinaryTools(allocator: std.mem.Allocator, tools: []const ai_chat_types.DynamicBinaryTool) void {
+    if (tools.len == 0) return;
+    for (tools) |tool| {
+        allocator.free(tool.function_name);
+        allocator.free(tool.executable_abs);
+        allocator.free(tool.description);
+    }
+    allocator.free(tools);
+}
+
+fn cloneDynamicToolSpecs(allocator: std.mem.Allocator, specs: []const ai_chat_protocol.DynamicToolSpec) ![]ai_chat_protocol.DynamicToolSpec {
+    if (specs.len == 0) return &.{};
+    const out = try allocator.alloc(ai_chat_protocol.DynamicToolSpec, specs.len);
+    var written: usize = 0;
+    errdefer {
+        for (out[0..written]) |spec| {
+            allocator.free(spec.name);
+            allocator.free(spec.description);
+        }
+        allocator.free(out);
+    }
+    for (specs) |spec| {
+        const name = try allocator.dupe(u8, spec.name);
+        errdefer allocator.free(name);
+        const description = try allocator.dupe(u8, spec.description);
+        out[written] = .{ .name = name, .description = description };
+        written += 1;
+    }
+    return out;
+}
+
+fn cloneDynamicBinaryTools(allocator: std.mem.Allocator, tools: []const ai_chat_types.DynamicBinaryTool) ![]ai_chat_types.DynamicBinaryTool {
+    if (tools.len == 0) return &.{};
+    const out = try allocator.alloc(ai_chat_types.DynamicBinaryTool, tools.len);
+    var written: usize = 0;
+    errdefer {
+        for (out[0..written]) |tool| {
+            allocator.free(tool.function_name);
+            allocator.free(tool.executable_abs);
+            allocator.free(tool.description);
+        }
+        allocator.free(out);
+    }
+    for (tools) |tool| {
+        const function_name = try allocator.dupe(u8, tool.function_name);
+        errdefer allocator.free(function_name);
+        const executable_abs = try allocator.dupe(u8, tool.executable_abs);
+        errdefer allocator.free(executable_abs);
+        const description = try allocator.dupe(u8, tool.description);
+        out[written] = .{
+            .function_name = function_name,
+            .executable_abs = executable_abs,
+            .description = description,
+        };
+        written += 1;
+    }
+    return out;
+}
+
+fn freeDynamicToolSpecs(allocator: std.mem.Allocator) void {
+    if (!g_dynamic_tool_specs_owned) return;
+    freeDynamicToolSpecsSlice(allocator, g_dynamic_tool_specs);
+    g_dynamic_tool_specs = &.{};
+    g_dynamic_tool_specs_owned = false;
+}
+
+fn freeDynamicBinaryTools(allocator: std.mem.Allocator) void {
+    if (!g_dynamic_binary_tools_owned) return;
+    freeOwnedDynamicBinaryTools(allocator, g_dynamic_binary_tools);
+    g_dynamic_binary_tools = &.{};
+    g_dynamic_binary_tools_owned = false;
+}
+
+fn freeFirstPartyDisabledTools(allocator: std.mem.Allocator) void {
+    if (!g_first_party_disabled_tools_owned) return;
+    freeOwnedStringList(allocator, g_first_party_disabled_tools);
+    g_first_party_disabled_tools = &.{};
+    g_first_party_disabled_tools_owned = false;
+}
+
+const DynamicToolSnapshots = struct {
+    specs: []ai_chat_protocol.DynamicToolSpec,
+    runtime: []ai_chat_types.DynamicBinaryTool,
+};
+
+fn loadDynamicToolSnapshots(allocator: std.mem.Allocator) !DynamicToolSnapshots {
+    const tools_root = try platform_dirs.toolsDir(allocator);
+    defer allocator.free(tools_root);
+
+    const installed = try tool_registry.scanInstalledTools(allocator, tools_root);
+    defer tool_registry.freeInstalledTools(allocator, installed);
+
+    const specs = try tool_registry.dynamicSpecsFromInstalled(allocator, installed);
+    errdefer tool_registry.freeDynamicSpecs(allocator, specs);
+    const runtime = try tool_registry.dynamicRuntimeFromInstalled(allocator, installed);
+    return .{ .specs = specs, .runtime = runtime };
+}
+
+pub fn reloadDynamicToolSpecs(allocator: std.mem.Allocator) void {
+    freeDynamicToolSpecs(allocator);
+    freeDynamicBinaryTools(allocator);
+    const snapshots = loadDynamicToolSnapshots(allocator) catch {
+        g_dynamic_tool_specs = &.{};
+        g_dynamic_tool_specs_owned = false;
+        g_dynamic_binary_tools = &.{};
+        g_dynamic_binary_tools_owned = false;
+        return;
+    };
+    g_dynamic_tool_specs = snapshots.specs;
+    g_dynamic_tool_specs_owned = g_dynamic_tool_specs.len != 0;
+    g_dynamic_binary_tools = snapshots.runtime;
+    g_dynamic_binary_tools_owned = g_dynamic_binary_tools.len != 0;
+}
+
+pub fn reloadFirstPartyToolState(allocator: std.mem.Allocator) void {
+    var disabled = first_party_tools.loadDisabledTools(allocator) catch return;
+    freeFirstPartyDisabledTools(allocator);
+    g_first_party_disabled_tools = disabled.names;
+    g_first_party_disabled_tools_owned = g_first_party_disabled_tools.len != 0;
+    disabled.names = &.{};
+}
 
 pub fn configureAgent(settings: AgentSettings) void {
     g_agent_mutex.lock();
@@ -512,6 +705,9 @@ pub fn currentAgentSettings() AgentSettings {
     var s = g_agent_settings;
     s.access_rules = g_access_rules;
     if (g_default_working_dir_len > 0) s.working_dir = g_default_working_dir_buf[0..g_default_working_dir_len];
+    s.dynamic_tools = g_dynamic_tool_specs;
+    s.dynamic_binary_tools = g_dynamic_binary_tools;
+    s.disabled_first_party_tools = g_first_party_disabled_tools;
     return s;
 }
 
@@ -910,6 +1106,7 @@ pub const Session = struct {
         if (record.session_id.len > 0) session.copySessionId(record.session_id);
         session.max_tokens = record.max_tokens;
         session.vision_enabled = record.vision_enabled;
+        session.copilot = record.copilot;
         session.created_at_ms = record.created_at;
         session.updated_at_ms = record.updated_at;
         for (record.messages) |msg| {
@@ -1223,6 +1420,31 @@ pub const Session = struct {
         return self.status_buf[0..self.status_len];
     }
 
+    /// Severity of the current status, for the header status dot.
+    /// ready → green, busy → yellow, stopped → red.
+    pub const StatusKind = enum { ready, busy, stopped };
+
+    /// Classify the current status for the header dot. Caller must hold
+    /// `mutex` (mirrors `status()` / `missingApiKey()`, which don't lock).
+    pub fn statusKind(self: *const Session) StatusKind {
+        if (self.missingApiKey()) return .stopped;
+        if (self.request_inflight) return .busy;
+        const s = self.status();
+        // Stopped / error states → red.
+        if (std.mem.eql(u8, s, "Stopped") or
+            std.mem.startsWith(u8, s, "Out of memory") or
+            std.mem.startsWith(u8, s, "Could not") or
+            std.mem.startsWith(u8, s, "Failed") or
+            std.mem.startsWith(u8, s, "Missing API key") or
+            std.mem.indexOf(u8, s, "unavailable") != null)
+            return .stopped;
+        // Awaiting the user → yellow (mid-task, your turn).
+        if (std.mem.eql(u8, s, "Approval needed") or
+            std.mem.startsWith(u8, s, "Waiting"))
+            return .busy;
+        return .ready;
+    }
+
     pub fn requestState(self: *Session) RequestState {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1261,6 +1483,18 @@ pub const Session = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.toHistoryRecordLocked(allocator);
+    }
+
+    /// True iff this session has at least one message that would be written to the
+    /// history store. Used to skip persisting/snapshotting never-chatted Copilot
+    /// sidebars.
+    pub fn shouldPersistCopilot(self: *Session) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.messages.items) |msg| {
+            if (msg.persist_to_history) return true;
+        }
+        return false;
     }
 
     pub fn allocMarkdownExport(self: *Session, allocator: std.mem.Allocator, mode: MarkdownExportMode) ![]u8 {
@@ -2446,7 +2680,10 @@ pub const Session = struct {
                 self.applyCwdArgLocked(arg);
                 result.suppress_output = true;
             },
-            .resume_session => result.deferred = .resume_picker,
+            .resume_session => result.deferred = if (self.copilot)
+                .copilot_conversation_picker
+            else
+                .resume_picker,
             .export_markdown => result.deferred = .{
                 .export_markdown = if (std.mem.eql(u8, std.mem.trim(u8, arg, " \t\r\n"), "full")) .full else .clean,
             },
@@ -3790,6 +4027,15 @@ pub const Session = struct {
 
         var subagent_profile = resolveSubagentProfileForRequest(self.allocator, agent_enabled);
         errdefer if (subagent_profile) |profile| profile.deinit(self.allocator);
+        const dynamic_tools = try cloneDynamicToolSpecs(self.allocator, settings.dynamic_tools);
+        var dynamic_tools_owned = true;
+        errdefer if (dynamic_tools_owned) freeOwnedDynamicToolSpecs(self.allocator, dynamic_tools);
+        const dynamic_binary_tools = try cloneDynamicBinaryTools(self.allocator, settings.dynamic_binary_tools);
+        var dynamic_binary_tools_owned = true;
+        errdefer if (dynamic_binary_tools_owned) freeOwnedDynamicBinaryTools(self.allocator, dynamic_binary_tools);
+        const disabled_first_party_tools = try cloneStringList(self.allocator, settings.disabled_first_party_tools);
+        var disabled_first_party_tools_owned = true;
+        errdefer if (disabled_first_party_tools_owned) freeOwnedStringList(self.allocator, disabled_first_party_tools);
 
         req.* = .{
             .allocator = self.allocator,
@@ -3806,6 +4052,9 @@ pub const Session = struct {
             .max_tokens = self.max_tokens,
             .agent_enabled = agent_enabled,
             .memory_enabled = settings.memory_enabled,
+            .dynamic_tools = dynamic_tools,
+            .dynamic_binary_tools = dynamic_binary_tools,
+            .disabled_first_party_tools = disabled_first_party_tools,
             .copilot = self.copilot,
             .tool_host = tool_host,
             .tool_snapshot = tool_snapshot,
@@ -3820,6 +4069,9 @@ pub const Session = struct {
         reasoning_effort_owned = false;
         weixin_ctx = null;
         subagent_profile = null;
+        dynamic_tools_owned = false;
+        dynamic_binary_tools_owned = false;
+        disabled_first_party_tools_owned = false;
         if (self.copilot and self.bound_surface_id_len > 0) {
             // Inline the write-context seed directly on ChatRequest (the field
             // layout is identical to ToolContext; setWriteContext in
@@ -3902,6 +4154,7 @@ pub const Session = struct {
             .max_tokens = self.max_tokens,
             .agent_enabled = self.agent_enabled,
             .vision_enabled = self.vision_enabled,
+            .copilot = self.copilot,
             .created_at = self.created_at_ms,
             .updated_at = self.updated_at_ms,
             .messages = messages,
@@ -5142,24 +5395,62 @@ test "/clear via submit empties the transcript and shows confirmation" {
 }
 
 var test_export_mode: ?MarkdownExportMode = null;
-fn testExportHook(mode: MarkdownExportMode) void {
+var test_export_session: ?*Session = null;
+fn testExportHook(session: *Session, mode: MarkdownExportMode) void {
+    test_export_session = session;
     test_export_mode = mode;
 }
 
-test "/export via submit fires the export trigger with parsed mode" {
+test "/export via submit fires the export trigger with submitting session and parsed mode" {
     const a = std.testing.allocator;
     setMarkdownExportTrigger(testExportHook);
     defer setMarkdownExportTrigger(null);
     var session = try Session.init(a, "chat", "https://api.example.com", "key", "m1", "sys", "false", "", "false", "false");
     defer session.deinit();
     test_export_mode = null;
+    test_export_session = null;
     session.appendInputText("/export full");
     session.submit();
+    try std.testing.expectEqual(session, test_export_session.?);
     try std.testing.expectEqual(MarkdownExportMode.full, test_export_mode.?);
+
+    var copilot = try Session.init(a, "copilot", "https://api.example.com", "key", "m1", "sys", "false", "", "false", "false");
+    defer copilot.deinit();
+    copilot.copilot = true;
     test_export_mode = null;
-    session.appendInputText("/export");
-    session.submit();
+    test_export_session = null;
+    copilot.appendInputText("/export");
+    copilot.submit();
+    try std.testing.expectEqual(copilot, test_export_session.?);
     try std.testing.expectEqual(MarkdownExportMode.clean, test_export_mode.?);
+}
+
+test "/resume defers to copilot picker for copilot sessions, external resume otherwise" {
+    const allocator = std.testing.allocator;
+    const copilot = try Session.init(allocator, "Copilot", "https://x", "k", "m", "s", "disabled", "low", "true", "true");
+    defer copilot.deinit();
+    copilot.copilot = true;
+    {
+        copilot.mutex.lock();
+        defer copilot.mutex.unlock();
+        const r = copilot.runBuiltinCommandLocked(.resume_session, "");
+        try std.testing.expectEqual(
+            @as(std.meta.Tag(DeferredAction), .copilot_conversation_picker),
+            std.meta.activeTag(r.deferred),
+        );
+    }
+
+    const tabchat = try Session.init(allocator, "Chat", "https://x", "k", "m", "s", "disabled", "low", "true", "true");
+    defer tabchat.deinit();
+    {
+        tabchat.mutex.lock();
+        defer tabchat.mutex.unlock();
+        const r = tabchat.runBuiltinCommandLocked(.resume_session, "");
+        try std.testing.expectEqual(
+            @as(std.meta.Tag(DeferredAction), .resume_picker),
+            std.meta.activeTag(r.deferred),
+        );
+    }
 }
 
 test "ai chat dollar skill suggestions filter and enter completes with trailing space" {
@@ -6921,6 +7212,67 @@ test "ai chat escape stops in-flight request" {
     try std.testing.expectEqualStrings("Stopping...", session.status());
 }
 
+test "statusKind: missing api key maps to stopped" {
+    var session = Session{ .allocator = std.testing.allocator };
+    // A freshly-constructed session has no API key.
+    try std.testing.expect(session.missingApiKey());
+    try std.testing.expectEqual(Session.StatusKind.stopped, session.statusKind());
+}
+
+test "statusKind: idle error and stopped states map to stopped" {
+    var session = Session{ .allocator = std.testing.allocator };
+    session.copyApiKey("k");
+    const errors = [_][]const u8{
+        "Stopped",
+        "Out of memory",
+        "Could not prepare request",
+        "Could not run command",
+        "Failed to start request thread",
+        "Summary unavailable — kept full history",
+        "Missing API key. Edit the Copilot profile or set DEEPSEEK_API_KEY.",
+    };
+    for (errors) |s| {
+        session.setStatus(s);
+        try std.testing.expectEqual(Session.StatusKind.stopped, session.statusKind());
+    }
+}
+
+test "statusKind: inflight maps to busy" {
+    var session = Session{ .allocator = std.testing.allocator };
+    session.copyApiKey("k");
+    session.request_inflight = true;
+    session.setStatus("Thinking...");
+    try std.testing.expectEqual(Session.StatusKind.busy, session.statusKind());
+}
+
+test "statusKind: idle waiting states map to busy" {
+    var session = Session{ .allocator = std.testing.allocator };
+    session.copyApiKey("k");
+    const waiting = [_][]const u8{ "Approval needed", "Waiting for your answer" };
+    for (waiting) |s| {
+        session.setStatus(s);
+        try std.testing.expectEqual(Session.StatusKind.busy, session.statusKind());
+    }
+}
+
+test "statusKind: idle normal states map to ready" {
+    var session = Session{ .allocator = std.testing.allocator };
+    session.copyApiKey("k");
+    const ready = [_][]const u8{
+        "Ready",
+        "Done",
+        "Done in 3.2s",
+        "Cleared",
+        "Model switched",
+        "Context summarized",
+        "Distill preview ready",
+    };
+    for (ready) |s| {
+        session.setStatus(s);
+        try std.testing.expectEqual(Session.StatusKind.ready, session.statusKind());
+    }
+}
+
 fn testDistillCandidate(allocator: std.mem.Allocator) !ai_skill_distill.Candidate {
     return .{
         .name = try allocator.dupe(u8, "ssh-transfer"),
@@ -7417,6 +7769,161 @@ test "ai chat agent request json includes stable skill_info tool schema" {
     try std.testing.expect(std.mem.indexOf(u8, json, "skill_name") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "pdf") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\\u0070df") == null);
+}
+
+test "ai chat session request owns dynamic tool specs snapshot" {
+    const allocator = std.testing.allocator;
+    const saved_settings = currentAgentSettings();
+    const saved_dynamic_specs = g_dynamic_tool_specs;
+    const saved_dynamic_specs_owned = g_dynamic_tool_specs_owned;
+    defer {
+        configureAgent(saved_settings);
+        g_dynamic_tool_specs = saved_dynamic_specs;
+        g_dynamic_tool_specs_owned = saved_dynamic_specs_owned;
+    }
+
+    const name = try allocator.dupe(u8, "agent_docx_review");
+    defer allocator.free(name);
+    const description = try allocator.dupe(u8, "Use for DOCX tracked-change review.");
+    defer allocator.free(description);
+    var specs = [_]ai_chat_protocol.DynamicToolSpec{.{
+        .name = name,
+        .description = description,
+    }};
+    setDynamicToolSpecsForTest(specs[0..]);
+    configureAgent(.{ .enabled = true });
+
+    const session = try Session.init(
+        allocator,
+        "Test",
+        DEFAULT_BASE_URL,
+        "test-key",
+        DEFAULT_MODEL,
+        DEFAULT_SYSTEM_PROMPT,
+        "enabled",
+        "high",
+        "false",
+        "true",
+    );
+    defer session.deinit();
+
+    session.mutex.lock();
+    try session.messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "hello") });
+    const request = try session.buildRequestLocked();
+    session.mutex.unlock();
+    defer request.deinit();
+
+    @memcpy(name, "agent_xlsx_review");
+    setDynamicToolSpecsForTest(&.{});
+
+    const json = try ai_chat_request.buildRequestJson(allocator, request);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent_docx_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent_xlsx_review\"") == null);
+}
+
+test "ai chat session request owns dynamic binary runtime snapshot" {
+    const allocator = std.testing.allocator;
+    const saved_settings = currentAgentSettings();
+    const saved_dynamic_runtime = g_dynamic_binary_tools;
+    const saved_dynamic_runtime_owned = g_dynamic_binary_tools_owned;
+    defer {
+        configureAgent(saved_settings);
+        g_dynamic_binary_tools = saved_dynamic_runtime;
+        g_dynamic_binary_tools_owned = saved_dynamic_runtime_owned;
+    }
+
+    const function_name = try allocator.dupe(u8, "fake_tool");
+    defer allocator.free(function_name);
+    const executable_text = if (builtin.os.tag == .windows) "cmd.exe" else "/bin/echo";
+    const executable_abs = try allocator.dupe(u8, executable_text);
+    defer allocator.free(executable_abs);
+    const description = try allocator.dupe(u8, "Echo test");
+    defer allocator.free(description);
+    var runtime = [_]ai_chat_types.DynamicBinaryTool{.{
+        .function_name = function_name,
+        .executable_abs = executable_abs,
+        .description = description,
+    }};
+    setDynamicBinaryToolsForTest(runtime[0..]);
+    configureAgent(.{ .enabled = true, .permission = .full });
+
+    const session = try Session.init(
+        allocator,
+        "Test",
+        DEFAULT_BASE_URL,
+        "test-key",
+        DEFAULT_MODEL,
+        DEFAULT_SYSTEM_PROMPT,
+        "enabled",
+        "high",
+        "false",
+        "true",
+    );
+    defer session.deinit();
+
+    session.mutex.lock();
+    try session.messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "hello") });
+    const request = try session.buildRequestLocked();
+    session.mutex.unlock();
+    defer request.deinit();
+
+    @memcpy(function_name, "gone_tool");
+    setDynamicBinaryToolsForTest(&.{});
+
+    try std.testing.expectEqual(@as(usize, 1), request.dynamic_binary_tools.len);
+    try std.testing.expectEqualStrings("fake_tool", request.dynamic_binary_tools[0].function_name);
+    try std.testing.expectEqualStrings(executable_text, request.dynamic_binary_tools[0].executable_abs);
+}
+
+test "ai chat session request owns disabled first-party tool snapshot" {
+    const allocator = std.testing.allocator;
+    const saved_settings = currentAgentSettings();
+    const saved_disabled_tools = g_first_party_disabled_tools;
+    const saved_disabled_tools_owned = g_first_party_disabled_tools_owned;
+    defer {
+        configureAgent(saved_settings);
+        g_first_party_disabled_tools = saved_disabled_tools;
+        g_first_party_disabled_tools_owned = saved_disabled_tools_owned;
+    }
+
+    const disabled_name = try allocator.dupe(u8, "webread");
+    defer allocator.free(disabled_name);
+    var disabled = [_][]const u8{disabled_name};
+    g_first_party_disabled_tools = disabled[0..];
+    g_first_party_disabled_tools_owned = false;
+    configureAgent(.{ .enabled = true, .permission = .full });
+
+    const session = try Session.init(
+        allocator,
+        "Test",
+        DEFAULT_BASE_URL,
+        "test-key",
+        DEFAULT_MODEL,
+        DEFAULT_SYSTEM_PROMPT,
+        "enabled",
+        "high",
+        "false",
+        "true",
+    );
+    defer session.deinit();
+
+    session.mutex.lock();
+    try session.messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "hello") });
+    const request = try session.buildRequestLocked();
+    session.mutex.unlock();
+    defer request.deinit();
+
+    @memcpy(disabled_name, "pubmed!");
+    g_first_party_disabled_tools = &.{};
+    g_first_party_disabled_tools_owned = false;
+
+    const json = try ai_chat_request.buildRequestJson(allocator, request);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"webread\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"websearch\"") != null);
 }
 
 const CopilotBoundSnapshotTestHost = struct {
@@ -8070,4 +8577,42 @@ test "composer submit of free text answers a pending question as custom" {
 
     try std.testing.expect(runner.result == .custom);
     try std.testing.expectEqualStrings("neither, use C", runner.result.custom);
+}
+
+test "copilot flag survives toHistoryRecord -> initFromHistoryRecord round-trip" {
+    const allocator = std.testing.allocator;
+    const session = try Session.init(
+        allocator, "Copilot", "https://x", "k", "m",
+        "sys", "disabled", "low", "true", "true",
+    );
+    defer session.deinit();
+    session.copilot = true;
+
+    var record = try session.toHistoryRecord(allocator);
+    defer agent_history.freeOwnedRecord(allocator, &record);
+    try std.testing.expect(record.copilot);
+
+    const restored = try Session.initFromHistoryRecord(allocator, record);
+    defer restored.deinit();
+    try std.testing.expect(restored.copilot);
+}
+
+test "shouldPersistCopilot is false for empty session, true after a real message" {
+    const allocator = std.testing.allocator;
+    const session = try Session.init(
+        allocator, "Copilot", "https://x", "k", "m",
+        "sys", "disabled", "low", "true", "true",
+    );
+    defer session.deinit();
+    try std.testing.expect(!session.shouldPersistCopilot());
+
+    {
+        session.mutex.lock();
+        defer session.mutex.unlock();
+        try session.messages.append(allocator, .{
+            .role = .user,
+            .content = try allocator.dupe(u8, "hello"),
+        });
+    }
+    try std.testing.expect(session.shouldPersistCopilot());
 }

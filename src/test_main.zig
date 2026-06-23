@@ -679,6 +679,7 @@ comptime {
     _ = @import("config_watcher.zig");
     _ = @import("file_backend.zig");
     _ = @import("file_explorer.zig");
+    _ = @import("first_party_tools.zig");
     _ = @import("input.zig");
     _ = @import("input/clipboard.zig");
     _ = @import("clipboard_osc52.zig");
@@ -695,7 +696,6 @@ comptime {
     _ = @import("renderer/cell_update_unit.zig");
     _ = @import("renderer/ui_batch.zig");
     _ = @import("input/underline_span.zig");
-    _ = @import("agent_detect_throttle.zig");
     _ = @import("surface_output_unit.zig");
     _ = @import("link_open.zig");
     _ = @import("markdown_preview.zig");
@@ -793,6 +793,9 @@ comptime {
     _ = @import("port_forwarding.zig");
     _ = @import("renderer/port_forwarding_renderer.zig");
     _ = @import("command_registry.zig");
+    _ = @import("tool_registry.zig");
+    _ = @import("tool_import.zig");
+    _ = @import("tool_skill_draft.zig");
     _ = @import("scrollbar_model.zig");
     _ = @import("ai_chat_scrollbar_model.zig");
     _ = @import("ssh_prompt.zig");
@@ -808,8 +811,10 @@ comptime {
 }
 
 test "app version metadata is exposed for CLI and command center" {
+    const expected_version = "1.28.0";
     try std.testing.expectEqualStrings("WispTerm", app_metadata.name);
-    try std.testing.expect(app_metadata.version.len > 0);
+    try std.testing.expectEqualStrings(expected_version, app_metadata.version);
+    try std.testing.expect(std.mem.indexOf(u8, app_metadata.release_notes, "# WispTerm v" ++ expected_version) != null);
 
     var buf: [64]u8 = undefined;
     const line = try app_metadata.versionLine(&buf);
@@ -820,4 +825,41 @@ test "command center browser entries do not expose backend implementation names"
     for (command_center_state.command_entries) |entry| {
         try std.testing.expect(std.mem.indexOf(u8, entry.detail, "WebView2") == null);
     }
+}
+
+test "copilot conversation picker has a keybind action and dispatch" {
+    const kb_src = @embedFile("keybind.zig");
+    try std.testing.expect(std.mem.indexOf(u8, kb_src, "copilot_conversation_picker") != null);
+    const input_src = @embedFile("input.zig");
+    try std.testing.expect(std.mem.indexOf(u8, input_src, ".copilot_conversation_picker =>") != null);
+}
+
+test "activeCopilotSession installs the history-change hook" {
+    const src = @embedFile("appwindow/tab.zig");
+    const anchor = "t.copilot_session = make() orelse return null;";
+    const idx = std.mem.indexOf(u8, src, anchor) orelse return error.AnchorMissing;
+    try std.testing.expect(std.mem.indexOf(u8, src[idx..], "installAiChatHistoryHook(") != null);
+}
+
+test "snapshotTab records copilot_session_id for terminal tabs" {
+    const src = @embedFile("appwindow/tab.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, ".copilot_session_id = ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "shouldPersistCopilot()") != null);
+}
+
+test "copilot load de-dups against open tabs" {
+    const tab_src = @embedFile("appwindow/tab.zig");
+    try std.testing.expect(std.mem.indexOf(u8, tab_src, "pub fn switchToCopilotTabBySessionId(") != null);
+    const aw_src = @embedFile("AppWindow.zig");
+    const load_idx = std.mem.indexOf(u8, aw_src, "pub fn loadCopilotConversationById(") orelse return error.Missing;
+    try std.testing.expect(std.mem.indexOf(u8, aw_src[load_idx..], "switchToCopilotTabBySessionId(") != null);
+}
+
+test "copilot picker is rendered and key-routed" {
+    const overlays_src = @embedFile("renderer/overlays.zig");
+    try std.testing.expect(std.mem.indexOf(u8, overlays_src, "pub fn renderCopilotPicker(") != null);
+    const input_src = @embedFile("input.zig");
+    try std.testing.expect(std.mem.indexOf(u8, input_src, "copilot_picker.isVisible()") != null);
+    const aw_src = @embedFile("AppWindow.zig");
+    try std.testing.expect(std.mem.indexOf(u8, aw_src, "renderCopilotPicker(") != null);
 }

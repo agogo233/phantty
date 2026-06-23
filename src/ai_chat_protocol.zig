@@ -3,6 +3,7 @@
 //! data + an allocator. (Imports the platform tool-description facades that the
 //! tool-schema builders already used.)
 const std = @import("std");
+const first_party_tools = @import("first_party_tools.zig");
 const platform_process = @import("platform/process.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
 
@@ -211,6 +212,11 @@ pub const ApiUsage = struct {
     }
 };
 
+pub const DynamicToolSpec = struct {
+    name: []const u8,
+    description: []const u8,
+};
+
 // ---------------------------------------------------------------------------
 // Request building
 // ---------------------------------------------------------------------------
@@ -225,6 +231,8 @@ pub const RequestParams = struct {
     max_tokens: u32 = 8192,
     memory_enabled: bool = false,
     toolset: Toolset = .full,
+    dynamic_tools: []const DynamicToolSpec = &.{},
+    disabled_first_party_tools: []const []const u8 = &.{},
 };
 
 pub fn buildRequestJson(allocator: std.mem.Allocator, params: RequestParams, messages: []const RequestMessage, include_tools: bool) ![]u8 {
@@ -393,7 +401,7 @@ fn buildChatCompletionsRequestJsonForMessages(
         try out.appendSlice(allocator, ",\"stream_options\":{\"include_usage\":true}");
     }
     if (include_tools) {
-        try appendToolSchemas(allocator, &out, .{ .include_memory = params.memory_enabled, .toolset = params.toolset });
+        try appendToolSchemas(allocator, &out, .{ .include_memory = params.memory_enabled, .toolset = params.toolset, .dynamic_tools = params.dynamic_tools, .disabled_first_party_tools = params.disabled_first_party_tools });
     }
     try out.append(allocator, '}');
 
@@ -456,7 +464,7 @@ fn buildResponsesRequestJsonForMessages(
     try out.appendSlice(allocator, ",\"stream\":");
     try out.appendSlice(allocator, if (params.stream) "true" else "false");
     if (include_tools) {
-        try appendResponseToolSchemas(allocator, &out, .{ .include_memory = params.memory_enabled, .toolset = params.toolset });
+        try appendResponseToolSchemas(allocator, &out, .{ .include_memory = params.memory_enabled, .toolset = params.toolset, .dynamic_tools = params.dynamic_tools, .disabled_first_party_tools = params.disabled_first_party_tools });
     }
     try out.append(allocator, '}');
 
@@ -482,7 +490,7 @@ fn buildAnthropicRequestJsonForMessages(
     try out.appendSlice(allocator, ",\"messages\":[");
     try appendAnthropicMessages(allocator, &out, messages);
     try out.append(allocator, ']');
-    if (include_tools) try appendAnthropicTools(allocator, &out, .{ .include_memory = params.memory_enabled, .toolset = params.toolset });
+    if (include_tools) try appendAnthropicTools(allocator, &out, .{ .include_memory = params.memory_enabled, .toolset = params.toolset, .dynamic_tools = params.dynamic_tools, .disabled_first_party_tools = params.disabled_first_party_tools });
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
 }
@@ -651,6 +659,8 @@ pub const Toolset = enum { full, subagent };
 pub const ToolSpecOpts = struct {
     include_memory: bool,
     toolset: Toolset = .full,
+    dynamic_tools: []const DynamicToolSpec = &.{},
+    disabled_first_party_tools: []const []const u8 = &.{},
 };
 
 /// Single source of truth for what a subagent may call. Every listed tool is
@@ -664,6 +674,52 @@ pub const subagent_allowed_tools = [_][]const u8{
 pub fn subagentToolAllowed(name: []const u8) bool {
     for (subagent_allowed_tools) |allowed| {
         if (std.mem.eql(u8, name, allowed)) return true;
+    }
+    return false;
+}
+
+pub fn builtinToolNameReserved(name: []const u8) bool {
+    const reserved = [_][]const u8{
+        "terminal_list",
+        "terminal_context",
+        "terminal_snapshot",
+        "terminal_select",
+        "shell_exec",
+        "powershell_exec",
+        "ssh_session_exec",
+        "wsl_session_exec",
+        "terminal_repl_exec",
+        "terminal_answer_prompt",
+        "ask_user",
+        "read_file",
+        "copy_file",
+        "write_file",
+        "edit_file",
+        "ssh_profile_save",
+        "ssh_profile_connect",
+        "tab_new",
+        "tab_close",
+        "skill_info",
+        "wispterm_docs",
+        "websearch",
+        "webread",
+        "pubmed",
+        "subagent",
+        "weixin_send_attachment",
+        "memory_save",
+        "memory_recall",
+        "memory_delete",
+    };
+    for (reserved) |reserved_name| {
+        if (std.mem.eql(u8, name, reserved_name)) return true;
+    }
+    return false;
+}
+
+fn dynamicToolNameSeenBefore(tools: []const DynamicToolSpec, index: usize) bool {
+    const name = tools[index].name;
+    for (tools[0..index]) |previous| {
+        if (std.mem.eql(u8, previous.name, name)) return true;
     }
     return false;
 }
@@ -684,6 +740,7 @@ fn forEachToolSpec(
     const Filtered = struct {
         fn emitTool(c: Ctx, o: ToolSpecOpts, name: []const u8, description: []const u8, properties: []const u8) anyerror!void {
             if (o.toolset == .subagent and !subagentToolAllowed(name)) return;
+            if (first_party_tools.isKnown(name) and first_party_tools.isDisabledName(o.disabled_first_party_tools, name)) return;
             try emit(c, name, description, properties);
         }
     };
@@ -719,6 +776,43 @@ fn forEachToolSpec(
         try Filtered.emitTool(ctx, opts, "memory_recall", "Read the full text of a memory by its name, when its index line looks relevant to the current task.", "{\"name\":{\"type\":\"string\",\"description\":\"The memory name (slug) from the resident index.\"}}");
         try Filtered.emitTool(ctx, opts, "memory_delete", "Delete a memory that is wrong or obsolete.", "{\"name\":{\"type\":\"string\",\"description\":\"The memory name (slug) to delete.\"},\"tier\":{\"type\":\"string\",\"description\":\"Optional: global or project. Omit to search both.\"}}");
     }
+    if (opts.toolset == .full) {
+        for (opts.dynamic_tools, 0..) |tool, i| {
+            if (builtinToolNameReserved(tool.name)) continue;
+            if (dynamicToolNameSeenBefore(opts.dynamic_tools, i)) continue;
+            try Filtered.emitTool(
+                ctx,
+                opts,
+                tool.name,
+                tool.description,
+                "{\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Command-line arguments to pass after the executable name.\"},\"cwd\":{\"type\":\"string\",\"description\":\"Optional working directory. Defaults to the AI Agent working directory.\"},\"timeout_ms\":{\"type\":\"integer\",\"description\":\"Optional timeout. Defaults to ai-agent-command-timeout-ms.\"}}",
+            );
+        }
+    }
+}
+
+const ToolNameCollectorForTesting = struct {
+    allocator: std.mem.Allocator,
+    names: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn emit(self: *ToolNameCollectorForTesting, name: []const u8, description: []const u8, properties: []const u8) !void {
+        _ = description;
+        _ = properties;
+        try self.names.append(self.allocator, name);
+    }
+};
+
+pub fn collectBuiltinToolNamesForTesting(allocator: std.mem.Allocator, opts: ToolSpecOpts) ![]const []const u8 {
+    var ctx = ToolNameCollectorForTesting{ .allocator = allocator };
+    errdefer ctx.names.deinit(allocator);
+    var builtin_opts = opts;
+    builtin_opts.dynamic_tools = &.{};
+    try forEachToolSpec(*ToolNameCollectorForTesting, &ctx, builtin_opts, ToolNameCollectorForTesting.emit);
+    return ctx.names.toOwnedSlice(allocator);
+}
+
+pub fn freeCollectedToolNamesForTesting(allocator: std.mem.Allocator, names: []const []const u8) void {
+    allocator.free(names);
 }
 
 const ToolSchemaEmitter = struct {
@@ -1545,6 +1639,100 @@ test "agent tool set includes webread" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"webread\"") != null);
 }
 
+fn requestParamsWithDisabledToolsForTesting(protocol: ApiProtocol, disabled_tools: []const []const u8) RequestParams {
+    return .{
+        .model = "m",
+        .system_prompt = "",
+        .protocol = protocol,
+        .thinking_enabled = false,
+        .reasoning_effort = "",
+        .stream = false,
+        .max_tokens = 8192,
+        .memory_enabled = true,
+        .disabled_first_party_tools = disabled_tools,
+    };
+}
+
+fn expectToolSchemaNameForTesting(json: []const u8, name: []const u8, present: bool) !void {
+    var buf: [128]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&buf, "\"name\":\"{s}\"", .{name});
+    if (present) {
+        try std.testing.expect(std.mem.indexOf(u8, json, needle) != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, json, needle) == null);
+    }
+}
+
+test "disabled webread is omitted from chat_completions tool schemas" {
+    const a = std.testing.allocator;
+    const disabled = [_][]const u8{"webread"};
+    const params = requestParamsWithDisabledToolsForTesting(.chat_completions, disabled[0..]);
+    const json = try buildRequestJson(a, params, &.{}, true);
+    defer a.free(json);
+
+    try expectToolSchemaNameForTesting(json, "webread", false);
+    try expectToolSchemaNameForTesting(json, "websearch", true);
+}
+
+test "disabled webread is omitted from responses tool schemas" {
+    const a = std.testing.allocator;
+    const disabled = [_][]const u8{"webread"};
+    const params = requestParamsWithDisabledToolsForTesting(.responses, disabled[0..]);
+    const json = try buildRequestJson(a, params, &.{}, true);
+    defer a.free(json);
+
+    try expectToolSchemaNameForTesting(json, "webread", false);
+    try expectToolSchemaNameForTesting(json, "websearch", true);
+}
+
+test "disabled webread is omitted from anthropic tool schemas" {
+    const a = std.testing.allocator;
+    const disabled = [_][]const u8{"webread"};
+    const params = requestParamsWithDisabledToolsForTesting(.anthropic, disabled[0..]);
+    const json = try buildRequestJson(a, params, &.{}, true);
+    defer a.free(json);
+
+    try expectToolSchemaNameForTesting(json, "webread", false);
+    try expectToolSchemaNameForTesting(json, "websearch", true);
+}
+
+test "subagent tool schemas inherit disabled first-party tools" {
+    const a = std.testing.allocator;
+    const disabled = [_][]const u8{"webread"};
+    const names = try collectBuiltinToolNamesForTesting(a, .{
+        .include_memory = true,
+        .toolset = .subagent,
+        .disabled_first_party_tools = disabled[0..],
+    });
+    defer freeCollectedToolNamesForTesting(a, names);
+
+    try std.testing.expect(indexOfToolNameForTesting(names, "webread") == null);
+    try std.testing.expect(indexOfToolNameForTesting(names, "websearch") != null);
+}
+
+fn indexOfToolNameForTesting(names: []const []const u8, target: []const u8) ?usize {
+    for (names, 0..) |name, i| {
+        if (std.mem.eql(u8, name, target)) return i;
+    }
+    return null;
+}
+
+test "collectBuiltinToolNamesForTesting names all active first-party catalog tools" {
+    const a = std.testing.allocator;
+    const definitions = try first_party_tools.activeDefinitions(a);
+    defer first_party_tools.freeDefinitions(a, definitions);
+
+    const names = try collectBuiltinToolNamesForTesting(a, .{ .include_memory = true });
+    defer freeCollectedToolNamesForTesting(a, names);
+
+    for (definitions) |definition| {
+        try std.testing.expect(indexOfToolNameForTesting(names, definition.name) != null);
+    }
+    for (names) |name| {
+        try std.testing.expect(first_party_tools.isKnown(name));
+    }
+}
+
 test "agent tool set includes pubmed" {
     const a = std.testing.allocator;
     var msgs = [_]RequestMessage{.{ .role = .user, .content = @constCast("hi") }};
@@ -1567,6 +1755,121 @@ test "buildRequestJson advertises memory tools only when enabled" {
     const off = try buildRequestJson(a, params_off, &.{}, true);
     defer a.free(off);
     try std.testing.expect(std.mem.indexOf(u8, off, "\"memory_save\"") == null);
+}
+
+test "buildRequestJson advertises enabled binary tools" {
+    const a = std.testing.allocator;
+    const tools = [_]DynamicToolSpec{.{
+        .name = "agent_docx_review",
+        .description = "Use for DOCX tracked-change review.",
+    }};
+    const params = RequestParams{
+        .model = "m",
+        .system_prompt = "s",
+        .protocol = .chat_completions,
+        .thinking_enabled = false,
+        .reasoning_effort = "",
+        .stream = false,
+        .dynamic_tools = tools[0..],
+    };
+    const json = try buildRequestJson(a, params, &.{}, true);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent_docx_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"args\"") != null);
+}
+
+test "disabled first-party list does not hide dynamic binary tools" {
+    const a = std.testing.allocator;
+    const disabled = [_][]const u8{"agent_docx_review"};
+    const tools = [_]DynamicToolSpec{.{
+        .name = "agent_docx_review",
+        .description = "Use for DOCX tracked-change review.",
+    }};
+    const params = RequestParams{
+        .model = "m",
+        .system_prompt = "s",
+        .protocol = .chat_completions,
+        .thinking_enabled = false,
+        .reasoning_effort = "",
+        .stream = false,
+        .dynamic_tools = tools[0..],
+        .disabled_first_party_tools = disabled[0..],
+    };
+    const json = try buildRequestJson(a, params, &.{}, true);
+    defer a.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent_docx_review\"") != null);
+}
+
+test "collectBuiltinToolNamesForTesting excludes dynamic binary tools" {
+    const a = std.testing.allocator;
+    const tools = [_]DynamicToolSpec{.{
+        .name = "agent_docx_review",
+        .description = "Use for DOCX tracked-change review.",
+    }};
+    const names = try collectBuiltinToolNamesForTesting(a, .{ .include_memory = true, .dynamic_tools = tools[0..] });
+    defer freeCollectedToolNamesForTesting(a, names);
+
+    try std.testing.expect(indexOfToolNameForTesting(names, "agent_docx_review") == null);
+    for (names) |name| {
+        try std.testing.expect(first_party_tools.isKnown(name));
+    }
+}
+
+test "dynamic binary tools skip built-in tool name collisions" {
+    const a = std.testing.allocator;
+    const tools = [_]DynamicToolSpec{
+        .{ .name = "terminal_list", .description = "Collision with a built-in tool." },
+        .{ .name = "agent_docx_review", .description = "Use for DOCX tracked-change review." },
+    };
+    const params = RequestParams{
+        .model = "m",
+        .system_prompt = "s",
+        .protocol = .chat_completions,
+        .thinking_enabled = false,
+        .reasoning_effort = "",
+        .stream = false,
+        .dynamic_tools = tools[0..],
+    };
+    const json = try buildRequestJson(a, params, &.{}, true);
+    defer a.free(json);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, json, "\"name\":\"terminal_list\""));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent_docx_review\"") != null);
+}
+
+test "dynamic binary tools skip duplicate dynamic tool names" {
+    const a = std.testing.allocator;
+    const tools = [_]DynamicToolSpec{
+        .{ .name = "agent_docx_review", .description = "First DOCX review tool." },
+        .{ .name = "agent_docx_review", .description = "Second DOCX review tool." },
+        .{ .name = "agent_pdf_review", .description = "PDF review tool." },
+    };
+    const params = RequestParams{
+        .model = "m",
+        .system_prompt = "s",
+        .protocol = .chat_completions,
+        .thinking_enabled = false,
+        .reasoning_effort = "",
+        .stream = false,
+        .dynamic_tools = tools[0..],
+    };
+    const json = try buildRequestJson(a, params, &.{}, true);
+    defer a.free(json);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, json, "\"name\":\"agent_docx_review\""));
+    try std.testing.expect(std.mem.indexOf(u8, json, "First DOCX review tool.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "Second DOCX review tool.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent_pdf_review\"") != null);
+}
+
+test "subagent toolset excludes binary tools" {
+    const a = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+    const tools = [_]DynamicToolSpec{.{ .name = "agent_docx_review", .description = "DOCX" }};
+    try appendToolSchemas(a, &out, .{ .include_memory = true, .toolset = .subagent, .dynamic_tools = tools[0..] });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "agent_docx_review") == null);
 }
 
 // ---------------------------------------------------------------------------

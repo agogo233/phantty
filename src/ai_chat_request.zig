@@ -9,6 +9,7 @@ const ChatRequest = ai_chat.ChatRequest;
 const ai_chat_protocol = @import("ai_chat_protocol.zig");
 const ai_skill_distill = @import("ai_skill_distill.zig");
 const ai_chat_tools = @import("ai_chat_tools.zig");
+const first_party_tools = @import("first_party_tools.zig");
 const web_search = @import("web_search.zig");
 const web_read = @import("web_read.zig");
 const pubmed = @import("pubmed.zig");
@@ -22,6 +23,17 @@ const ImageBlock = ai_chat_protocol.ImageBlock;
 const ApiResult = ai_chat_protocol.ApiResult;
 const ApiUsage = ai_chat_protocol.ApiUsage;
 const Role = ai_chat_protocol.Role;
+pub const ApiProtocol = ai_chat.ApiProtocol;
+
+pub const OneShotProfile = struct {
+    base_url: []const u8,
+    api_key: []const u8,
+    model: []const u8,
+    protocol: ApiProtocol,
+    thinking_enabled: bool,
+    reasoning_effort: []const u8,
+    max_tokens: u32,
+};
 
 // ---------------------------------------------------------------------------
 // MOVE: worker-thread entry points
@@ -458,6 +470,71 @@ fn runChatRequest(request: *const ChatRequest) !ApiResult {
     return runChatRequestForMessages(request, request.messages, request.agent_enabled);
 }
 
+pub fn runOneShotPrompt(allocator: std.mem.Allocator, profile: OneShotProfile, system_prompt: []const u8, user_prompt: []const u8) ![]u8 {
+    const thinking = if (profile.thinking_enabled) ai_chat.DEFAULT_THINKING else "disabled";
+    const session = try Session.initWithVision(
+        allocator,
+        "One shot",
+        profile.base_url,
+        profile.api_key,
+        profile.model,
+        profile.protocol.name(),
+        system_prompt,
+        thinking,
+        profile.reasoning_effort,
+        "false",
+        "false",
+        ai_chat.DEFAULT_VISION,
+    );
+    defer session.deinit();
+
+    const base_url = try allocator.dupe(u8, profile.base_url);
+    defer allocator.free(base_url);
+    const api_key = try allocator.dupe(u8, profile.api_key);
+    defer allocator.free(api_key);
+    const model = try allocator.dupe(u8, profile.model);
+    defer allocator.free(model);
+    const system_prompt_copy = try allocator.dupe(u8, system_prompt);
+    defer allocator.free(system_prompt_copy);
+    const reasoning_effort = try allocator.dupe(u8, profile.reasoning_effort);
+    defer allocator.free(reasoning_effort);
+
+    const messages = try allocator.alloc(RequestMessage, 1);
+    errdefer allocator.free(messages);
+    messages[0] = try requestMessageWithClonedFields(allocator, .user, user_prompt, null, null, null, null);
+    defer {
+        messages[0].deinit(allocator);
+        allocator.free(messages);
+    }
+
+    const request = ChatRequest{
+        .allocator = allocator,
+        .session = session,
+        .base_url = base_url,
+        .api_key = api_key,
+        .model = model,
+        .protocol = oneShotRequestProtocol(session),
+        .system_prompt = system_prompt_copy,
+        .messages = messages,
+        .thinking_enabled = profile.thinking_enabled,
+        .reasoning_effort = reasoning_effort,
+        .stream = false,
+        .max_tokens = profile.max_tokens,
+        .agent_enabled = false,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .started_ms = std.time.milliTimestamp(),
+    };
+
+    const result = try runChatRequestForMessages(&request, messages, false);
+    defer result.deinit(allocator);
+    return allocator.dupe(u8, result.content);
+}
+
+fn oneShotRequestProtocol(session: *const Session) ApiProtocol {
+    return session.protocol;
+}
+
 fn runChatRequestForMessages(request: *const ChatRequest, messages: []const RequestMessage, include_tools: bool) !ApiResult {
     if (ai_chat.requestCancelled(request)) return error.Canceled;
     const allocator = request.allocator;
@@ -766,6 +843,9 @@ fn toolAsk(ctx: *anyopaque, question: []const u8, options: []const ai_chat_types
 
 fn toolContextFromRequest(request: *ChatRequest) ai_chat_types.ToolContext {
     var settings = ai_chat.currentAgentSettings();
+    settings.dynamic_tools = request.dynamic_tools;
+    settings.dynamic_binary_tools = request.dynamic_binary_tools;
+    settings.disabled_first_party_tools = request.disabled_first_party_tools;
     // Per-conversation override beats the global default.
     if (request.session.workingDirOverride()) |override| settings.working_dir = override;
     return .{
@@ -786,6 +866,9 @@ fn toolContextFromRequest(request: *ChatRequest) ai_chat_types.ToolContext {
 }
 
 pub fn executeToolCall(request: *ChatRequest, call: ToolCall) ![]u8 {
+    if (first_party_tools.isKnown(call.name) and first_party_tools.isDisabledName(request.disabled_first_party_tools, call.name)) {
+        return std.fmt.allocPrint(request.allocator, "Tool is disabled: {s}", .{call.name});
+    }
     if (std.mem.eql(u8, call.name, "subagent")) return subagentToolCall(request, call);
     var tool_ctx = toolContextFromRequest(request);
     const result = try ai_chat_tools.executeToolCall(&tool_ctx, call);
@@ -809,6 +892,36 @@ test "ai chat network failure result includes endpoint and underlying error" {
         "HTTP request failed before response: UnknownHostName (https://api.example.test/v1/responses)",
         result.content,
     );
+}
+
+test "one-shot request protocol uses normalized session protocol" {
+    const allocator = std.testing.allocator;
+    const profile = OneShotProfile{
+        .base_url = "https://api.anthropic.com",
+        .api_key = "",
+        .model = "claude-sonnet",
+        .protocol = .chat_completions,
+        .thinking_enabled = false,
+        .reasoning_effort = "",
+        .max_tokens = 8192,
+    };
+    const session = try Session.initWithVision(
+        allocator,
+        "One shot",
+        profile.base_url,
+        profile.api_key,
+        profile.model,
+        profile.protocol.name(),
+        "",
+        "disabled",
+        profile.reasoning_effort,
+        "false",
+        "false",
+        ai_chat.DEFAULT_VISION,
+    );
+    defer session.deinit();
+
+    try std.testing.expectEqual(ApiProtocol.anthropic, oneShotRequestProtocol(session));
 }
 
 test "ai chat request json includes deepseek thinking mode" {
@@ -1180,6 +1293,65 @@ test "subagent tool call requires a task argument" {
     const out = try executeToolCall(env.request, call);
     defer a.free(out);
     try std.testing.expectEqualStrings("Missing task", out);
+}
+
+test "executeToolCall rejects disabled subagent before the wrapper special case" {
+    const a = std.testing.allocator;
+    const env = try testSessionAndRequest(a);
+    defer env.session.deinit();
+    defer env.request.deinit();
+
+    const disabled = try a.alloc([]u8, 1);
+    disabled[0] = try a.dupe(u8, "subagent");
+    env.request.disabled_first_party_tools = disabled;
+
+    var call = ToolCall{
+        .id = try a.dupe(u8, "c1"),
+        .name = try a.dupe(u8, "subagent"),
+        .arguments = try a.dupe(u8, "{}"),
+    };
+    defer call.deinit(a);
+
+    const out = try executeToolCall(env.request, call);
+    defer a.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "Tool is disabled: subagent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Missing task") == null);
+}
+
+test "request-owned dynamic binary tool dispatches through executeToolCall" {
+    const a = std.testing.allocator;
+    const saved_settings = ai_chat.currentAgentSettings();
+    defer ai_chat.configureAgent(saved_settings);
+    ai_chat.configureAgent(.{ .enabled = true, .permission = .full });
+    const builtin = @import("builtin");
+    const executable = if (builtin.os.tag == .windows) "cmd.exe" else "/bin/echo";
+    const arguments = if (builtin.os.tag == .windows)
+        "{\"args\":[\"/C\",\"echo\",\"hello\",\"runtime\"]}"
+    else
+        "{\"args\":[\"hello\",\"runtime\"]}";
+
+    const env = try testSessionAndRequest(a);
+    defer env.session.deinit();
+    defer env.request.deinit();
+    const runtime = try a.alloc(ai_chat_types.DynamicBinaryTool, 1);
+    runtime[0] = .{
+        .function_name = try a.dupe(u8, "fake_tool"),
+        .executable_abs = try a.dupe(u8, executable),
+        .description = try a.dupe(u8, "Echo test"),
+    };
+    env.request.dynamic_binary_tools = runtime;
+
+    const out = try executeToolCall(env.request, .{
+        .id = @constCast("1"),
+        .name = @constCast("fake_tool"),
+        .arguments = @constCast(arguments),
+    });
+    defer a.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "Unknown tool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "runtime") != null);
 }
 
 test "applySubagentUsage merges into the loop total" {

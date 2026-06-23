@@ -10,6 +10,7 @@ const agent_file_copy = @import("agent_file_copy.zig");
 const scp = @import("scp.zig");
 const ToolSshConnection = types.SshConnection;
 const ai_chat_protocol = @import("ai_chat_protocol.zig");
+const first_party_tools = @import("first_party_tools.zig");
 const ToolCall = ai_chat_protocol.ToolCall;
 const ToolContext = types.ToolContext;
 const ToolSurface = types.ToolSurface;
@@ -45,6 +46,9 @@ pub const COPILOT_CONTEXT_LINES: usize = 40;
 
 pub fn executeToolCall(ctx: *ToolContext, call: ToolCall) ![]u8 {
     if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
+    if (first_party_tools.isKnown(call.name) and first_party_tools.isDisabledName(ctx.settings.disabled_first_party_tools, call.name)) {
+        return std.fmt.allocPrint(ctx.allocator, "Tool is disabled: {s}", .{call.name});
+    }
     if (std.mem.eql(u8, call.name, "terminal_list")) {
         return terminalListTool(ctx);
     }
@@ -276,6 +280,18 @@ pub fn executeToolCall(ctx: *ToolContext, call: ToolCall) ![]u8 {
             null;
         return agent_memory.deleteMemory(ctx.allocator, ctx.settings.working_dir orelse "", name, tier_opt);
     }
+    if (findDynamicBinaryTool(ctx.settings.dynamic_binary_tools, call.name)) |tool| {
+        const args = parseArgs(ctx.allocator, call.arguments) orelse return ctx.allocator.dupe(u8, "Invalid tool arguments");
+        defer args.deinit();
+        const argv_args = jsonStringArrayArg(ctx.allocator, args.value, "args") catch |err| switch (err) {
+            error.InvalidToolArguments => return ctx.allocator.dupe(u8, "Invalid tool arguments"),
+            else => return err,
+        };
+        defer freeStringArray(ctx.allocator, argv_args);
+        const cwd = jsonStringArg(args.value, "cwd") orelse ctx.settings.working_dir;
+        const timeout_ms = jsonIntArg(args.value, "timeout_ms") orelse ctx.settings.command_timeout_ms;
+        return dynamicBinaryTool(ctx, tool, argv_args, cwd, timeout_ms);
+    }
     return std.fmt.allocPrint(ctx.allocator, "Unknown tool: {s}", .{call.name});
 }
 
@@ -319,6 +335,39 @@ fn jsonBoolArg(root: std.json.Value, name: []const u8) ?bool {
         .bool => |b| b,
         else => null,
     };
+}
+
+fn findDynamicBinaryTool(tools: []const types.DynamicBinaryTool, name: []const u8) ?types.DynamicBinaryTool {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.function_name, name)) return tool;
+    }
+    return null;
+}
+
+fn jsonStringArrayArg(allocator: std.mem.Allocator, value: std.json.Value, key: []const u8) ![]const []const u8 {
+    if (value != .object) return error.InvalidToolArguments;
+    const array_value = value.object.get(key) orelse return allocator.alloc([]const u8, 0);
+    if (array_value != .array) return error.InvalidToolArguments;
+
+    var out = try allocator.alloc([]const u8, array_value.array.items.len);
+    var n: usize = 0;
+    errdefer {
+        for (out[0..n]) |item| allocator.free(item);
+        allocator.free(out);
+    }
+
+    for (array_value.array.items) |item| {
+        if (item != .string) return error.InvalidToolArguments;
+        out[n] = try allocator.dupe(u8, item.string);
+        n += 1;
+    }
+
+    return out;
+}
+
+fn freeStringArray(allocator: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
 }
 
 /// Extract the `options` array of an ask_user call into `buf`. Each item needs a
@@ -816,6 +865,43 @@ fn localCommandExecTool(ctx: *const ToolContext, command: []const u8, cwd: ?[]co
     return truncateOwned(ctx.allocator, ctx.settings, try out.toOwnedSlice(ctx.allocator));
 }
 
+fn dynamicBinaryTool(ctx: *ToolContext, tool: types.DynamicBinaryTool, args: []const []const u8, cwd: ?[]const u8, timeout_ms: u32) ![]u8 {
+    if (ctx.isCancelled()) return ctx.allocator.dupe(u8, "Canceled.");
+
+    var approval_text = std.ArrayListUnmanaged(u8).empty;
+    defer approval_text.deinit(ctx.allocator);
+    try approval_text.appendSlice(ctx.allocator, tool.function_name);
+    for (args) |arg| {
+        try approval_text.append(ctx.allocator, ' ');
+        try approval_text.appendSlice(ctx.allocator, arg);
+    }
+
+    switch (ctx.settings.permission) {
+        .confirm, .auto => {
+            if (!ctx.requestApproval(tool.function_name, approval_text.items, "Run installed binary tool")) {
+                return deniedResult(ctx.allocator, approval_text.items, "operator denied binary tool execution");
+            }
+        },
+        .full => {},
+    }
+
+    const argv = try ctx.allocator.alloc([]const u8, args.len + 1);
+    defer ctx.allocator.free(argv);
+    argv[0] = tool.executable_abs;
+    for (args, 0..) |arg, i| argv[i + 1] = arg;
+
+    const result = runArgv(ctx.allocator, argv, cwd, ctx.settings.output_limit, timeout_ms, ctx) catch |err| {
+        return std.fmt.allocPrint(ctx.allocator, "Binary tool {s} failed: {}", .{ tool.function_name, err });
+    };
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    if (result.timed_out) try out.appendSlice(ctx.allocator, "timed_out=true\n");
+    try out.print(ctx.allocator, "exit_code={d}\nstdout:\n{s}\nstderr:\n{s}", .{ result.exit_code, result.stdout, result.stderr });
+    return truncateOwned(ctx.allocator, ctx.settings, try out.toOwnedSlice(ctx.allocator));
+}
+
 pub const ShellResult = struct {
     exit_code: i32,
     stdout: []u8,
@@ -1265,7 +1351,11 @@ fn terminalAnswerPromptTool(ctx: *ToolContext, surface_id: ?[]const u8, answer: 
         return ctx.allocator.dupe(u8, "Failed to read terminal snapshot.");
     defer ctx.allocator.free(screen);
 
-    const detection = agent_detector.detect(surface.title, screen);
+    const detection: agent_detector.Detection = .{
+        .app = surface.agent_app,
+        .state = surface.agent_state,
+        .confidence = surface.agent_confidence,
+    };
     if (detection.app == .none or (detection.state != .waiting_approval and detection.state != .needs_input)) {
         const out = try std.fmt.allocPrint(
             ctx.allocator,
@@ -2148,6 +2238,7 @@ fn resolveFileTarget(ctx: *ToolContext, surface_id: ?[]const u8) !FileTarget {
         return .{ .err = try allocNoSurfaceError(ctx.allocator, snapshot, sid) };
     };
     if (!surface.is_ssh) return .local;
+    if (surface.ssh_connection) |conn| return .{ .remote = conn };
     if (ctx.sshConnectionForSurface(surface.id)) |conn| return .{ .remote = conn };
     return .{ .err = try std.fmt.allocPrint(ctx.allocator, "Surface {s} is an SSH terminal but its connection is unavailable.", .{surface.id}) };
 }
@@ -2161,6 +2252,9 @@ fn resolveCopyEndpoint(ctx: *ToolContext, surface_id: ?[]const u8) !CopyEndpoint
         return .{ .err = try allocNoSurfaceError(ctx.allocator, snapshot, sid) };
     };
     if (surface.is_ssh) {
+        if (surface.ssh_connection) |conn| {
+            return .{ .ssh = .{ .surface = surface, .conn = conn } };
+        }
         if (ctx.sshConnectionForSurface(surface.id)) |conn| {
             return .{ .ssh = .{ .surface = surface, .conn = conn } };
         }
@@ -2651,6 +2745,17 @@ fn fakeCancelled(_: *anyopaque) bool {
     return false;
 }
 
+const FakeApprover = struct {
+    allowed: bool,
+    called: bool = false,
+
+    fn approve(ctx: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
+        const self: *FakeApprover = @ptrCast(@alignCast(ctx));
+        self.called = true;
+        return self.allowed;
+    }
+};
+
 const FakeAsker = struct {
     result: types.AskResult,
     captured_count: usize = 0,
@@ -2730,6 +2835,57 @@ test "ask_user tool rejects fewer than two options without asking" {
     try std.testing.expectEqual(@as(usize, 0), asker.captured_count); // ask hook never called
 }
 
+test "executeToolCall rejects disabled first-party webread before validating args" {
+    const disabled = [_][]const u8{"webread"};
+    var dummy: u8 = 0;
+    var ctx = ToolContext{
+        .allocator = std.testing.allocator,
+        .ctx = &dummy,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .settings = .{
+            .disabled_first_party_tools = disabled[0..],
+        },
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+
+    const out = try executeToolCall(&ctx, .{
+        .id = @constCast("c1"),
+        .name = @constCast("webread"),
+        .arguments = @constCast("not-json"),
+    });
+    defer std.testing.allocator.free(out);
+
+    try std.testing.expectEqualStrings("Tool is disabled: webread", out);
+}
+
+test "executeToolCall does not treat disabled dynamic names as first-party tools" {
+    const disabled = [_][]const u8{"project_dynamic_tool"};
+    var dummy: u8 = 0;
+    var ctx = ToolContext{
+        .allocator = std.testing.allocator,
+        .ctx = &dummy,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .settings = .{
+            .disabled_first_party_tools = disabled[0..],
+        },
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+
+    const out = try executeToolCall(&ctx, .{
+        .id = @constCast("c1"),
+        .name = @constCast("project_dynamic_tool"),
+        .arguments = @constCast("{}"),
+    });
+    defer std.testing.allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "Unknown tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Tool is disabled") == null);
+}
+
 test "isDangerousCommand flags destructive verbs without a Session" {
     var dummy: u8 = 0;
     var ctx = types.ToolContext{
@@ -2744,6 +2900,101 @@ test "isDangerousCommand flags destructive verbs without a Session" {
     _ = &ctx;
     try std.testing.expect(isDangerousCommand("rm -rf /tmp/x"));
     try std.testing.expect(!isDangerousCommand("ls -la"));
+}
+
+test "executeToolCall dispatches enabled binary tool by argv" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    const executable = if (builtin.os.tag == .windows) "cmd.exe" else "/bin/echo";
+    const arguments = if (builtin.os.tag == .windows)
+        "{\"args\":[\"/C\",\"echo\",\"hello\",\"world\"]}"
+    else
+        "{\"args\":[\"hello\",\"world\"]}";
+    const tools = [_]types.DynamicBinaryTool{.{
+        .function_name = "fake_tool",
+        .executable_abs = executable,
+        .description = "Echo test",
+    }};
+    var ctx = ToolContext{
+        .allocator = a,
+        .ctx = &dummy,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .settings = .{
+            .permission = .full,
+            .working_dir = null,
+            .dynamic_binary_tools = tools[0..],
+        },
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    const out = try executeToolCall(&ctx, .{
+        .id = @constCast("1"),
+        .name = @constCast("fake_tool"),
+        .arguments = @constCast(arguments),
+    });
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Unknown tool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "world") != null);
+}
+
+test "executeToolCall asks before binary tool in auto mode" {
+    var asker = FakeApprover{ .allowed = false };
+    const tools = [_]types.DynamicBinaryTool{.{
+        .function_name = "fake_tool",
+        .executable_abs = "/bin/echo",
+        .description = "Echo",
+    }};
+    var ctx = ToolContext{
+        .allocator = std.testing.allocator,
+        .ctx = &asker,
+        .settings = .{
+            .permission = .auto,
+            .dynamic_binary_tools = tools[0..],
+        },
+        .tool_host = null,
+        .tool_snapshot = null,
+        .approve = FakeApprover.approve,
+        .cancelled = fakeCancelled,
+    };
+    const out = try executeToolCall(&ctx, .{
+        .id = @constCast("1"),
+        .name = @constCast("fake_tool"),
+        .arguments = @constCast("{\"args\":[\"hi\"]}"),
+    });
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(asker.called);
+    try std.testing.expect(std.mem.indexOf(u8, out, "denied") != null);
+}
+
+test "executeToolCall reports invalid dynamic binary tool args as a tool result" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    const tools = [_]types.DynamicBinaryTool{.{
+        .function_name = "fake_tool",
+        .executable_abs = "/bin/echo",
+        .description = "Echo test",
+    }};
+    var ctx = ToolContext{
+        .allocator = a,
+        .ctx = &dummy,
+        .tool_host = null,
+        .tool_snapshot = null,
+        .settings = .{
+            .permission = .full,
+            .dynamic_binary_tools = tools[0..],
+        },
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+    const out = try executeToolCall(&ctx, .{
+        .id = @constCast("1"),
+        .name = @constCast("fake_tool"),
+        .arguments = @constCast("{\"args\":\"not-array\"}"),
+    });
+    defer a.free(out);
+    try std.testing.expectEqualStrings("Invalid tool arguments", out);
 }
 
 // ---------------------------------------------------------------------------
@@ -3994,6 +4245,74 @@ test "copy_file copies a local artifact into wispterm-files by default" {
     try std.testing.expectEqualStrings("artifact-bytes", copied);
     try std.testing.expect(std.mem.indexOf(u8, out, "local_path=") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "wispterm-files") != null);
+}
+
+test "file tool resolution uses ssh connection carried by the request snapshot" {
+    const a = std.testing.allocator;
+    const conn = ToolSshConnection.fromParts(.{
+        .user = "alice",
+        .host = "example.test",
+        .port = "2222",
+        .proxy_jump = "jump.example.test",
+    });
+    var surfaces = try a.alloc(ToolSurface, 1);
+    surfaces[0] = .{
+        .id = try a.dupe(u8, "ssh-surface"),
+        .title = try a.dupe(u8, "SSH"),
+        .cwd = try a.dupe(u8, "/home/alice"),
+        .snapshot = try a.dupe(u8, "$ "),
+        .tab_index = 0,
+        .focused = true,
+        .is_ssh = true,
+        .is_wsl = false,
+        .ssh_connection = conn,
+        .agent_app = .none,
+        .agent_state = .none,
+        .agent_confidence = 0,
+        .ptr = @ptrFromInt(1),
+    };
+    const snapshot = ToolSnapshot{ .surfaces = surfaces, .active_tab = 0 };
+    defer snapshot.deinit(a);
+
+    var dummy: u8 = 0;
+    var ctx = ToolContext{
+        .allocator = a,
+        .ctx = &dummy,
+        .tool_host = null,
+        .tool_snapshot = snapshot,
+        .settings = .{},
+        .approve = fakeApprove,
+        .cancelled = fakeCancelled,
+    };
+
+    const target = try resolveFileTarget(&ctx, "ssh-surface");
+    switch (target) {
+        .remote => |remote| {
+            try std.testing.expectEqualStrings("alice", remote.user());
+            try std.testing.expectEqualStrings("example.test", remote.host());
+            try std.testing.expectEqualStrings("2222", remote.port());
+            try std.testing.expectEqualStrings("jump.example.test", remote.proxyJump());
+        },
+        .err => |msg| {
+            defer a.free(msg);
+            return error.TestExpectedEqual;
+        },
+        .local => return error.TestExpectedEqual,
+    }
+
+    const endpoint = try resolveCopyEndpoint(&ctx, "ssh-surface");
+    switch (endpoint) {
+        .ssh => |remote| {
+            try std.testing.expectEqualStrings("ssh-surface", remote.surface.id);
+            try std.testing.expectEqualStrings("alice", remote.conn.user());
+            try std.testing.expectEqualStrings("example.test", remote.conn.host());
+        },
+        .err => |msg| {
+            defer a.free(msg);
+            return error.TestExpectedEqual;
+        },
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "write_file creates a local file in full permission mode" {

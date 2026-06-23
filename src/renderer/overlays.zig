@@ -6,6 +6,7 @@
 const std = @import("std");
 const AppWindow = @import("../AppWindow.zig");
 const ai_chat = @import("../ai_chat.zig");
+const ai_chat_protocol = @import("../ai_chat_protocol.zig");
 const titlebar = AppWindow.titlebar;
 const font = AppWindow.font;
 const tab = AppWindow.tab;
@@ -36,6 +37,7 @@ const weixin_types = @import("../weixin/types.zig");
 const i18n = @import("../i18n.zig");
 const ai_model_switch = @import("../ai_model_switch.zig");
 const claude_integration = @import("../claude_integration.zig");
+const codex_integration = @import("../codex_integration.zig");
 const platform_atomic_file = @import("../platform/atomic_file.zig");
 const agent_detector = @import("../agent_detector.zig");
 
@@ -552,6 +554,7 @@ fn executeCommand(action: CommandAction) void {
         .toggle_ai_copilot => AppWindow.toggleAiCopilot(),
         .manage_ai_profiles => openAiListFromCommandPalette(),
         .select_agent_history => commandPaletteOpenAgentHistory(),
+        .load_copilot_conversation => AppWindow.openCopilotConversationPicker(),
         .split_right => AppWindow.splitFocused(.right),
         .split_down => AppWindow.splitFocused(.down),
         .split_left => AppWindow.splitFocused(.left),
@@ -602,6 +605,8 @@ fn executeCommand(action: CommandAction) void {
         .show_whats_new => showWhatsNew(),
         .install_claude_code_integration => installClaudeCodeIntegration(),
         .remove_claude_code_integration => removeClaudeCodeIntegration(),
+        .install_codex_integration => installCodexIntegration(),
+        .remove_codex_integration => removeCodexIntegration(),
         .open_skill_center => {
             _ = AppWindow.spawnSkillCenterTab();
         },
@@ -1426,6 +1431,7 @@ fn renderTitlebarTextStrongLimited(text: []const u8, x_start: f32, y: f32, color
 }
 
 const jupyter_picker = @import("../jupyter_picker.zig");
+const copilot_picker = @import("../copilot_picker.zig");
 
 /// Render the multi-server Jupyter picker overlay.
 pub fn renderJupyterPicker(window_width: f32, window_height: f32) void {
@@ -1488,6 +1494,84 @@ pub fn renderJupyterPicker(window_width: f32, window_height: f32) void {
         ui_pipeline.fillQuadAlpha(sb_x, track_gl_y, sb_w, track_h, mixColor(bg, fg, 0.25), 0.30);
         const thumb_h = @max(24.0, @round(track_h * vis_f / total_f));
         const max_scroll_f: f32 = @floatFromInt(n - visible);
+        const scroll_f: f32 = @floatFromInt(scroll);
+        const thumb_offset = if (max_scroll_f > 0) @round((track_h - thumb_h) * (scroll_f / max_scroll_f)) else 0;
+        const thumb_gl_y = @round(window_height - (track_top_px + thumb_offset) - thumb_h);
+        ui_pipeline.fillQuadAlpha(sb_x, thumb_gl_y, sb_w, thumb_h, accent, 0.55);
+    }
+}
+
+/// Render the Copilot conversation picker overlay (mirror of renderJupyterPicker).
+pub fn renderCopilotPicker(window_width: f32, window_height: f32) void {
+    if (!copilot_picker.isVisible()) return;
+    const total = copilot_picker.rowCount(); // conversations + "+ New" row
+    if (total == 0) return;
+
+    const bg = AppWindow.g_theme.background;
+    const fg = AppWindow.g_theme.foreground;
+    const accent = AppWindow.g_theme.cursor_color;
+    const panel = mixColor(bg, fg, 0.05);
+    const border = mixColor(bg, fg, 0.18);
+    const sel_bg = mixColor(bg, accent, 0.5);
+    const text_color = mixColor(bg, fg, 0.88);
+    const meta_color = mixColor(bg, fg, 0.54);
+
+    const row_h: f32 = @max(28.0, font.g_titlebar_cell_height + 12);
+    const box_w: f32 = @min(window_width - 80, 720);
+    const title_h: f32 = row_h;
+    const bottom_pad: f32 = 16;
+    const usable_h = @max(row_h, window_height - 32.0 - title_h - bottom_pad);
+    const fit: usize = @intFromFloat(@max(1.0, @floor(usable_h / row_h)));
+    const visible = @min(total, fit);
+    const scroll = copilot_picker.firstVisible(copilot_picker.selectedIndex(), visible, total);
+    const box_h: f32 = clampOverlayBoxHeight(title_h + row_h * @as(f32, @floatFromInt(visible)) + bottom_pad, window_height);
+    const box_x = @round((window_width - box_w) / 2);
+    const box_top = @round(@max(16.0, (window_height - box_h) / 2));
+    const box_y = @round(window_height - box_top - box_h);
+
+    ui_pipeline.fillQuadAlpha(0, 0, window_width, window_height, .{ 0.0, 0.0, 0.0 }, 0.30);
+    renderRoundedQuadAlpha(box_x - 1, box_y - 1, box_w + 2, box_h + 2, 9, border, 0.5);
+    renderRoundedQuadAlpha(box_x, box_y, box_w, box_h, 8, panel, 0.99);
+
+    const title_y = @round(box_y + box_h - title_h + (title_h - font.g_titlebar_cell_height) / 2);
+    _ = titlebar.renderTextLimited(i18n.s().copilot_picker_title, box_x + 16, title_y, mixColor(bg, fg, 0.6), box_w - 32);
+
+    const now_ms = std.time.milliTimestamp();
+    var display: usize = 0;
+    while (display < visible) : (display += 1) {
+        const i = scroll + display;
+        if (i >= total) break;
+        const row_top_px = box_top + title_h + row_h * @as(f32, @floatFromInt(display));
+        const row_y = @round(window_height - row_top_px - row_h);
+        if (i == copilot_picker.selectedIndex()) {
+            renderRoundedQuadAlpha(box_x + 8, row_y + 3, box_w - 16, row_h - 6, 5, sel_bg, 0.6);
+        }
+        const ty = @round(row_y + (row_h - font.g_titlebar_cell_height) / 2);
+        if (i == copilot_picker.count()) {
+            // Trailing "+ New conversation" action row.
+            renderTitlebarTextLimited(i18n.s().copilot_picker_new, box_x + 18, ty, text_color, box_w - 36);
+        } else {
+            var tbuf: [32]u8 = undefined;
+            const rel = copilot_picker.formatRelativeTime(now_ms, copilot_picker.updatedAt(i), &tbuf);
+            const rel_w = measureTitlebarText(rel);
+            const meta_right = box_x + box_w - 18;
+            renderTitlebarText(rel, meta_right - rel_w, ty, meta_color);
+            renderTitlebarTextLimited(copilot_picker.titleAt(i), box_x + 18, ty, text_color, (meta_right - rel_w) - (box_x + 18) - 12);
+        }
+    }
+
+    // Scrollbar thumb when the list is taller than the window.
+    if (total > visible and visible > 0) {
+        const total_f: f32 = @floatFromInt(total);
+        const vis_f: f32 = @floatFromInt(visible);
+        const track_h = row_h * vis_f;
+        const track_top_px = box_top + title_h;
+        const sb_w: f32 = 3;
+        const sb_x = box_x + box_w - sb_w - 6;
+        const track_gl_y = @round(window_height - track_top_px - track_h);
+        ui_pipeline.fillQuadAlpha(sb_x, track_gl_y, sb_w, track_h, mixColor(bg, fg, 0.25), 0.30);
+        const thumb_h = @max(24.0, @round(track_h * vis_f / total_f));
+        const max_scroll_f: f32 = @floatFromInt(total - visible);
         const scroll_f: f32 = @floatFromInt(scroll);
         const thumb_offset = if (max_scroll_f > 0) @round((track_h - thumb_h) * (scroll_f / max_scroll_f)) else 0;
         const thumb_gl_y = @round(window_height - (track_top_px + thumb_offset) - thumb_h);
@@ -1836,8 +1920,9 @@ const profile_codec = @import("overlays/profile_codec.zig");
 const openssh_config_import = @import("../openssh_config_import.zig");
 const SSH_FIELD_COUNT = profile_codec.SSH_FIELD_COUNT;
 const SSH_FIELD_MAX = profile_codec.SSH_FIELD_MAX;
-const SSH_PROFILE_MAX = 16;
+const SSH_PROFILE_MAX = 128;
 const SSH_PROFILE_NONE = std.math.maxInt(usize);
+const SSH_LIST_MAX_VISIBLE_ROWS = 5;
 const AI_FIELD_COUNT = profile_codec.AI_FIELD_COUNT;
 const AI_FIELD_MAX = profile_codec.AI_FIELD_MAX;
 const AI_PROFILE_MAX = 16;
@@ -1909,6 +1994,7 @@ const SessionLayout = struct {
     box_w: f32,
     box_h: f32,
     header_h: f32,
+    filter_h: f32,
     first_row_top_px: f32,
     row_h: f32,
     /// Total rows in the active mode.
@@ -1941,6 +2027,7 @@ threadlocal var g_ssh_list_selected: usize = 0;
 threadlocal var g_ssh_list_mode: SshListMode = .manage;
 threadlocal var g_ssh_list_filter_buf: [SSH_FIELD_MAX]u8 = undefined;
 threadlocal var g_ssh_list_filter_len: usize = 0;
+threadlocal var g_ssh_delete_selected: [SSH_PROFILE_MAX]bool = .{false} ** SSH_PROFILE_MAX;
 threadlocal var g_ssh_edit_index: usize = SSH_PROFILE_NONE;
 threadlocal var g_ai_focus: usize = @intFromEnum(AiField.name);
 threadlocal var g_ai_bufs: [AI_FIELD_COUNT][AI_FIELD_MAX]u8 = undefined;
@@ -2406,6 +2493,7 @@ fn openSshList() void {
     g_ssh_list_visible = true;
     g_ssh_form_visible = false;
     g_ssh_list_mode = .manage;
+    clearSshDeleteSelection();
     clearSshListFilter();
     clampSshListSelection();
 }
@@ -2425,6 +2513,7 @@ fn openSshProfilePicker(mode: SshListMode) void {
     g_ssh_list_visible = true;
     g_ssh_form_visible = false;
     g_ssh_list_mode = mode;
+    if (mode == .delete_select) clearSshDeleteSelection();
     clearSshListFilter();
     clampSshListSelection();
 }
@@ -2473,6 +2562,11 @@ fn handleSshListKey(ev: input_key.KeyEvent) void {
         .arrow_down, .tab => g_ssh_list_selected = (g_ssh_list_selected + 1) % row_count,
         .arrow_up => g_ssh_list_selected = if (g_ssh_list_selected == 0) row_count - 1 else g_ssh_list_selected - 1,
         .enter => runSshListRow(g_ssh_list_selected),
+        .space => {
+            if (g_ssh_list_mode == .delete_select) {
+                _ = toggleSshDeleteSelectionAtVisibleRow(g_ssh_list_selected);
+            }
+        },
         .backspace => backspaceSshListFilter(),
         else => {},
     }
@@ -2481,7 +2575,8 @@ fn handleSshListKey(ev: input_key.KeyEvent) void {
 fn sshListRowCount() usize {
     return switch (g_ssh_list_mode) {
         .manage => sshVisibleProfileCount() + 5,
-        .edit_select, .delete_select, .ai_history_select, .tmux_connect => sshVisibleProfileCount() + 1,
+        .delete_select => sshVisibleProfileCount() + 2,
+        .edit_select, .ai_history_select, .tmux_connect => sshVisibleProfileCount() + 1,
     };
 }
 
@@ -2541,7 +2636,13 @@ fn appendSshListFilterText(text: []const u8) void {
 fn sshProfileMatchesFilter(profile: *const SshProfile) bool {
     const filter = sshListFilter();
     if (filter.len == 0) return true;
-    return startsWithIgnoreCase(profileField(profile, .name), filter);
+    if (containsIgnoreCase(profileField(profile, .name), filter)) return true;
+    if (containsIgnoreCase(profileField(profile, .ip), filter)) return true;
+    if (containsIgnoreCase(profileField(profile, .user), filter)) return true;
+    if (containsIgnoreCase(profileField(profile, .port), filter)) return true;
+    if (containsIgnoreCase(profileField(profile, .proxy_jump), filter)) return true;
+    var target_buf: [SSH_FIELD_MAX * 2]u8 = undefined;
+    return containsIgnoreCase(sshProfileTarget(profile, target_buf[0..]), filter);
 }
 
 fn sshVisibleProfileCount() usize {
@@ -2574,6 +2675,46 @@ fn clampSshListSelection() void {
 fn resetSshListSelection() void {
     g_ssh_list_selected = 0;
     clampSshListSelection();
+}
+
+fn clearSshDeleteSelection() void {
+    @memset(g_ssh_delete_selected[0..], false);
+}
+
+fn sshDeleteSelectionCount() usize {
+    var count: usize = 0;
+    for (0..g_ssh_profile_count) |idx| {
+        if (g_ssh_delete_selected[idx]) count += 1;
+    }
+    return count;
+}
+
+fn toggleSshDeleteSelectionAtVisibleRow(row: usize) bool {
+    const profile_idx = sshVisibleProfileIndexAt(row) orelse return false;
+    if (profile_idx >= g_ssh_profile_count) return false;
+    g_ssh_delete_selected[profile_idx] = !g_ssh_delete_selected[profile_idx];
+    return true;
+}
+
+fn deleteSelectedSshProfiles() usize {
+    var write_idx: usize = 0;
+    var deleted: usize = 0;
+    for (0..g_ssh_profile_count) |read_idx| {
+        if (g_ssh_delete_selected[read_idx]) {
+            deleted += 1;
+            continue;
+        }
+        if (write_idx != read_idx) {
+            g_ssh_profiles[write_idx] = g_ssh_profiles[read_idx];
+        }
+        write_idx += 1;
+    }
+    if (deleted == 0) return 0;
+    g_ssh_profile_count = write_idx;
+    clearSshDeleteSelection();
+    clampSshListSelection();
+    if (AppWindow.g_allocator) |allocator| saveSshProfiles(allocator);
+    return deleted;
 }
 
 fn sshField(field: SshField) []const u8 {
@@ -2655,11 +2796,6 @@ fn findLoadedSshProfileIndex(identifier_raw: []const u8) ?usize {
         if (std.ascii.eqlIgnoreCase(identifier, profileField(&g_ssh_profiles[idx], .ip))) return idx;
     }
     return null;
-}
-
-fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
-    if (text.len < prefix.len) return false;
-    return std.ascii.eqlIgnoreCase(text[0..prefix.len], prefix);
 }
 
 pub fn agentConnectSshProfile(identifier: []const u8) AgentSshConnectResult {
@@ -2913,9 +3049,15 @@ fn runSshListRow(row: usize) void {
         },
         .delete_select => {
             if (row < visible_profile_count) {
-                const profile_idx = sshVisibleProfileIndexAt(row) orelse return;
-                deleteSshProfile(profile_idx);
-                openSshList();
+                if (sshDeleteSelectionCount() > 0) {
+                    _ = toggleSshDeleteSelectionAtVisibleRow(row);
+                } else {
+                    const profile_idx = sshVisibleProfileIndexAt(row) orelse return;
+                    deleteSshProfile(profile_idx);
+                    openSshList();
+                }
+            } else if (row == visible_profile_count) {
+                if (deleteSelectedSshProfiles() > 0) openSshList();
             } else {
                 openSshList();
             }
@@ -2947,6 +3089,7 @@ fn deleteSshProfile(idx: usize) void {
         g_ssh_profiles[i] = g_ssh_profiles[i + 1];
     }
     g_ssh_profile_count -= 1;
+    clearSshDeleteSelection();
     clampSshListSelection();
     if (AppWindow.g_allocator) |allocator| saveSshProfiles(allocator);
 }
@@ -3846,6 +3989,82 @@ pub fn makeCopilotSessionForDefaultProfile() ?*ai_chat.Session {
     return session;
 }
 
+pub const DefaultAiProfileSnapshot = struct {
+    base_url: []u8,
+    api_key: []u8,
+    model: []u8,
+    protocol: ai_chat.ApiProtocol,
+    thinking_enabled: bool,
+    reasoning_effort: []u8,
+    max_tokens: u32,
+
+    pub fn deinit(self: *DefaultAiProfileSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.base_url);
+        allocator.free(self.api_key);
+        allocator.free(self.model);
+        allocator.free(self.reasoning_effort);
+        self.* = undefined;
+    }
+};
+
+pub fn defaultAiProfileSnapshot(allocator: std.mem.Allocator) ?DefaultAiProfileSnapshot {
+    loadAiProfiles();
+    if (g_ai_profile_count == 0) return null;
+    const idx = defaultAiProfileIndex();
+    if (idx >= g_ai_profile_count) return null;
+    const profile = &g_ai_profiles[idx];
+    const base_url = aiProfileField(profile, .base_url);
+    const api_key = aiProfileField(profile, .api_key);
+    const model = aiProfileField(profile, .model);
+    const thinking = aiProfileField(profile, .thinking);
+    const reasoning_effort = aiProfileField(profile, .reasoning_effort);
+    const protocol = aiProfileField(profile, .protocol);
+    const max_tokens = std.fmt.parseInt(u32, std.mem.trim(u8, aiProfileField(profile, .max_tokens), " \t"), 10) catch 8192;
+    if (base_url.len == 0 or model.len == 0) return null;
+    if (!isHttpUrlish(base_url)) return null;
+
+    const base_url_copy = allocator.dupe(u8, base_url) catch return null;
+    const api_key_copy = allocator.dupe(u8, api_key) catch {
+        allocator.free(base_url_copy);
+        return null;
+    };
+    const model_copy = allocator.dupe(u8, model) catch {
+        allocator.free(base_url_copy);
+        allocator.free(api_key_copy);
+        return null;
+    };
+    const reasoning_copy = allocator.dupe(u8, reasoning_effort) catch {
+        allocator.free(base_url_copy);
+        allocator.free(api_key_copy);
+        allocator.free(model_copy);
+        return null;
+    };
+    return .{
+        .base_url = base_url_copy,
+        .api_key = api_key_copy,
+        .model = model_copy,
+        .protocol = defaultAiProfileSnapshotProtocol(base_url, protocol),
+        .thinking_enabled = !std.mem.eql(u8, thinking, "disabled"),
+        .reasoning_effort = reasoning_copy,
+        .max_tokens = max_tokens,
+    };
+}
+
+fn defaultAiProfileSnapshotProtocol(base_url: []const u8, protocol: []const u8) ai_chat.ApiProtocol {
+    var parsed = ai_chat.ApiProtocol.parse(protocol);
+    if (parsed == .chat_completions and ai_chat_protocol.isAnthropicBaseUrl(base_url)) {
+        parsed = .anthropic;
+    }
+    return parsed;
+}
+
+test "default AI profile snapshot normalizes Anthropic URL with default protocol" {
+    try std.testing.expectEqual(
+        ai_chat.ApiProtocol.anthropic,
+        defaultAiProfileSnapshotProtocol("https://api.anthropic.com", ""),
+    );
+}
+
 threadlocal var g_ai_default_name_buf: [256]u8 = undefined;
 threadlocal var g_ai_default_name_len: usize = 0;
 threadlocal var g_ai_default_loaded: bool = false;
@@ -4095,7 +4314,7 @@ fn loadOpenSshConfigDefault() void {
     };
     defer allocator.free(content);
 
-    var candidates_buf: [64]openssh_config_import.Candidate = undefined;
+    var candidates_buf: [SSH_PROFILE_MAX]openssh_config_import.Candidate = undefined;
     const candidates = openssh_config_import.parseCandidates(content, &candidates_buf);
     var stats = OpenSshImportStats{};
     for (candidates) |candidate| mergeOpenSshCandidate(candidate, &stats);
@@ -4190,6 +4409,9 @@ fn sessionDesiredBoxWidth() f32 {
     const title = sessionLauncherTitle();
     const hint = sessionLauncherHint();
     var desired = @max(measureTitlebarText(title), measureTitlebarText(hint)) + 48.0;
+    if (g_ssh_list_visible) {
+        desired = @max(desired, measureTitlebarText(i18n.s().sl_search_ssh_servers) + 96.0);
+    }
 
     if (g_ai_form_visible) {
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ai_profile_name, aiField(.name)));
@@ -4275,6 +4497,9 @@ fn sessionDesiredBoxWidth() f32 {
                 desired = @max(desired, sessionTwoColumnWidth(sessionLauncherCancelLabel(), "Esc"));
             },
             .edit_select, .delete_select => {
+                if (g_ssh_list_mode == .delete_select) {
+                    desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_delete_selected_ssh_servers, i18n.s().sl_v_choose));
+                }
                 desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_back, i18n.s().sl_v_manage));
             },
             .ai_history_select => {
@@ -4362,7 +4587,8 @@ fn sessionRowCapacity(content_height: f32, base_h: f32, row_h: f32, row_count: u
     const usable_h = @max(row_h, content_height - 32.0 - base_h);
     if (usable_h <= row_h) return 1;
     const fit: usize = @intFromFloat(@max(1.0, @floor(usable_h / row_h)));
-    return @min(row_count, fit);
+    const capped = @min(row_count, fit);
+    return if (g_ssh_list_visible) @min(capped, SSH_LIST_MAX_VISIBLE_ROWS) else capped;
 }
 
 /// First row to render so the selected row stays visible. Mirrors
@@ -4381,11 +4607,13 @@ fn sessionLayout(window_width: f32, window_height: f32, top_offset: f32) Session
     const box_w: f32 = @round(@min(@max(min_box_w, sessionDesiredBoxWidth()), max_box_w));
     const row_h = overlayRowHeight(38);
     const header_h = @round(18 + overlayLineHeight() * 2 + 12);
+    const filter_h = if (g_ssh_list_visible) overlayControlHeight(42) else 0;
+    const filter_gap: f32 = if (g_ssh_list_visible) 12 else 0;
     const bottom_pad = @round(@max(20.0, overlayTextHeight() * 0.55));
     const row_count = sessionActiveRowCount();
-    const visible_rows = sessionRowCapacity(content_height, header_h + bottom_pad, row_h, row_count);
+    const visible_rows = sessionRowCapacity(content_height, header_h + filter_h + filter_gap + bottom_pad, row_h, row_count);
     const scroll = sessionFirstVisibleRow(sessionActiveSelection(), visible_rows, row_count);
-    const box_h = @round(clampOverlayBoxHeight(header_h + row_h * @as(f32, @floatFromInt(visible_rows)) + bottom_pad, content_height));
+    const box_h = @round(clampOverlayBoxHeight(header_h + filter_h + filter_gap + row_h * @as(f32, @floatFromInt(visible_rows)) + bottom_pad, content_height));
     const box_x = @round(@max(16, (window_width - box_w) / 2));
     const box_top_px = @round(top_offset + @max(16, (content_height - box_h) / 2));
     return .{
@@ -4394,7 +4622,8 @@ fn sessionLayout(window_width: f32, window_height: f32, top_offset: f32) Session
         .box_w = box_w,
         .box_h = box_h,
         .header_h = header_h,
-        .first_row_top_px = box_top_px + header_h,
+        .filter_h = filter_h,
+        .first_row_top_px = box_top_px + header_h + filter_h + filter_gap,
         .row_h = row_h,
         .row_count = row_count,
         .visible_rows = visible_rows,
@@ -4547,6 +4776,20 @@ fn renderSshProfileRow(layout: SessionLayout, window_height: f32, row: usize, pr
     renderSessionRow(layout, window_height, row, profileField(profile, .name), target, selected);
 }
 
+fn renderSshListProfileRow(layout: SessionLayout, window_height: f32, row: usize, profile_idx: usize, profile: *const SshProfile, selected: bool) void {
+    if (g_ssh_list_mode != .delete_select) {
+        renderSshProfileRow(layout, window_height, row, profile, selected);
+        return;
+    }
+
+    var target_buf: [SSH_FIELD_MAX * 2]u8 = undefined;
+    const target = sshProfileTarget(profile, target_buf[0..]);
+    var label_buf: [SSH_FIELD_MAX + 4]u8 = undefined;
+    const mark = if (profile_idx < g_ssh_delete_selected.len and g_ssh_delete_selected[profile_idx]) "[x]" else "[ ]";
+    const label = std.fmt.bufPrint(label_buf[0..], "{s} {s}", .{ mark, profileField(profile, .name) }) catch profileField(profile, .name);
+    renderSessionRow(layout, window_height, row, label, target, selected);
+}
+
 fn sshProfileTarget(profile: *const SshProfile, target_buf: []u8) []const u8 {
     const host = profileField(profile, .ip);
     const user = profileField(profile, .user);
@@ -4594,8 +4837,11 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
     const accent = AppWindow.g_theme.cursor_color;
     const panel_color = mixColor(bg, fg, 0.035);
     const border_color = mixColor(bg, accent, 0.24);
+    const field_color = mixColor(bg, fg, 0.075);
+    const field_border = mixColor(bg, fg, 0.19);
     const title_color = mixColor(fg, accent, 0.14);
     const muted_color = mixColor(bg, fg, 0.58);
+    const dim_color = mixColor(bg, fg, 0.44);
 
     ui_pipeline.fillQuadAlpha(0, 0, window_width, window_height, .{ 0.0, 0.0, 0.0 }, 0.18);
     renderRoundedQuadAlpha(layout.box_x - 1, box_y - 1, layout.box_w + 2, layout.box_h + 2, 11, border_color, 0.24);
@@ -4627,6 +4873,19 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
     const hint_y = textYFromTop(window_height, layout.box_top_px + 18 + overlayLineHeight());
     renderTitlebarTextStrong(title, layout.box_x + 24, title_y, title_color);
     renderTitlebarTextStrongLimited(hint, layout.box_x + 24, hint_y, muted_color, layout.box_w - 48);
+
+    if (g_ssh_list_visible and layout.filter_h > 0) {
+        const filter_x = @round(layout.box_x + 18);
+        const filter_box_y = @round(window_height - (layout.box_top_px + layout.header_h + layout.filter_h));
+        const filter_w = layout.box_w - 36;
+        renderRoundedQuadAlpha(filter_x - 1, filter_box_y - 1, filter_w + 2, layout.filter_h + 2, 6, field_border, 0.42);
+        renderRoundedQuadAlpha(filter_x, filter_box_y, filter_w, layout.filter_h, 5, field_color, 0.92);
+
+        const filter = sshListFilter();
+        const text = if (filter.len > 0) filter else i18n.s().sl_search_ssh_servers;
+        const color = if (filter.len > 0) fg else dim_color;
+        renderTitlebarTextLimited(text, filter_x + 12, rowTextY(filter_box_y, layout.filter_h), color, filter_w - 24);
+    }
 
     if (!g_ssh_form_visible and !g_ai_form_visible) {
         if (g_ai_history_source_visible) {
@@ -4669,7 +4928,7 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
             while (profile_idx < g_ssh_profile_count) : (profile_idx += 1) {
                 const profile = &g_ssh_profiles[profile_idx];
                 if (!sshProfileMatchesFilter(profile)) continue;
-                renderSshProfileRow(layout, window_height, row, profile, g_ssh_list_selected == row);
+                renderSshListProfileRow(layout, window_height, row, profile_idx, profile, g_ssh_list_selected == row);
                 row += 1;
             }
             switch (g_ssh_list_mode) {
@@ -4685,6 +4944,16 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
                     renderSessionRow(layout, window_height, row, sessionLauncherCancelLabel(), "Esc", g_ssh_list_selected == row);
                 },
                 .edit_select, .delete_select => {
+                    if (g_ssh_list_mode == .delete_select) {
+                        var count_buf: [32]u8 = undefined;
+                        const selected_count = sshDeleteSelectionCount();
+                        const detail = if (selected_count == 0)
+                            i18n.s().sl_v_no_server
+                        else
+                            std.fmt.bufPrint(count_buf[0..], "{d} selected", .{selected_count}) catch i18n.s().sl_v_choose;
+                        renderSessionRow(layout, window_height, row, i18n.s().sl_delete_selected_ssh_servers, detail, g_ssh_list_selected == row);
+                        row += 1;
+                    }
                     renderSessionRow(layout, window_height, row, i18n.s().sl_back, i18n.s().sl_v_manage, g_ssh_list_selected == row);
                 },
                 .ai_history_select => {
@@ -5766,6 +6035,44 @@ test "overlays: session launcher caps rows and scrolls to keep selection visible
     try std.testing.expect(total - 1 < scroll + short_vis);
 }
 
+test "overlays: SSH list caps visible rows to five when many profiles exist" {
+    const saved_ssh_list = g_ssh_list_visible;
+    const saved_session = g_session_launcher_visible;
+    const saved_count = g_ssh_profile_count;
+    const saved_mode = g_ssh_list_mode;
+    const saved_selected = g_ssh_list_selected;
+    const saved_filter_len = g_ssh_list_filter_len;
+    var saved_profiles: [SSH_PROFILE_MAX]SshProfile = undefined;
+    if (saved_count > 0) @memcpy(saved_profiles[0..saved_count], g_ssh_profiles[0..saved_count]);
+    defer {
+        g_ssh_list_visible = saved_ssh_list;
+        g_session_launcher_visible = saved_session;
+        g_ssh_profile_count = saved_count;
+        if (saved_count > 0) @memcpy(g_ssh_profiles[0..saved_count], saved_profiles[0..saved_count]);
+        g_ssh_list_mode = saved_mode;
+        g_ssh_list_selected = saved_selected;
+        g_ssh_list_filter_len = saved_filter_len;
+    }
+
+    g_ssh_list_visible = true;
+    g_session_launcher_visible = false;
+    g_ssh_list_mode = .manage;
+    g_ssh_list_selected = 0;
+    g_ssh_list_filter_len = 0;
+    g_ssh_profile_count = 12;
+    for (0..g_ssh_profile_count) |idx| {
+        var name_buf: [16]u8 = undefined;
+        var host_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "host-{d}", .{idx}) catch unreachable;
+        const host = std.fmt.bufPrint(&host_buf, "10.0.0.{d}", .{idx}) catch unreachable;
+        g_ssh_profiles[idx] = makeSshProfile(name, host, "user", "22");
+    }
+
+    const layout = sessionLayout(900, 2000, 0);
+    try std.testing.expectEqual(@as(usize, 5), layout.visible_rows);
+    try std.testing.expect(layout.filter_h > 0);
+}
+
 test "overlays: session launcher mouse wheel moves selection without wrapping" {
     sessionLauncherOpen();
     defer sessionLauncherClose();
@@ -5873,6 +6180,102 @@ test "overlays: SSH list filter matches server name prefixes case-insensitively"
     appendSshListFilterText("x1");
     try std.testing.expectEqual(@as(usize, 1), sshVisibleProfileCount());
     try std.testing.expectEqual(@as(?usize, 1), sshVisibleProfileIndexAt(0));
+}
+
+test "overlays: SSH list filter matches server target fields" {
+    const saved_count = g_ssh_profile_count;
+    const saved_mode = g_ssh_list_mode;
+    const saved_filter_len = g_ssh_list_filter_len;
+    const saved_selected = g_ssh_list_selected;
+    var saved_profiles: [SSH_PROFILE_MAX]SshProfile = undefined;
+    if (saved_count > 0) @memcpy(saved_profiles[0..saved_count], g_ssh_profiles[0..saved_count]);
+    defer {
+        g_ssh_profile_count = saved_count;
+        if (saved_count > 0) @memcpy(g_ssh_profiles[0..saved_count], saved_profiles[0..saved_count]);
+        g_ssh_list_mode = saved_mode;
+        g_ssh_list_filter_len = saved_filter_len;
+        g_ssh_list_selected = saved_selected;
+    }
+
+    g_ssh_profile_count = 2;
+    g_ssh_profiles[0] = makeSshProfile("CPU2", "10.0.0.1", "alice", "22");
+    g_ssh_profiles[1] = makeSshProfile("GPU", "gpu.example", "builder", "2202");
+    g_ssh_list_mode = .manage;
+    g_ssh_list_selected = 0;
+    g_ssh_list_filter_len = 0;
+
+    appendSshListFilterText("2202");
+    try std.testing.expectEqual(@as(usize, 1), sshVisibleProfileCount());
+    try std.testing.expectEqual(@as(?usize, 1), sshVisibleProfileIndexAt(0));
+}
+
+test "overlays: OpenSSH import keeps more than sixteen SSH profiles" {
+    const saved_count = g_ssh_profile_count;
+    var saved_profiles: [SSH_PROFILE_MAX]SshProfile = undefined;
+    if (saved_count > 0) @memcpy(saved_profiles[0..saved_count], g_ssh_profiles[0..saved_count]);
+    defer {
+        g_ssh_profile_count = saved_count;
+        if (saved_count > 0) @memcpy(g_ssh_profiles[0..saved_count], saved_profiles[0..saved_count]);
+    }
+
+    g_ssh_profile_count = 0;
+    var stats = OpenSshImportStats{};
+    for (0..27) |idx| {
+        var candidate = openssh_config_import.Candidate{};
+        var name_buf: [32]u8 = undefined;
+        var host_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "lab-{d}", .{idx}) catch unreachable;
+        const host = std.fmt.bufPrint(&host_buf, "10.10.0.{d}", .{idx}) catch unreachable;
+        opensshCandidateSetForTest(&candidate, .name, name);
+        opensshCandidateSetForTest(&candidate, .host, host);
+        opensshCandidateSetForTest(&candidate, .user, "alice");
+        opensshCandidateSetForTest(&candidate, .port, "22");
+        mergeOpenSshCandidate(candidate, &stats);
+    }
+
+    try std.testing.expectEqual(@as(usize, 27), g_ssh_profile_count);
+    try std.testing.expectEqual(@as(usize, 27), stats.created);
+    try std.testing.expect(!stats.capped);
+}
+
+test "overlays: SSH delete picker supports multi-select batch delete" {
+    const saved_count = g_ssh_profile_count;
+    const saved_mode = g_ssh_list_mode;
+    const saved_filter_len = g_ssh_list_filter_len;
+    const saved_selected = g_ssh_list_selected;
+    var saved_profiles: [SSH_PROFILE_MAX]SshProfile = undefined;
+    if (saved_count > 0) @memcpy(saved_profiles[0..saved_count], g_ssh_profiles[0..saved_count]);
+    defer {
+        g_ssh_profile_count = saved_count;
+        if (saved_count > 0) @memcpy(g_ssh_profiles[0..saved_count], saved_profiles[0..saved_count]);
+        g_ssh_list_mode = saved_mode;
+        g_ssh_list_filter_len = saved_filter_len;
+        g_ssh_list_selected = saved_selected;
+        clearSshDeleteSelection();
+    }
+
+    g_ssh_profile_count = 3;
+    g_ssh_profiles[0] = makeSshProfile("one", "10.0.0.1", "user", "22");
+    g_ssh_profiles[1] = makeSshProfile("two", "10.0.0.2", "user", "22");
+    g_ssh_profiles[2] = makeSshProfile("three", "10.0.0.3", "user", "22");
+    g_ssh_list_mode = .delete_select;
+    g_ssh_list_filter_len = 0;
+    g_ssh_list_selected = 0;
+    clearSshDeleteSelection();
+
+    try std.testing.expectEqual(@as(usize, 5), sshListRowCount());
+
+    handleSshListKey(.{ .key = .space });
+    g_ssh_list_selected = 1;
+    handleSshListKey(.{ .key = .space });
+    try std.testing.expectEqual(@as(usize, 2), sshDeleteSelectionCount());
+
+    g_ssh_list_selected = sshVisibleProfileCount();
+    handleSshListKey(.{ .key = .enter });
+
+    try std.testing.expectEqual(@as(usize, 1), g_ssh_profile_count);
+    try std.testing.expectEqualStrings("three", profileField(&g_ssh_profiles[0], .name));
+    try std.testing.expectEqual(@as(usize, 0), sshDeleteSelectionCount());
 }
 
 test "overlays: SSH manage list includes Load OpenSSH config action" {
@@ -6781,6 +7184,16 @@ fn removeClaudeCodeIntegration() void {
     applyClaudeIntegration(allocator, false);
 }
 
+fn installCodexIntegration() void {
+    const allocator = AppWindow.g_allocator orelse return;
+    applyCodexIntegration(allocator, true);
+}
+
+fn removeCodexIntegration() void {
+    const allocator = AppWindow.g_allocator orelse return;
+    applyCodexIntegration(allocator, false);
+}
+
 fn applyClaudeIntegration(allocator: std.mem.Allocator, comptime do_install: bool) void {
     // Resolve the Claude Code settings file path via platform_dirs.
     const settings_path = platform_dirs.agentHookSettingsPath(allocator) catch |err| {
@@ -6835,6 +7248,58 @@ fn applyClaudeIntegration(allocator: std.mem.Allocator, comptime do_install: boo
         showStatusToast("Claude Code agent integration installed");
     } else {
         showStatusToast("Claude Code agent integration removed");
+    }
+}
+
+fn applyCodexIntegration(allocator: std.mem.Allocator, comptime do_install: bool) void {
+    const settings_path = platform_dirs.openaiCodexHookSettingsPath(allocator) catch |err| {
+        std.log.warn("codex integration: cannot resolve hooks path: {}", .{err});
+        showStatusToast("Codex integration: cannot resolve home directory");
+        return;
+    };
+    defer allocator.free(settings_path);
+
+    const existing = std.fs.cwd().readFileAlloc(allocator, settings_path, 16 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => allocator.dupe(u8, "") catch {
+            showStatusToast("Codex integration: out of memory");
+            return;
+        },
+        else => {
+            std.log.warn("codex integration: read {s}: {}", .{ settings_path, err });
+            showStatusToast("Codex integration: failed to read hooks.json");
+            return;
+        },
+    };
+    defer allocator.free(existing);
+
+    const new_content = if (do_install)
+        codex_integration.install(allocator, existing)
+    else
+        codex_integration.uninstall(allocator, existing);
+    const result = new_content catch |err| {
+        std.log.warn("codex integration: transform failed: {}", .{err});
+        showStatusToast("Codex integration: hooks.json parse error");
+        return;
+    };
+    defer allocator.free(result);
+
+    const settings_dir = std.fs.path.dirname(settings_path) orelse settings_path;
+    std.fs.cwd().makePath(settings_dir) catch |err| {
+        std.log.warn("codex integration: makePath {s}: {}", .{ settings_dir, err });
+        showStatusToast("Codex integration: cannot create hooks directory");
+        return;
+    };
+
+    platform_atomic_file.writeFileReplaceSafe(settings_path, result) catch |err| {
+        std.log.warn("codex integration: write {s}: {}", .{ settings_path, err });
+        showStatusToast("Codex integration: failed to write hooks.json");
+        return;
+    };
+
+    if (do_install) {
+        showStatusToast("Codex agent integration installed");
+    } else {
+        showStatusToast("Codex agent integration removed");
     }
 }
 

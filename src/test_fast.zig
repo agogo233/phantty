@@ -19,6 +19,18 @@ const build_options = @import("build_options");
 const std = @import("std");
 const app_metadata = @import("app_metadata.zig");
 
+test "input ssh download surfaces missing connection and helper probe failures" {
+    const input_source = @embedFile("input.zig");
+    try std.testing.expect(std.mem.indexOf(u8, input_source, "\"SSH connection unavailable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, input_source, "\"SSH helper unavailable\"") != null);
+}
+
+test "remote file ssh helpers include short keepalive options" {
+    const remote_file_source = @embedFile("platform/remote_file.zig");
+    try std.testing.expect(std.mem.indexOf(u8, remote_file_source, "\"ServerAliveInterval=5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, remote_file_source, "\"ServerAliveCountMax=2\"") != null);
+}
+
 test {
     _ = @import("input/command_dispatch.zig");
     _ = @import("input/click_tracker.zig");
@@ -36,7 +48,6 @@ test {
     _ = @import("renderer/overlays/transfer_toast_model.zig");
     _ = @import("renderer/overlays/update_prompt_model.zig");
     _ = @import("renderer/overlays/whats_new_model.zig");
-    _ = @import("agent_detect_throttle.zig");
     _ = @import("renderer/ui_batch.zig");
     _ = @import("close_confirm.zig");
     _ = @import("command_palette_model.zig");
@@ -87,6 +98,7 @@ test {
     _ = @import("composer_detail_wrap.zig");
     _ = @import("web_search.zig");
     _ = @import("agent_prompt_answer.zig");
+    _ = @import("first_party_tools.zig");
     _ = @import("web_read.zig");
     _ = @import("web_read_cache.zig");
     _ = @import("pubmed.zig");
@@ -110,6 +122,7 @@ test {
     _ = @import("skill_transfer_cmd.zig");
     _ = @import("skill_transfer.zig");
     _ = @import("skill_diff.zig");
+    _ = @import("tool_skill_draft.zig");
     _ = @import("text_wrap.zig");
     _ = @import("ai_history_resume.zig");
     _ = @import("ai_history_session.zig");
@@ -147,10 +160,14 @@ test {
     _ = @import("ai_chat_title.zig");
     _ = @import("ai_model_switch.zig");
     _ = @import("command_registry.zig");
+    _ = @import("tool_registry.zig");
+    _ = @import("tool_import.zig");
     _ = @import("agent_detector.zig");
     _ = @import("claude_integration.zig");
+    _ = @import("codex_integration.zig");
     _ = @import("jupyter_detect.zig");
     _ = @import("jupyter_picker.zig");
+    _ = @import("copilot_picker.zig");
     _ = @import("html_server_model.zig");
     // Platform-aware agent prompt: pure string constants, no heavy deps.
     _ = @import("platform/agent_prompt.zig");

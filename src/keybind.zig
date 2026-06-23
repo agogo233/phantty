@@ -65,6 +65,7 @@ pub const Action = enum {
     toggle_file_explorer,
     toggle_sidebar,
     toggle_ai_copilot,
+    copilot_conversation_picker,
     close_panel_or_tab,
     toggle_maximize,
     font_size_increase,
@@ -148,9 +149,11 @@ pub const Set = struct {
                     b.trigger.mods.win = true;
                 }
             }
-            // Plain Cmd+C alongside Cmd+Shift+C, matching the macOS copy
-            // convention (Cmd+Shift+C still works as the historic muscle memory).
-            set.appendIfRoom(.{ .trigger = .{ .mods = .{ .win = true }, .key_code = 'C' }, .action = .copy });
+            // Copy is just Cmd+C on macOS. Windows/Linux keep Ctrl+Shift+C
+            // because Ctrl+C is the terminal's SIGINT and can't double as copy;
+            // Cmd+C has no such conflict, so the migrated Cmd+Shift+C is replaced
+            // by the single conventional shortcut rather than kept alongside it.
+            set.replaceTrigger(.copy, .{ .mods = .{ .win = true }, .key_code = 'C' });
         }
         return set;
     }
@@ -414,6 +417,7 @@ pub const default_bindings = [_]Binding{
     .{ .trigger = .{ .mods = .{ .ctrl = true, .shift = true }, .key_code = 'N' }, .action = .new_window },
     .{ .trigger = .{ .mods = .{ .ctrl = true, .shift = true }, .key_code = 'B' }, .action = .toggle_sidebar },
     .{ .trigger = .{ .mods = .{ .ctrl = true, .shift = true }, .key_code = 'A' }, .action = .toggle_ai_copilot },
+    .{ .trigger = .{ .mods = .{ .ctrl = true, .shift = true }, .key_code = 'R' }, .action = .copilot_conversation_picker },
     // Windows-Terminal-style split chords: Ctrl+Shift++ splits vertically (a pane
     // to the right), Ctrl+Shift+- splits horizontally (a pane below). These take
     // the shifted "+" chord that font-size-increase used to share, so font size
@@ -485,6 +489,28 @@ test "keybind defaults include global quake and command palette" {
         .mods = if (is_macos) .{ .win = true, .shift = true } else .{ .ctrl = true, .shift = true },
         .key_code = 'P',
     }).?);
+}
+
+test "copy default: macOS binds Cmd+C only, other platforms keep Ctrl+Shift+C" {
+    const set = Set.defaults();
+    if (builtin.target.os.tag == .macos) {
+        // macOS copy is the single conventional Cmd+C.
+        try std.testing.expectEqual(@as(?Action, .copy), set.lookupApp(.{
+            .mods = .{ .win = true },
+            .key_code = 'C',
+        }));
+        // The migrated Cmd+Shift+C is intentionally dropped (not bound).
+        try std.testing.expectEqual(@as(?Action, null), set.lookupApp(.{
+            .mods = .{ .win = true, .shift = true },
+            .key_code = 'C',
+        }));
+    } else {
+        // Elsewhere copy stays Ctrl+Shift+C — Ctrl+C is the terminal's SIGINT.
+        try std.testing.expectEqual(@as(?Action, .copy), set.lookupApp(.{
+            .mods = .{ .ctrl = true, .shift = true },
+            .key_code = 'C',
+        }));
+    }
 }
 
 test "keybind overriding an action removes its old default trigger" {

@@ -9,6 +9,7 @@ pub const CommandAction = enum {
     toggle_ai_copilot,
     manage_ai_profiles,
     select_agent_history,
+    load_copilot_conversation,
     split_right,
     split_down,
     split_left,
@@ -43,6 +44,8 @@ pub const CommandAction = enum {
     show_whats_new,
     install_claude_code_integration,
     remove_claude_code_integration,
+    install_codex_integration,
+    remove_codex_integration,
     open_skill_center,
     open_port_forwarding,
     split_preview,
@@ -61,7 +64,8 @@ pub const command_entries = [_]CommandEntry{
     .{ .title = "Toggle Copilot", .detail = "Open or close the Copilot sidebar on the current terminal", .shortcut = "", .action = .toggle_ai_copilot },
     .{ .title = "Manage AI Profiles", .detail = "Create, edit, or delete saved AI profiles", .shortcut = "", .action = .manage_ai_profiles },
     .{ .title = "Select Copilot History", .detail = "Open the command-center Copilot history picker", .shortcut = "", .action = .select_agent_history },
-    .{ .title = "Skill Center", .detail = "Inventory Claude Code / Codex skills across servers", .shortcut = "", .action = .open_skill_center },
+    .{ .title = "Load Copilot Conversation", .detail = "Reopen a saved Copilot sidebar conversation", .shortcut = "", .action = .load_copilot_conversation },
+    .{ .title = "Skill Center", .detail = "Manage Claude Code / Codex skills and local executable tools", .shortcut = "", .action = .open_skill_center },
     .{ .title = "Split Right", .detail = "Create a panel to the right", .shortcut = "", .action = .split_right },
     .{ .title = "Split Down", .detail = "Create a panel below", .shortcut = "", .action = .split_down },
     .{ .title = "Split Left", .detail = "Create a panel to the left", .shortcut = "", .action = .split_left },
@@ -97,6 +101,8 @@ pub const command_entries = [_]CommandEntry{
     .{ .title = "What's New", .detail = "Show what changed in this version of WispTerm", .shortcut = app_metadata.version, .action = .show_whats_new },
     .{ .title = "Install Claude Code Integration", .detail = "Add WispTerm agent hooks to ~/.claude/settings.json", .shortcut = "", .action = .install_claude_code_integration },
     .{ .title = "Remove Claude Code Integration", .detail = "Remove WispTerm agent hooks from ~/.claude/settings.json", .shortcut = "", .action = .remove_claude_code_integration },
+    .{ .title = "Install Codex Integration", .detail = "Add WispTerm agent hooks to ~/.codex/hooks.json", .shortcut = "", .action = .install_codex_integration },
+    .{ .title = "Remove Codex Integration", .detail = "Remove WispTerm agent hooks from ~/.codex/hooks.json", .shortcut = "", .action = .remove_codex_integration },
     .{ .title = "Port Forwarding", .detail = "Manage SSH port forwarding rules", .shortcut = "", .action = .open_port_forwarding },
     .{ .title = "Split Preview", .detail = "Open a preview panel on the right", .shortcut = "", .action = .split_preview },
 };
@@ -302,6 +308,13 @@ test "command center includes Select Copilot History action" {
     try std.testing.expectEqual(CommandAction.select_agent_history, findCommandAction("Select Copilot History"));
 }
 
+test "command catalog includes Load Copilot Conversation" {
+    try std.testing.expectEqual(
+        CommandAction.load_copilot_conversation,
+        findCommandAction("Load Copilot Conversation"),
+    );
+}
+
 test "command center includes update check actions" {
     try std.testing.expectEqual(CommandAction.check_for_updates, findCommandAction("Check for Updates"));
     try std.testing.expectEqual(CommandAction.download_update, findCommandAction("Download Update"));
@@ -314,6 +327,13 @@ test "findCommandAction resolves What's New" {
 
 test "command center includes Skill Center action" {
     try std.testing.expectEqual(CommandAction.open_skill_center, findCommandAction("Skill Center"));
+    for (command_entries) |entry| {
+        if (entry.action == .open_skill_center) {
+            try std.testing.expect(std.mem.indexOf(u8, entry.detail, "tools") != null or std.mem.indexOf(u8, entry.detail, "Tools") != null);
+            return;
+        }
+    }
+    return error.MissingSkillCenterCommand;
 }
 
 test "Skill Center is on the default first command center page" {
