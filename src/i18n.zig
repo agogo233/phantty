@@ -191,6 +191,15 @@ pub const Strings = struct {
     cmd_palette_no_sessions: []const u8,
     cmd_palette_footer: []const u8,
     cmd_palette_footer_history: []const u8,
+    cmd_palette_sidebar_tag: []const u8,
+    cmd_palette_group_today: []const u8,
+    cmd_palette_group_yesterday: []const u8,
+    cmd_palette_group_past_week: []const u8,
+    cmd_palette_group_earlier: []const u8,
+    cmd_palette_source_all: []const u8,
+    cmd_palette_source_sidebar: []const u8,
+    cmd_palette_source_tab: []const u8,
+    cmd_palette_history_search_placeholder: []const u8,
     copilot_picker_title: []const u8,
     copilot_picker_new: []const u8,
     copilot_picker_empty: []const u8,
@@ -402,7 +411,16 @@ const en = Strings{
     .cmd_palette_recent_sessions = "Recent Copilot sessions",
     .cmd_palette_no_sessions = "No saved Copilot sessions",
     .cmd_palette_footer = "Up/Down + Enter applies",
-    .cmd_palette_footer_history = "Up/Down selects, Enter reopens, Delete removes, Esc returns",
+    .cmd_palette_footer_history = "Type to filter, Tab source, Up/Down, Enter reopens, Delete removes, Esc returns",
+    .cmd_palette_sidebar_tag = "Sidebar",
+    .cmd_palette_group_today = "Today",
+    .cmd_palette_group_yesterday = "Yesterday",
+    .cmd_palette_group_past_week = "Past 7 days",
+    .cmd_palette_group_earlier = "Earlier",
+    .cmd_palette_source_all = "All",
+    .cmd_palette_source_sidebar = "Sidebar",
+    .cmd_palette_source_tab = "Tab",
+    .cmd_palette_history_search_placeholder = "Search Copilot history",
     .copilot_picker_title = "Copilot conversations (Up/Down, Enter, Delete, Esc)",
     .copilot_picker_new = "+ New conversation",
     .copilot_picker_empty = "No saved Copilot conversations",
@@ -611,7 +629,16 @@ const zh_CN = Strings{
     .cmd_palette_recent_sessions = "最近的副驾会话",
     .cmd_palette_no_sessions = "没有已保存的副驾会话",
     .cmd_palette_footer = "上下选择，回车执行",
-    .cmd_palette_footer_history = "上下选择，回车重开，Delete 删除，Esc 返回",
+    .cmd_palette_footer_history = "输入筛选，Tab 来源，上下选择，回车重开，Delete 删除，Esc 返回",
+    .cmd_palette_sidebar_tag = "侧栏",
+    .cmd_palette_group_today = "今天",
+    .cmd_palette_group_yesterday = "昨天",
+    .cmd_palette_group_past_week = "过去7天",
+    .cmd_palette_group_earlier = "更早",
+    .cmd_palette_source_all = "全部",
+    .cmd_palette_source_sidebar = "侧栏",
+    .cmd_palette_source_tab = "标签页",
+    .cmd_palette_history_search_placeholder = "搜索副驾历史",
     .copilot_picker_title = "副驾对话（上下选择，回车打开，Delete 删除，Esc 关闭）",
     .copilot_picker_new = "+ 新建对话",
     .copilot_picker_empty = "没有已保存的副驾对话",
@@ -756,8 +783,7 @@ pub fn commandTitle(action: CommandAction) ?[]const u8 {
         .new_agent => "新建副驾",
         .toggle_ai_copilot => "开 / 关 Copilot",
         .manage_ai_profiles => "管理 AI 配置",
-        .select_agent_history => "选择副驾历史",
-        .load_copilot_conversation => "载入副驾对话",
+        .select_agent_history => "副驾历史",
         .split_right => "向右分屏",
         .split_down => "向下分屏",
         .split_left => "向左分屏",
@@ -790,10 +816,7 @@ pub fn commandTitle(action: CommandAction) ?[]const u8 {
         .download_update => "下载更新",
         .open_latest_release => "打开最新发布",
         .show_whats_new => "更新内容",
-        .install_claude_code_integration => "安装 Claude Code 集成",
-        .remove_claude_code_integration => "移除 Claude Code 集成",
-        .install_codex_integration => "安装 Codex 集成",
-        .remove_codex_integration => "移除 Codex 集成",
+        .show_integration_prompt => "安装集成",
         .open_skill_center => "技能中心",
         .open_port_forwarding => "端口转发",
         .split_preview => "分屏预览",
@@ -812,7 +835,6 @@ pub fn commandDetail(action: CommandAction) ?[]const u8 {
         .toggle_ai_copilot => "在当前终端上打开或关闭 Copilot 侧栏",
         .manage_ai_profiles => "创建、编辑或删除已保存的 AI 配置",
         .select_agent_history => "打开命令中心的副驾历史选择器",
-        .load_copilot_conversation => "重新打开已保存的副驾侧栏对话",
         .split_right => "在右侧创建一个面板",
         .split_down => "在下方创建一个面板",
         .split_left => "在左侧创建一个面板",
@@ -845,10 +867,7 @@ pub fn commandDetail(action: CommandAction) ?[]const u8 {
         .download_update => "把最新更新下载到「下载」文件夹",
         .open_latest_release => "打开最新的 WispTerm GitHub Release",
         .show_whats_new => "查看本版本的更新内容",
-        .install_claude_code_integration => "将 WispTerm 智能体钩子添加到 ~/.claude/settings.json",
-        .remove_claude_code_integration => "从 ~/.claude/settings.json 中移除 WispTerm 智能体钩子",
-        .install_codex_integration => "将 WispTerm 智能体钩子添加到 ~/.codex/hooks.json",
-        .remove_codex_integration => "从 ~/.codex/hooks.json 中移除 WispTerm 智能体钩子",
+        .show_integration_prompt => "显示给 Codex、Claude Code 或其他智能体生成 WispTerm hook 的 prompt",
         .open_skill_center => "盘点各服务器上的 Claude Code / Codex 技能",
         .open_port_forwarding => "管理 SSH 端口转发规则",
         .split_preview => "在右侧打开预览面板",
@@ -935,4 +954,15 @@ test "settings strings: en source and zh translation present" {
     try std.testing.expectEqualStrings("语言", s().settings_language);
     try std.testing.expectEqualStrings("重启生效", s().settings_hint_restart);
     try std.testing.expect(s().settings_close.len > 0);
+}
+
+test "i18n: history panel strings present in both locales" {
+    defer setLang(.en);
+    setLang(.en);
+    try std.testing.expectEqualStrings("Today", s().cmd_palette_group_today);
+    try std.testing.expectEqualStrings("Sidebar", s().cmd_palette_source_sidebar);
+    setLang(.zh_CN);
+    try std.testing.expectEqualStrings("今天", s().cmd_palette_group_today);
+    try std.testing.expectEqualStrings("过去7天", s().cmd_palette_group_past_week);
+    try std.testing.expectEqualStrings("侧栏", s().cmd_palette_source_sidebar);
 }

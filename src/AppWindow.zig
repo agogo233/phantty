@@ -25,6 +25,7 @@ const memory_debug = @import("memory_debug.zig");
 const surface_registry = @import("surface_registry.zig");
 const agent_detector = @import("agent_detector.zig");
 const agent_history = @import("agent_history.zig");
+const agent_history_store = @import("agent_history_store.zig");
 const close_confirm = @import("close_confirm.zig");
 const font_backend = @import("platform/font_backend.zig");
 const platform_display = @import("platform/display.zig");
@@ -1158,7 +1159,11 @@ test "AppWindow: open AI chat tabs are persisted to agent history before session
     tab.g_tab_count = 0;
     active_tab_state.g_active_tab = 0;
 
-    var store = agent_history.Store.init(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const hist_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(hist_root);
+    var store = try agent_history_store.MetaStore.open(allocator, hist_root);
     defer store.deinit();
     g_agent_history = &store;
 
@@ -1221,7 +1226,11 @@ test "AppWindow: terminal tab copilot sessions are persisted to agent history be
     tab.g_tab_count = 0;
     active_tab_state.g_active_tab = 0;
 
-    var store = agent_history.Store.init(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const hist_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(hist_root);
+    var store = try agent_history_store.MetaStore.open(allocator, hist_root);
     defer store.deinit();
     g_agent_history = &store;
 
@@ -1329,7 +1338,11 @@ test "AppWindow: copilot restore hook rehydrates a copilot session by id" {
         g_allocator = previous_alloc;
     }
 
-    var store = agent_history.Store.init(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const hist_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(hist_root);
+    var store = try agent_history_store.MetaStore.open(allocator, hist_root);
     defer store.deinit();
     g_agent_history = &store;
     g_allocator = allocator;
@@ -1365,7 +1378,7 @@ test "AppWindow: copilot restore hook rehydrates a copilot session by id" {
 // App pointer for requestNewWindow
 pub threadlocal var g_app: ?*App = null;
 var g_agent_history_mutex: std.Thread.Mutex = .{};
-pub var g_agent_history: ?*agent_history.Store = null;
+pub var g_agent_history: ?*agent_history_store.MetaStore = null;
 var g_flush_scheduler: flush_scheduler.FlushScheduler = .{};
 var g_agent_history_revision: u64 = 0;
 
@@ -5567,9 +5580,11 @@ fn ensureGlobalAgentHistoryStore(allocator: std.mem.Allocator) !void {
 
     if (g_agent_history != null) return;
 
-    const store = try allocator.create(agent_history.Store);
+    const store = try allocator.create(agent_history_store.MetaStore);
     errdefer allocator.destroy(store);
-    store.* = try agent_history.loadDefault(allocator);
+    const dir = try platform_dirs.agentHistoryDir(allocator);
+    defer allocator.free(dir);
+    store.* = try agent_history_store.MetaStore.open(allocator, dir);
     g_agent_history = store;
     g_flush_scheduler.reset();
     g_agent_history_revision = 0;
@@ -5658,51 +5673,17 @@ fn markAgentHistoryDirtyLocked() void {
 
 fn flushAgentHistoryStoreIfDirty(force: bool) void {
     const now = std.time.milliTimestamp();
-    var json: ?[]u8 = null;
-    var path: ?[]const u8 = null;
-    var snapshot_allocator: ?std.mem.Allocator = null;
-
     g_agent_history_mutex.lock();
-    if (!g_flush_scheduler.shouldFlush(force, now)) {
-        g_agent_history_mutex.unlock();
-        return;
-    }
+    defer g_agent_history_mutex.unlock();
 
-    const store = g_agent_history orelse {
-        g_agent_history_mutex.unlock();
-        return;
-    };
-    snapshot_allocator = store.allocator;
-    json = store.toJsonString(store.allocator) catch |err| {
-        log.warn("failed to snapshot agent history store for flush: {}", .{err});
-        g_flush_scheduler.deferFlush(now);
-        g_agent_history_mutex.unlock();
-        return;
-    };
-    path = agent_history.defaultPath(store.allocator) catch |err| {
-        log.warn("failed to resolve agent history path for flush: {}", .{err});
-        store.allocator.free(json.?);
-        g_flush_scheduler.deferFlush(now);
-        g_agent_history_mutex.unlock();
+    if (!g_flush_scheduler.shouldFlush(force, now)) return;
+    const store = g_agent_history orelse return;
+    store.flush() catch |err| {
+        log.warn("failed to flush agent history store: {}", .{err});
+        g_flush_scheduler.failFlush(std.time.milliTimestamp());
         return;
     };
     g_flush_scheduler.beginFlush();
-    g_agent_history_mutex.unlock();
-
-    agent_history.saveJsonToPath(path.?, json.?) catch |err| {
-        log.warn("failed to flush agent history store: {}", .{err});
-        g_agent_history_mutex.lock();
-        g_flush_scheduler.failFlush(std.time.milliTimestamp());
-        snapshot_allocator.?.free(path.?);
-        snapshot_allocator.?.free(json.?);
-        g_agent_history_mutex.unlock();
-        return;
-    };
-
-    g_agent_history_mutex.lock();
-    snapshot_allocator.?.free(path.?);
-    snapshot_allocator.?.free(json.?);
-    g_agent_history_mutex.unlock();
 }
 
 fn spawnTabWithCwd(allocator: std.mem.Allocator, cwd: platform_pty_command.Cwd) bool {
@@ -6607,6 +6588,7 @@ fn renderResizeFrame(width: i32, height: i32) void {
     overlays.renderUpdatePrompt(@floatFromInt(fb_width), @floatFromInt(fb_height));
     overlays.renderWindowCloseConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
     overlays.renderRestoreDefaultsConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
+    overlays.renderIntegrationPrompt(@floatFromInt(fb_width), @floatFromInt(fb_height));
     overlays.renderWhatsNew(@floatFromInt(fb_width), @floatFromInt(fb_height));
 
     render_diagnostics.log(
@@ -7955,6 +7937,13 @@ var g_ctl_panes_json: []u8 = &.{}; // page_allocator-owned latest panes JSON
 // sync). The timestamp must be touched atomically to avoid a data race.
 var g_ctl_panes_last_ms = std.atomic.Value(i64).init(0);
 
+// Overlay semantic state for `ui-state`, published the same way as panes: the UI
+// thread serializes the threadlocal command-center globals on the render tick,
+// the ctl server thread only ever reads this buffer under the mutex.
+var g_ctl_ui_state_mutex: std.Thread.Mutex = .{};
+var g_ctl_ui_state_json: []u8 = &.{}; // page_allocator-owned latest ui-state JSON
+var g_ctl_ui_state_last_ms = std.atomic.Value(i64).init(0);
+
 const ctl_default_rows: u32 = 1000;
 
 pub fn enableAgentControl() void {
@@ -7990,10 +7979,19 @@ fn ctlSendText(ctx: *anyopaque, id: []const u8, data: []const u8) bool {
     return true;
 }
 
+fn ctlUiState(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8 {
+    _ = ctx;
+    g_ctl_ui_state_mutex.lock();
+    defer g_ctl_ui_state_mutex.unlock();
+    if (g_ctl_ui_state_json.len == 0) return null;
+    return try allocator.dupe(u8, g_ctl_ui_state_json);
+}
+
 const ctl_vtable = ctl_control.Control.VTable{
     .list_panes = ctlListPanes,
     .get_text = ctlGetText,
     .send_text = ctlSendText,
+    .ui_state = ctlUiState,
 };
 
 /// The Control the agent-control server drives. Backed by process-global state,
@@ -8026,6 +8024,32 @@ fn syncCtlPanes(allocator: std.mem.Allocator) void {
     defer g_ctl_panes_mutex.unlock();
     if (g_ctl_panes_json.len != 0) std.heap.page_allocator.free(g_ctl_panes_json);
     g_ctl_panes_json = owned;
+}
+
+fn clearCtlUiStateCache() void {
+    g_ctl_ui_state_mutex.lock();
+    defer g_ctl_ui_state_mutex.unlock();
+    if (g_ctl_ui_state_json.len != 0) std.heap.page_allocator.free(g_ctl_ui_state_json);
+    g_ctl_ui_state_json = &.{};
+}
+
+/// UI-thread: publish a fresh overlay ui-state JSON snapshot (throttled). Called
+/// from the render loop next to syncCtlPanes. No-op unless ctl is enabled.
+fn syncCtlUiState(allocator: std.mem.Allocator) void {
+    if (!g_agent_control_enabled.load(.acquire)) return;
+    const now = std.time.milliTimestamp();
+    if (now - g_ctl_ui_state_last_ms.load(.monotonic) < 200) return;
+    g_ctl_ui_state_last_ms.store(now, .monotonic);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    overlays.buildUiStateJson(allocator, &out) catch return;
+
+    const owned = std.heap.page_allocator.dupe(u8, out.items) catch return;
+    g_ctl_ui_state_mutex.lock();
+    defer g_ctl_ui_state_mutex.unlock();
+    if (g_ctl_ui_state_json.len != 0) std.heap.page_allocator.free(g_ctl_ui_state_json);
+    g_ctl_ui_state_json = owned;
 }
 
 test "ctl surface callbacks reject an unregistered id without dereferencing" {
@@ -10005,6 +10029,7 @@ fn runMainLoop(self: *AppWindow) !void {
             const split_count = computeSplitLayout(active_tab, content_x, content_y, content_w, content_h, font.cell_width, font.cell_height);
             syncRemoteLayout(allocator);
             syncCtlPanes(allocator);
+            syncCtlUiState(allocator);
             syncImeCaretPosition(win, split_count);
             if (active_tab.kind != .ai_chat and active_tab.kind != .ai_history and active_tab.kind != .skill_center and active_tab.kind != .port_forwarding and synchronizedOutputPendingForVisibleSplits(split_count)) {
                 // Block instead of spinning at ~1kHz: the IO thread posts a
@@ -10257,6 +10282,7 @@ fn runMainLoop(self: *AppWindow) !void {
         overlays.renderUpdatePrompt(@floatFromInt(fb_width), @floatFromInt(fb_height));
         overlays.renderWindowCloseConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
         overlays.renderRestoreDefaultsConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
+        overlays.renderIntegrationPrompt(@floatFromInt(fb_width), @floatFromInt(fb_height));
         overlays.renderWhatsNew(@floatFromInt(fb_width), @floatFromInt(fb_height));
         renderImePreedit(win, fb_width, fb_height);
 
@@ -10332,6 +10358,7 @@ fn runMainLoop(self: *AppWindow) !void {
     weixin_qr_panel.deinit();
     clearWeixinTranscriptCache();
     clearCtlPanesCache();
+    clearCtlUiStateCache();
     markdown_preview_renderer.deinit();
     browser_panel.deinit();
 

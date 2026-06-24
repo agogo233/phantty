@@ -23,6 +23,8 @@ const ssh_prompt = @import("../ssh_prompt.zig");
 const ssh_connection = @import("../ssh_connection.zig");
 const app_metadata = @import("../app_metadata.zig");
 const command_center_state = @import("../command_center_state.zig");
+const ctl_ui_state = @import("../ctl/ui_state.zig");
+const command_palette_history_view = @import("../command_palette_history_view.zig");
 const command_palette_model = @import("../command_palette_model.zig");
 const agent_history = @import("../agent_history.zig");
 const platform_dirs = @import("../platform/dirs.zig");
@@ -36,10 +38,8 @@ const weixin_qr_panel = @import("../weixin/qr_panel.zig");
 const weixin_types = @import("../weixin/types.zig");
 const i18n = @import("../i18n.zig");
 const ai_model_switch = @import("../ai_model_switch.zig");
-const claude_integration = @import("../claude_integration.zig");
-const codex_integration = @import("../codex_integration.zig");
-const platform_atomic_file = @import("../platform/atomic_file.zig");
-const agent_detector = @import("../agent_detector.zig");
+const agent_integration_prompt = @import("../agent_integration_prompt.zig");
+const ai_history_time = @import("../ai_history_time.zig");
 
 const ui_pipeline = @import("ui_pipeline.zig");
 
@@ -136,6 +136,8 @@ const md = @import("../markdown_text.zig");
 const whats_new_model = @import("overlays/whats_new_model.zig");
 threadlocal var g_whats_new_visible: bool = false;
 threadlocal var g_whats_new_scroll: i64 = 0;
+threadlocal var g_integration_prompt_visible: bool = false;
+threadlocal var g_integration_prompt_scroll: i64 = 0;
 threadlocal var g_update_prompt_until_ms: i64 = 0;
 threadlocal var g_update_prompt_buf: [128]u8 = undefined;
 threadlocal var g_update_prompt_len: usize = 0;
@@ -228,6 +230,8 @@ threadlocal var g_command_palette_filter: [COMMAND_PALETTE_FILTER_MAX]u8 = undef
 threadlocal var g_command_palette_filter_len: usize = 0;
 threadlocal var g_command_palette_mode: CommandPaletteMode = .commands;
 threadlocal var g_command_palette_history_selected: usize = 0;
+threadlocal var g_command_palette_history_source: command_palette_history_view.SourceFilter = .all;
+threadlocal var g_command_palette_history_item_count: usize = 0;
 
 const CommandPaletteLayout = struct {
     box_x: f32,
@@ -322,17 +326,33 @@ pub fn commandPaletteAgentHistoryVisible() bool {
 
 pub fn commandPaletteMoveAgentHistory(delta: i32) void {
     commandPaletteSyncAgentHistoryRows();
+    var view = buildHistoryView() orelse {
+        var state0 = commandCenterStateSnapshot();
+        state0.commandPaletteMoveAgentHistory(delta, g_command_palette_history_rows.len);
+        commandCenterStateCommit(state0);
+        return;
+    };
+    defer view.deinit(AppWindow.g_allocator.?);
     var state = commandCenterStateSnapshot();
-    state.commandPaletteMoveAgentHistory(delta, g_command_palette_history_rows.len);
+    state.commandPaletteMoveAgentHistory(delta, view.rowCount());
+    commandCenterStateCommit(state);
+}
+
+pub fn commandPaletteCycleHistorySource() void {
+    var state = commandCenterStateSnapshot();
+    state.commandPaletteCycleHistorySource();
     commandCenterStateCommit(state);
 }
 
 pub fn commandPaletteDeleteSelectedAgentHistory() bool {
     if (!commandPaletteIsHistoryMode()) return false;
     commandPaletteSyncAgentHistoryRows();
+    var view = buildHistoryView() orelse return false;
+    defer view.deinit(AppWindow.g_allocator.?);
     const state = commandCenterStateSnapshot();
-    const row_idx = state.commandPaletteSelectedAgentHistoryIndex(g_command_palette_history_rows.len) orelse return false;
-    return commandPaletteDeleteAgentHistoryIndex(row_idx);
+    const ord = state.commandPaletteSelectedAgentHistoryIndex(view.rowCount()) orelse return false;
+    const orig = view.filtered[ord];
+    return commandPaletteDeleteAgentHistoryIndex(orig);
 }
 
 pub fn commandPaletteLeaveAgentHistory() void {
@@ -343,13 +363,15 @@ pub fn commandPaletteLeaveAgentHistory() void {
 }
 
 pub fn commandPaletteBackspace() void {
-    if (commandPaletteIsHistoryMode()) return;
     if (g_command_palette_filter_len == 0) return;
-    // Remove a whole UTF-8 codepoint: walk back over continuation bytes (0b10xxxxxx).
     var n = g_command_palette_filter_len - 1;
     while (n > 0 and (g_command_palette_filter[n] & 0xC0) == 0x80) n -= 1;
     g_command_palette_filter_len = n;
-    commandPaletteClampSelection();
+    if (commandPaletteIsHistoryMode()) {
+        g_command_palette_history_selected = 0;
+    } else {
+        commandPaletteClampSelection();
+    }
 }
 
 pub fn commandPaletteClearFilter() void {
@@ -359,17 +381,17 @@ pub fn commandPaletteClearFilter() void {
 }
 
 pub fn commandPaletteInsertChar(codepoint: u21) void {
-    if (commandPaletteIsHistoryMode()) return;
     if (codepoint < 0x20 or codepoint == 0x7f) return;
-
-    // UTF-8-encode the codepoint so CJK (e.g. IME-committed 中文) is accepted,
-    // not just ASCII. Mirrors the terminal char path's utf8Encode.
     var buf: [4]u8 = undefined;
     const len = std.unicode.utf8Encode(codepoint, &buf) catch return;
     if (g_command_palette_filter_len + len > g_command_palette_filter.len) return;
     @memcpy(g_command_palette_filter[g_command_palette_filter_len..][0..len], buf[0..len]);
     g_command_palette_filter_len += len;
-    commandPaletteClampSelection();
+    if (commandPaletteIsHistoryMode()) {
+        g_command_palette_history_selected = 0;
+    } else {
+        commandPaletteClampSelection();
+    }
 }
 
 pub fn commandPaletteExecuteSelected() void {
@@ -503,6 +525,68 @@ pub fn restoreDefaultsConfirmExecuteAt(xpos: f64, ypos: f64, window_width: f32, 
     return pointInTopRect(xpos, ypos, layout.panel_x, layout.panel_top_px, layout.panel_w, layout.panel_h);
 }
 
+pub fn integrationPromptOpen() void {
+    g_integration_prompt_scroll = 0;
+    g_integration_prompt_visible = true;
+}
+
+pub fn integrationPromptClose() void {
+    g_integration_prompt_visible = false;
+}
+
+pub fn integrationPromptVisible() bool {
+    return g_integration_prompt_visible;
+}
+
+fn copyIntegrationPrompt() void {
+    if (AppWindow.input.copyTextToClipboard(agent_integration_prompt.promptText())) {
+        integrationPromptCopySucceeded();
+    } else {
+        showStatusToast("Copy failed; select the prompt text manually");
+    }
+}
+
+fn integrationPromptCopySucceeded() void {
+    showStatusToast("Integration prompt copied");
+    integrationPromptClose();
+}
+
+pub fn integrationPromptHandleKey(ev: input_key.KeyEvent) void {
+    if (!g_integration_prompt_visible) return;
+    switch (ev.key) {
+        .escape => integrationPromptClose(),
+        .enter => copyIntegrationPrompt(),
+        .page_up => g_integration_prompt_scroll -= 8,
+        .page_down => g_integration_prompt_scroll += 8,
+        .arrow_up => g_integration_prompt_scroll -= 1,
+        .arrow_down => g_integration_prompt_scroll += 1,
+        .home => g_integration_prompt_scroll = 0,
+        .end => g_integration_prompt_scroll = std.math.maxInt(i32),
+        else => {},
+    }
+}
+
+pub fn integrationPromptHandleScroll(delta_y: f64) void {
+    if (!g_integration_prompt_visible) return;
+    g_integration_prompt_scroll += if (delta_y > 0) @as(i64, -3) else 3;
+}
+
+pub fn integrationPromptExecuteAt(xpos: f64, ypos: f64, window_width: f32, window_height: f32) bool {
+    if (!g_integration_prompt_visible) return false;
+    const layout = integrationPromptLayout(window_width, window_height);
+    if (pointInTopRect(xpos, ypos, layout.close_x, layout.close_top_px, layout.close_w, layout.close_h)) {
+        copyIntegrationPrompt();
+        return true;
+    }
+    if (pointInTopRect(xpos, ypos, layout.cancel_x, layout.cancel_top_px, layout.cancel_w, layout.cancel_h)) {
+        integrationPromptClose();
+        return true;
+    }
+    if (pointInTopRect(xpos, ypos, layout.panel_x, layout.panel_top_px, layout.panel_w, layout.panel_h)) return true;
+    integrationPromptClose();
+    return true;
+}
+
 pub fn transferCancelConfirmOpen() void {
     g_transfer_cancel_confirm_visible = true;
 }
@@ -554,7 +638,6 @@ fn executeCommand(action: CommandAction) void {
         .toggle_ai_copilot => AppWindow.toggleAiCopilot(),
         .manage_ai_profiles => openAiListFromCommandPalette(),
         .select_agent_history => commandPaletteOpenAgentHistory(),
-        .load_copilot_conversation => AppWindow.openCopilotConversationPicker(),
         .split_right => AppWindow.splitFocused(.right),
         .split_down => AppWindow.splitFocused(.down),
         .split_left => AppWindow.splitFocused(.left),
@@ -603,10 +686,7 @@ fn executeCommand(action: CommandAction) void {
         },
         .open_latest_release => openLatestRelease(),
         .show_whats_new => showWhatsNew(),
-        .install_claude_code_integration => installClaudeCodeIntegration(),
-        .remove_claude_code_integration => removeClaudeCodeIntegration(),
-        .install_codex_integration => installCodexIntegration(),
-        .remove_codex_integration => removeCodexIntegration(),
+        .show_integration_prompt => integrationPromptOpen(),
         .open_skill_center => {
             _ = AppWindow.spawnSkillCenterTab();
         },
@@ -1061,6 +1141,22 @@ fn commandPaletteSyncAgentHistoryRows() void {
     commandPaletteRefreshAgentHistoryRows();
 }
 
+/// Build the current filtered/grouped view from the loaded history rows + live
+/// filter/source. Caller owns the View and must `deinit` it. Null on no allocator.
+fn buildHistoryView() ?command_palette_history_view.View {
+    const allocator = AppWindow.g_allocator orelse return null;
+    const now_ms = std.time.milliTimestamp();
+    const tz = ai_history_time.localOffsetSeconds();
+    return command_palette_history_view.build(
+        allocator,
+        g_command_palette_history_rows,
+        commandPaletteFilter(),
+        g_command_palette_history_source,
+        now_ms,
+        tz,
+    ) catch null;
+}
+
 fn applyEmbeddedThemeFromPalette(theme_index: usize) void {
     const allocator = AppWindow.g_allocator orelse return;
     if (theme_index >= themes_embed.entries.len) return;
@@ -1075,8 +1171,44 @@ fn commandPaletteVisibleCount() usize {
 }
 
 fn commandPaletteResultCount() usize {
-    if (commandPaletteIsHistoryMode()) return g_command_palette_history_rows.len;
+    if (commandPaletteIsHistoryMode()) return g_command_palette_history_item_count;
     return commandPaletteVisibleCount();
+}
+
+fn historyBucketLabel(b: command_palette_history_view.Bucket) []const u8 {
+    return switch (b) {
+        .today => i18n.s().cmd_palette_group_today,
+        .yesterday => i18n.s().cmd_palette_group_yesterday,
+        .past_week => i18n.s().cmd_palette_group_past_week,
+        .earlier => i18n.s().cmd_palette_group_earlier,
+    };
+}
+
+fn historySourceLabel(src: command_palette_history_view.SourceFilter) []const u8 {
+    return switch (src) {
+        .all => i18n.s().cmd_palette_source_all,
+        .sidebar => i18n.s().cmd_palette_source_sidebar,
+        .tab => i18n.s().cmd_palette_source_tab,
+    };
+}
+
+/// First visible item index that keeps `focus_item` inside a window of `rendered`
+/// items out of `count`.
+fn historyWindowStart(count: usize, rendered: usize, focus_item: usize) usize {
+    if (rendered == 0 or count <= rendered) return 0;
+    if (focus_item < rendered) return 0;
+    return @min(focus_item - rendered + 1, count - rendered);
+}
+
+/// The items-index of the row whose ordinal == selected_ord (0 if not found).
+fn historySelectedItemIndex(view: command_palette_history_view.View, selected_ord: usize) usize {
+    for (view.items, 0..) |it, i| {
+        switch (it) {
+            .row => |ord| if (ord == selected_ord) return i,
+            .header => {},
+        }
+    }
+    return 0;
 }
 
 fn commandPaletteClampSelection() void {
@@ -1220,17 +1352,30 @@ fn commandPaletteHistoryHitTestIndex(xpos: f64, ypos: f64, window_width: f32, wi
     const row: usize = @intFromFloat(@floor(row_f));
     if (row >= layout.rendered_rows) return null;
 
-    const item_idx = commandPaletteFirstVisibleIndex(layout.rendered_rows) + row;
-    if (item_idx >= g_command_palette_history_rows.len) return null;
-    return item_idx;
+    var view = buildHistoryView() orelse return null;
+    defer view.deinit(AppWindow.g_allocator.?);
+    const selectable = view.rowCount();
+    if (selectable == 0) return null;
+    const selected_ord = @min(g_command_palette_history_selected, selectable - 1);
+    const focus_item = historySelectedItemIndex(view, selected_ord);
+    const first_item = historyWindowStart(view.items.len, layout.rendered_rows, focus_item);
+    const item_idx = first_item + row;
+    if (item_idx >= view.items.len) return null;
+    return switch (view.items[item_idx]) {
+        .header => null, // clicking a group header is a no-op
+        .row => |ord| view.filtered[ord], // raw index into g_command_palette_history_rows
+    };
 }
 
 fn commandPaletteActivateSelectedAgentHistory() bool {
     if (!commandPaletteIsHistoryMode()) return false;
     commandPaletteSyncAgentHistoryRows();
+    var view = buildHistoryView() orelse return false;
+    defer view.deinit(AppWindow.g_allocator.?);
     const state = commandCenterStateSnapshot();
-    const row_idx = state.commandPaletteActivateSelected(g_command_palette_history_rows.len) orelse return false;
-    return commandPaletteActivateAgentHistoryIndex(row_idx);
+    const ord = state.commandPaletteActivateSelected(view.rowCount()) orelse return false;
+    const orig = view.filtered[ord];
+    return commandPaletteActivateAgentHistoryIndex(orig);
 }
 
 fn commandPaletteActivateAgentHistoryRow(row_idx: usize) bool {
@@ -1245,6 +1390,16 @@ fn commandPaletteActivateAgentHistoryRow(row_idx: usize) bool {
 fn commandPaletteActivateAgentHistoryIndex(row_idx: usize) bool {
     if (!commandPaletteIsHistoryMode()) return false;
     if (row_idx >= g_command_palette_history_rows.len) return false;
+
+    // Sidebar-origin conversations restore into the active tab's Copilot
+    // sidebar; tab conversations reopen as a full AI-chat tab. The sidebar
+    // branch runs before the palette closes, so the row pointer stays valid.
+    if (g_command_palette_history_rows[row_idx].copilot) {
+        AppWindow.loadCopilotConversationById(g_command_palette_history_rows[row_idx].session_id);
+        commandPaletteClose();
+        return true;
+    }
+
     if (AppWindow.reopenAiChatTabFromHistorySessionId(g_command_palette_history_rows[row_idx].session_id)) {
         commandPaletteClose();
         return true;
@@ -1316,6 +1471,40 @@ fn windowCloseConfirmLayout(window_width: f32, window_height: f32) WindowCloseCo
         .cancel_x = cancel_x,
         .cancel_top_px = button_top_px,
         .cancel_w = cancel_w,
+        .cancel_h = button_h,
+    };
+}
+
+const INTEGRATION_PROMPT_COPY_LABEL = "Copy Prompt";
+const INTEGRATION_PROMPT_CLOSE_LABEL = "Close";
+
+fn integrationPromptLayout(window_width: f32, window_height: f32) WindowCloseConfirmLayout {
+    const panel_w = @round(@min(@max(360.0, window_width - 96.0), 960.0));
+    const desired_h = @min(@max(360.0, window_height - 96.0), 560.0);
+    const panel_h = @round(@min(desired_h, @max(220.0, window_height - 48.0)));
+    const panel_x = @round(@max(24.0, (window_width - panel_w) / 2.0));
+    const panel_top_px = @round(@max(24.0, (window_height - panel_h) / 2.0));
+
+    const button_h = @round(@max(38.0, overlayTextHeight() + 16.0));
+    const copy_w = @round(@max(154.0, measureTitlebarText(INTEGRATION_PROMPT_COPY_LABEL) + 44.0));
+    const close_w = @round(@max(130.0, measureTitlebarText(INTEGRATION_PROMPT_CLOSE_LABEL) + 42.0));
+    const gap: f32 = 12.0;
+    const button_top_px = panel_top_px + panel_h - 30.0 - button_h;
+    const cancel_x = panel_x + panel_w - 32.0 - close_w;
+    const close_x = cancel_x - gap - copy_w;
+
+    return .{
+        .panel_x = panel_x,
+        .panel_top_px = panel_top_px,
+        .panel_w = panel_w,
+        .panel_h = panel_h,
+        .close_x = close_x,
+        .close_top_px = button_top_px,
+        .close_w = copy_w,
+        .close_h = button_h,
+        .cancel_x = cancel_x,
+        .cancel_top_px = button_top_px,
+        .cancel_w = close_w,
         .cancel_h = button_h,
     };
 }
@@ -1706,6 +1895,17 @@ pub fn renderCommandPalette(window_width: f32, window_height: f32, top_offset: f
     if (!g_command_palette_visible) return;
     commandPaletteSyncAgentHistoryRows();
 
+    var history_view: ?command_palette_history_view.View = null;
+    const hist_alloc = AppWindow.g_allocator;
+    defer if (history_view) |*v| {
+        if (hist_alloc) |a| v.deinit(a);
+    };
+    const hist_now_ms = std.time.milliTimestamp();
+    if (commandPaletteIsHistoryMode()) {
+        history_view = buildHistoryView();
+        g_command_palette_history_item_count = if (history_view) |v| v.items.len else 0;
+    }
+
     const layout = commandPaletteLayout(window_width, window_height, top_offset);
     const box_y = @round(window_height - layout.box_top_px - layout.box_h);
 
@@ -1731,6 +1931,12 @@ pub fn renderCommandPalette(window_width: f32, window_height: f32, top_offset: f
     renderTitlebarText(if (commandPaletteIsHistoryMode()) i18n.s().cmd_palette_history_title else i18n.s().cmd_palette_title, layout.box_x + pad_x, title_y, title_color);
     const esc_hint = if (commandPaletteIsHistoryMode()) i18n.s().cmd_palette_esc_returns else i18n.s().cmd_palette_esc_closes;
     renderTitlebarText(esc_hint, layout.box_x + layout.box_w - pad_x - measureTitlebarText(esc_hint), title_y, muted);
+    if (commandPaletteIsHistoryMode()) {
+        const chip = historySourceLabel(g_command_palette_history_source);
+        const chip_w = measureTitlebarText(chip);
+        const chip_x = layout.box_x + layout.box_w - pad_x - measureTitlebarText(esc_hint) - 16 - chip_w;
+        renderTitlebarText(chip, chip_x, title_y, mixColor(fg, accent, 0.20));
+    }
 
     const filter_x = @round(layout.box_x + pad_x);
     const filter_box_y = @round(window_height - (layout.box_top_px + layout.header_h + layout.filter_h));
@@ -1740,11 +1946,12 @@ pub fn renderCommandPalette(window_width: f32, window_height: f32, top_offset: f
 
     const filter_text_y = rowTextY(filter_box_y, layout.filter_h);
     if (commandPaletteIsHistoryMode()) {
-        const history_hint = if (g_command_palette_history_rows.len == 0)
-            i18n.s().cmd_palette_no_sessions_yet
-        else
-            i18n.s().cmd_palette_recent_sessions;
-        renderTitlebarTextLimited(history_hint, filter_x + 12, filter_text_y, dim, filter_w - 24);
+        const filter = commandPaletteFilter();
+        if (filter.len > 0) {
+            renderTitlebarTextLimited(filter, filter_x + 12, filter_text_y, fg, filter_w - 24);
+        } else {
+            renderTitlebarTextLimited(i18n.s().cmd_palette_history_search_placeholder, filter_x + 12, filter_text_y, dim, filter_w - 24);
+        }
     } else {
         const filter = commandPaletteFilter();
         if (filter.len > 0) {
@@ -1755,37 +1962,55 @@ pub fn renderCommandPalette(window_width: f32, window_height: f32, top_offset: f
     }
 
     if (commandPaletteIsHistoryMode()) {
-        if (g_command_palette_history_rows.len == 0) {
+        const selectable = if (history_view) |v| v.rowCount() else 0;
+        if (history_view == null or selectable == 0) {
             const empty_text = i18n.s().cmd_palette_no_sessions;
             const empty_y = @round(window_height - layout.row_top_px - layout.row_h + (layout.row_h - overlayTextHeight()) / 2);
             renderTitlebarText(empty_text, layout.box_x + (layout.box_w - measureTitlebarText(empty_text)) / 2, empty_y, muted);
         } else {
-            const first_row = commandPaletteFirstVisibleIndex(layout.rendered_rows);
+            const view = history_view.?;
+            const selected_ord = @min(g_command_palette_history_selected, selectable - 1);
+            const focus_item = historySelectedItemIndex(view, selected_ord);
+            const first_item = historyWindowStart(view.items.len, layout.rendered_rows, focus_item);
+
             var display_row: usize = 0;
             while (display_row < layout.rendered_rows) : (display_row += 1) {
-                const item_idx = first_row + display_row;
-                if (item_idx >= g_command_palette_history_rows.len) break;
-                const row = g_command_palette_history_rows[item_idx];
-                const selected = item_idx == g_command_palette_history_selected;
-
+                const item_idx = first_item + display_row;
+                if (item_idx >= view.items.len) break;
                 const row_top = @round(layout.row_top_px + @as(f32, @floatFromInt(display_row)) * layout.row_h);
                 const row_y = @round(window_height - row_top - layout.row_h);
-                if (selected) {
-                    renderRoundedQuadAlpha(layout.box_x + 12, row_y + 4, layout.box_w - 24, layout.row_h - 8, 5, selected_border, 0.38);
-                    renderRoundedQuadAlpha(layout.box_x + 13, row_y + 5, layout.box_w - 26, layout.row_h - 10, 4, selected_bg, 0.78);
-                }
-
-                const row_title_color = if (selected) fg else mixColor(bg, fg, 0.86);
-                const meta_color = if (selected) mixColor(fg, accent, 0.08) else mixColor(bg, fg, 0.54);
                 const text_y = rowTextY(row_y, layout.row_h);
-                const title_x = @round(layout.box_x + pad_x + 2);
-                const meta_right = layout.box_x + layout.box_w - pad_x;
-                if (row.model.len > 0) {
-                    const meta_w = measureTitlebarText(row.model);
-                    renderTitlebarText(row.model, meta_right - meta_w, text_y, meta_color);
-                    renderTitlebarTextLimited(row.title, title_x, text_y, row_title_color, (meta_right - meta_w) - title_x - 18);
-                } else {
-                    renderTitlebarTextLimited(row.title, title_x, text_y, row_title_color, meta_right - title_x);
+                switch (view.items[item_idx]) {
+                    .header => |b| {
+                        const label = historyBucketLabel(b);
+                        renderTitlebarText(label, @round(layout.box_x + pad_x + 2), text_y, mixColor(bg, fg, 0.40));
+                    },
+                    .row => |ord| {
+                        const row = g_command_palette_history_rows[view.filtered[ord]];
+                        const selected = ord == selected_ord;
+                        if (selected) {
+                            renderRoundedQuadAlpha(layout.box_x + 12, row_y + 4, layout.box_w - 24, layout.row_h - 8, 5, selected_border, 0.38);
+                            renderRoundedQuadAlpha(layout.box_x + 13, row_y + 5, layout.box_w - 26, layout.row_h - 10, 4, selected_bg, 0.78);
+                        }
+                        const row_title_color = if (selected) fg else mixColor(bg, fg, 0.86);
+                        const meta_color = if (selected) mixColor(fg, accent, 0.08) else mixColor(bg, fg, 0.54);
+                        const title_x = @round(layout.box_x + pad_x + 2);
+                        const meta_right = layout.box_x + layout.box_w - pad_x;
+
+                        var tbuf: [32]u8 = undefined;
+                        const rel = copilot_picker.formatRelativeTime(hist_now_ms, row.updated_at, &tbuf);
+                        const rel_w = measureTitlebarText(rel);
+                        renderTitlebarText(rel, meta_right - rel_w, text_y, meta_color);
+
+                        const tag = if (row.copilot) i18n.s().cmd_palette_sidebar_tag else row.model;
+                        var title_limit_right = meta_right - rel_w - 14;
+                        if (tag.len > 0) {
+                            const tag_w = measureTitlebarText(tag);
+                            renderTitlebarText(tag, title_limit_right - tag_w, text_y, meta_color);
+                            title_limit_right = title_limit_right - tag_w - 14;
+                        }
+                        renderTitlebarTextLimited(row.title, title_x, text_y, row_title_color, title_limit_right - title_x);
+                    },
                 }
             }
         }
@@ -1899,7 +2124,15 @@ pub fn renderCommandPalette(window_width: f32, window_height: f32, top_offset: f
         const track_gl_y = @round(window_height - track_top_px - track_h);
         ui_pipeline.fillQuadAlpha(sb_x, track_gl_y, sb_w, track_h, mixColor(bg, fg, 0.25), 0.30);
 
-        const first_row = commandPaletteFirstVisibleIndex(layout.rendered_rows);
+        // History mode windows over display items (rows + group headers), so the
+        // thumb must track the same item-index window the list render uses, not the
+        // raw-ordinal window commandPaletteFirstVisibleIndex assumes.
+        const first_row = if (commandPaletteIsHistoryMode()) blk: {
+            const v = history_view orelse break :blk 0;
+            const selectable = v.rowCount();
+            const selected_ord = if (selectable == 0) 0 else @min(g_command_palette_history_selected, selectable - 1);
+            break :blk historyWindowStart(v.items.len, layout.rendered_rows, historySelectedItemIndex(v, selected_ord));
+        } else commandPaletteFirstVisibleIndex(layout.rendered_rows);
         const thumb_h = @max(24.0, @round(track_h * vis_f / total_f));
         const max_scroll_f: f32 = @floatFromInt(total_results - layout.rendered_rows);
         const scroll_f: f32 = @floatFromInt(first_row);
@@ -2073,6 +2306,43 @@ pub fn sessionLauncherVisible() bool {
     return commandCenterStateSnapshot().sessionLauncherVisible();
 }
 
+/// Serialize the overlay layer (which modal is up, selection, filter) for the
+/// wisptermctl `ui-state` command. Reads threadlocal command-center globals, so
+/// it must run on the UI thread — AppWindow's render-tick publisher calls it and
+/// hands the JSON to the ctl server thread. Complements `panes` (topology).
+pub fn buildUiStateJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    const st = commandCenterStateSnapshot();
+    const history_mode = st.commandPaletteIsHistoryMode();
+    // commandPaletteVisibleCount() rebuilds the filtered-results scratch, so only
+    // pay for it when the palette is showing the command list.
+    const visible_count: usize = if (st.command_palette_visible and !history_mode)
+        commandPaletteVisibleCount()
+    else
+        0;
+    try ctl_ui_state.writeJson(allocator, out, .{
+        .command_palette_visible = st.command_palette_visible,
+        .command_palette_mode = if (history_mode) .history else .commands,
+        .command_palette_selected = st.command_palette_selected,
+        .command_palette_visible_count = visible_count,
+        .command_palette_filter = commandPaletteFilter(),
+        .history_selected = st.command_palette_history_selected,
+        .history_source = switch (st.command_palette_history_source) {
+            .all => .all,
+            .sidebar => .sidebar,
+            .tab => .tab,
+        },
+        .session_launcher_visible = st.session_launcher_visible,
+        .session_launcher_selected = st.session_launcher_selected,
+        .settings_visible = st.settings_visible,
+        .ai_form_visible = st.ai_form_visible,
+        .ssh_form_visible = st.ssh_form_visible,
+        .ai_list_visible = st.ai_list_visible,
+        .ssh_list_visible = st.ssh_list_visible,
+        .ai_history_source_visible = st.ai_history_source_visible,
+        .startup_shortcuts_visible = st.startup_shortcuts_visible,
+    });
+}
+
 fn commandCenterStateSnapshot() command_center_state.State {
     return .{
         .command_palette_visible = g_command_palette_visible,
@@ -2080,6 +2350,7 @@ fn commandCenterStateSnapshot() command_center_state.State {
         .command_palette_filter_len = g_command_palette_filter_len,
         .command_palette_mode = g_command_palette_mode,
         .command_palette_history_selected = g_command_palette_history_selected,
+        .command_palette_history_source = g_command_palette_history_source,
         .startup_shortcuts_visible = startup_shortcuts.g_startup_shortcuts_visible,
         .session_launcher_visible = g_session_launcher_visible,
         .session_launcher_selected = g_session_launcher_selected,
@@ -2107,6 +2378,7 @@ fn commandCenterStateApply(state: command_center_state.State) void {
     g_command_palette_filter_len = state.command_palette_filter_len;
     g_command_palette_mode = state.command_palette_mode;
     g_command_palette_history_selected = state.command_palette_history_selected;
+    g_command_palette_history_source = state.command_palette_history_source;
     startup_shortcuts.g_startup_shortcuts_visible = state.startup_shortcuts_visible;
     g_session_launcher_visible = state.session_launcher_visible;
     g_session_launcher_selected = state.session_launcher_selected;
@@ -6355,6 +6627,7 @@ test "overlays: anyBlockingOverlayVisible reflects each modal overlay" {
     const saved_palette = g_command_palette_visible;
     const saved_settings = g_settings_visible;
     const saved_whats_new = g_whats_new_visible;
+    const saved_integration_prompt = g_integration_prompt_visible;
     const saved_close = g_window_close_confirm_visible;
     const saved_restore = g_restore_defaults_confirm_visible;
     const saved_transfer = g_transfer_cancel_confirm_visible;
@@ -6368,6 +6641,7 @@ test "overlays: anyBlockingOverlayVisible reflects each modal overlay" {
         g_command_palette_visible = saved_palette;
         g_settings_visible = saved_settings;
         g_whats_new_visible = saved_whats_new;
+        g_integration_prompt_visible = saved_integration_prompt;
         g_window_close_confirm_visible = saved_close;
         g_restore_defaults_confirm_visible = saved_restore;
         g_transfer_cancel_confirm_visible = saved_transfer;
@@ -6383,6 +6657,7 @@ test "overlays: anyBlockingOverlayVisible reflects each modal overlay" {
     g_command_palette_visible = false;
     g_settings_visible = false;
     g_whats_new_visible = false;
+    g_integration_prompt_visible = false;
     g_window_close_confirm_visible = false;
     g_restore_defaults_confirm_visible = false;
     g_transfer_cancel_confirm_visible = false;
@@ -6407,6 +6682,10 @@ test "overlays: anyBlockingOverlayVisible reflects each modal overlay" {
     try std.testing.expect(anyBlockingOverlayVisible());
     g_whats_new_visible = false;
 
+    g_integration_prompt_visible = true;
+    try std.testing.expect(anyBlockingOverlayVisible());
+    g_integration_prompt_visible = false;
+
     g_window_close_confirm_visible = true;
     try std.testing.expect(anyBlockingOverlayVisible());
     g_window_close_confirm_visible = false;
@@ -6416,6 +6695,48 @@ test "overlays: anyBlockingOverlayVisible reflects each modal overlay" {
     g_session_launcher_visible = false;
 
     try std.testing.expect(!anyBlockingOverlayVisible());
+}
+
+test "overlays: integration prompt opens scrolls and closes" {
+    const saved_visible = g_integration_prompt_visible;
+    const saved_scroll = g_integration_prompt_scroll;
+    defer {
+        g_integration_prompt_visible = saved_visible;
+        g_integration_prompt_scroll = saved_scroll;
+    }
+
+    integrationPromptOpen();
+    try std.testing.expect(integrationPromptVisible());
+    try std.testing.expectEqual(@as(i64, 0), g_integration_prompt_scroll);
+
+    integrationPromptHandleKey(.{ .key = .page_down });
+    try std.testing.expect(g_integration_prompt_scroll > 0);
+
+    integrationPromptHandleKey(.{ .key = .escape });
+    try std.testing.expect(!integrationPromptVisible());
+}
+
+test "overlays: successful integration prompt copy closes modal and shows toast" {
+    const saved_visible = g_integration_prompt_visible;
+    const saved_toast_len = g_copy_toast_len;
+    const saved_toast_until = g_copy_toast_until_ms;
+    const saved_toast_buf = g_copy_toast_buf;
+    defer {
+        g_integration_prompt_visible = saved_visible;
+        g_copy_toast_len = saved_toast_len;
+        g_copy_toast_until_ms = saved_toast_until;
+        g_copy_toast_buf = saved_toast_buf;
+    }
+
+    g_integration_prompt_visible = true;
+    g_copy_toast_len = 0;
+    g_copy_toast_until_ms = 0;
+
+    integrationPromptCopySucceeded();
+
+    try std.testing.expect(!integrationPromptVisible());
+    try std.testing.expectEqualStrings("Integration prompt copied", g_copy_toast_buf[0..g_copy_toast_len]);
+    try std.testing.expect(g_copy_toast_until_ms > 0);
 }
 
 fn showVersionToast() void {
@@ -6616,6 +6937,115 @@ pub fn renderRestoreDefaultsConfirm(window_width: f32, window_height: f32) void 
     renderTitlebarTextStrong(cancel_label, layout.cancel_x + (layout.cancel_w - measureTitlebarText(cancel_label)) / 2, rowTextY(cancel_y, layout.cancel_h), body);
 }
 
+fn integrationPromptLineCount(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var lines: usize = 1;
+    for (text) |ch| {
+        if (ch == '\n') lines += 1;
+    }
+    return lines;
+}
+
+fn integrationPromptClampedScroll(total_lines: usize, visible_rows: usize) usize {
+    if (total_lines <= visible_rows) return 0;
+    if (g_integration_prompt_scroll <= 0) return 0;
+    const max_scroll = total_lines - visible_rows;
+    const requested: usize = @intCast(g_integration_prompt_scroll);
+    return @min(requested, max_scroll);
+}
+
+pub fn renderIntegrationPrompt(window_width: f32, window_height: f32) void {
+    if (!g_integration_prompt_visible) return;
+
+    const layout = integrationPromptLayout(window_width, window_height);
+    const panel_y = @round(window_height - layout.panel_top_px - layout.panel_h);
+    const copy_y = @round(window_height - layout.close_top_px - layout.close_h);
+    const close_y = @round(window_height - layout.cancel_top_px - layout.cancel_h);
+
+    const bg = AppWindow.g_theme.background;
+    const fg = AppWindow.g_theme.foreground;
+    const accent = AppWindow.g_theme.cursor_color;
+    const panel = mixColor(bg, fg, 0.050);
+    const panel_top = mixColor(bg, fg, 0.073);
+    const prompt_box = mixColor(bg, fg, 0.032);
+    const panel_border = mixColor(bg, fg, 0.24);
+    const quiet_border = mixColor(bg, fg, 0.15);
+    const muted = mixColor(bg, fg, 0.56);
+    const body = mixColor(bg, fg, 0.80);
+    const accent_soft = mixColor(bg, accent, 0.20);
+
+    ui_pipeline.fillQuadAlpha(0, 0, window_width, window_height, .{ 0.0, 0.0, 0.0 }, 0.46);
+    renderRoundedQuadAlpha(layout.panel_x + 10, panel_y - 10, layout.panel_w, layout.panel_h, 13, .{ 0.0, 0.0, 0.0 }, 0.26);
+    renderRoundedQuadAlpha(layout.panel_x - 1, panel_y - 1, layout.panel_w + 2, layout.panel_h + 2, 13, panel_border, 0.42);
+    renderRoundedQuadAlpha(layout.panel_x, panel_y, layout.panel_w, layout.panel_h, 12, panel, 0.99);
+    renderRoundedQuadAlpha(layout.panel_x + 1, panel_y + layout.panel_h - 82, layout.panel_w - 2, 81, 12, panel_top, 0.78);
+    ui_pipeline.fillQuadAlpha(layout.panel_x + 1, panel_y + layout.panel_h - 82, layout.panel_w - 2, 1, quiet_border, 0.40);
+    renderRoundedQuadAlpha(layout.panel_x, panel_y, 5, layout.panel_h, 12, accent, 0.84);
+
+    const pad: f32 = 34;
+    const icon_size: f32 = 34;
+    const icon_x = layout.panel_x + pad;
+    const title_y = @round(panel_y + layout.panel_h - 54);
+    const icon_y = @round(title_y - (icon_size - overlayTextHeight()) / 2.0 - 2.0);
+    renderRoundedQuadAlpha(icon_x, icon_y, icon_size, icon_size, 17, accent, 0.18);
+    renderRoundedQuadAlpha(icon_x + 5, icon_y + 5, icon_size - 10, icon_size - 10, 12, accent, 0.88);
+    renderTitlebarTextStrong(">", icon_x + (icon_size - measureTitlebarText(">")) / 2, rowTextY(icon_y, icon_size), mixColor(fg, accent, 0.12));
+
+    const text_x = icon_x + icon_size + 18;
+    const text_right = layout.panel_x + layout.panel_w - pad;
+    renderTitlebarTextStrongLimited("Install Integration", text_x, title_y, fg, text_right - text_x);
+    const subtitle_y = title_y - overlayTextHeight() - 14;
+    renderTitlebarTextLimited("Copy this prompt into Codex, Claude Code, or another agent.", text_x, subtitle_y, body, text_right - text_x);
+
+    const footer_y = copy_y + layout.close_h + 20;
+    ui_pipeline.fillQuadAlpha(layout.panel_x + 5, footer_y, layout.panel_w - 5, 1, quiet_border, 0.46);
+
+    const prompt_x = layout.panel_x + pad;
+    const prompt_y = footer_y + 18;
+    const prompt_w = layout.panel_w - pad * 2;
+    const prompt_top = subtitle_y - 22;
+    const prompt_h = @max(72.0, prompt_top - prompt_y);
+    renderRoundedQuadAlpha(prompt_x - 1, prompt_y - 1, prompt_w + 2, prompt_h + 2, 8, quiet_border, 0.55);
+    renderRoundedQuadAlpha(prompt_x, prompt_y, prompt_w, prompt_h, 7, prompt_box, 0.96);
+
+    const prompt = agent_integration_prompt.promptText();
+    const line_h = @round(@max(22.0, overlayTextHeight() + 6.0));
+    const available_h = @max(line_h, prompt_h - 18.0);
+    const visible_rows: usize = @intFromFloat(@max(1.0, @floor(available_h / line_h)));
+    const total_lines = integrationPromptLineCount(prompt);
+    const scroll = integrationPromptClampedScroll(total_lines, visible_rows);
+    g_integration_prompt_scroll = @intCast(scroll);
+
+    var drawn: usize = 0;
+    var line_index: usize = 0;
+    var it = std.mem.splitScalar(u8, prompt, '\n');
+    while (it.next()) |line| {
+        if (line_index >= scroll and drawn < visible_rows) {
+            const row_y = prompt_y + prompt_h - 9.0 - line_h * @as(f32, @floatFromInt(drawn + 1));
+            if (row_y < prompt_y + 6.0) break;
+            renderTitlebarTextLimited(line, prompt_x + 12, rowTextY(row_y, line_h), body, prompt_w - 24);
+            drawn += 1;
+        }
+        line_index += 1;
+        if (drawn >= visible_rows) break;
+    }
+
+    if (total_lines > visible_rows) {
+        var info_buf: [64]u8 = undefined;
+        const info = std.fmt.bufPrint(&info_buf, "{d}/{d}", .{ scroll + 1, total_lines }) catch "";
+        const info_w = measureTitlebarText(info);
+        renderTitlebarTextLimited(info, prompt_x + prompt_w - info_w - 12, prompt_y + 8, muted, info_w + 4);
+    }
+
+    renderRoundedQuadAlpha(layout.close_x - 1, copy_y - 1, layout.close_w + 2, layout.close_h + 2, 8, mixColor(accent, fg, 0.20), 0.80);
+    renderRoundedQuadAlpha(layout.close_x, copy_y, layout.close_w, layout.close_h, 7, accent_soft, 0.96);
+    renderTitlebarTextStrong(INTEGRATION_PROMPT_COPY_LABEL, layout.close_x + (layout.close_w - measureTitlebarText(INTEGRATION_PROMPT_COPY_LABEL)) / 2, rowTextY(copy_y, layout.close_h), mixColor(fg, accent, 0.18));
+
+    renderRoundedQuadAlpha(layout.cancel_x - 1, close_y - 1, layout.cancel_w + 2, layout.cancel_h + 2, 8, quiet_border, 0.76);
+    renderRoundedQuadAlpha(layout.cancel_x, close_y, layout.cancel_w, layout.cancel_h, 7, mixColor(bg, fg, 0.10), 0.96);
+    renderTitlebarTextStrong(INTEGRATION_PROMPT_CLOSE_LABEL, layout.cancel_x + (layout.cancel_w - measureTitlebarText(INTEGRATION_PROMPT_CLOSE_LABEL)) / 2, rowTextY(close_y, layout.cancel_h), body);
+}
+
 pub fn renderTransferCancelConfirm(window_width: f32, window_height: f32) void {
     if (!g_transfer_cancel_confirm_visible) return;
 
@@ -6794,6 +7224,7 @@ pub fn anyBlockingOverlayVisible() bool {
         settingsPageVisible() or
         sessionLauncherVisible() or
         whatsNewVisible() or
+        integrationPromptVisible() or
         windowCloseConfirmVisible() or
         restoreDefaultsConfirmVisible() or
         transferCancelConfirmVisible();
@@ -7168,139 +7599,6 @@ pub fn openLatestRelease() void {
     var url_buf: [256]u8 = undefined;
     const url = latestReleaseUrl(&url_buf);
     _ = platform_open_url.open(allocator, .{ .url = url });
-}
-
-/// Read the Claude Code hook settings file (empty string if absent), call
-/// claude_integration.install, write atomically, show a toast.
-fn installClaudeCodeIntegration() void {
-    const allocator = AppWindow.g_allocator orelse return;
-    applyClaudeIntegration(allocator, true);
-}
-
-/// Read the Claude Code hook settings file (empty string if absent), call
-/// claude_integration.uninstall, write atomically, show a toast.
-fn removeClaudeCodeIntegration() void {
-    const allocator = AppWindow.g_allocator orelse return;
-    applyClaudeIntegration(allocator, false);
-}
-
-fn installCodexIntegration() void {
-    const allocator = AppWindow.g_allocator orelse return;
-    applyCodexIntegration(allocator, true);
-}
-
-fn removeCodexIntegration() void {
-    const allocator = AppWindow.g_allocator orelse return;
-    applyCodexIntegration(allocator, false);
-}
-
-fn applyClaudeIntegration(allocator: std.mem.Allocator, comptime do_install: bool) void {
-    // Resolve the Claude Code settings file path via platform_dirs.
-    const settings_path = platform_dirs.agentHookSettingsPath(allocator) catch |err| {
-        std.log.warn("claude integration: cannot resolve settings path: {}", .{err});
-        showStatusToast("Claude Code integration: cannot resolve home directory");
-        return;
-    };
-    defer allocator.free(settings_path);
-
-    // Read existing content; treat missing file as "".
-    const existing = std.fs.cwd().readFileAlloc(allocator, settings_path, 16 * 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => allocator.dupe(u8, "") catch {
-            showStatusToast("Claude Code integration: out of memory");
-            return;
-        },
-        else => {
-            std.log.warn("claude integration: read {s}: {}", .{ settings_path, err });
-            showStatusToast("Claude Code integration: failed to read settings.json");
-            return;
-        },
-    };
-    defer allocator.free(existing);
-
-    // Apply install or uninstall (pure, no IO).
-    const new_content = if (do_install)
-        claude_integration.install(allocator, existing)
-    else
-        claude_integration.uninstall(allocator, existing);
-    const result = new_content catch |err| {
-        std.log.warn("claude integration: transform failed: {}", .{err});
-        showStatusToast("Claude Code integration: settings.json parse error");
-        return;
-    };
-    defer allocator.free(result);
-
-    // Ensure the settings directory exists.
-    const settings_dir = std.fs.path.dirname(settings_path) orelse settings_path;
-    std.fs.cwd().makePath(settings_dir) catch |err| {
-        std.log.warn("claude integration: makePath {s}: {}", .{ settings_dir, err });
-        showStatusToast("Claude Code integration: cannot create settings directory");
-        return;
-    };
-
-    // Write atomically (temp file + rename via platform helper).
-    platform_atomic_file.writeFileReplaceSafe(settings_path, result) catch |err| {
-        std.log.warn("claude integration: write {s}: {}", .{ settings_path, err });
-        showStatusToast("Claude Code integration: failed to write settings.json");
-        return;
-    };
-
-    if (do_install) {
-        showStatusToast("Claude Code agent integration installed");
-    } else {
-        showStatusToast("Claude Code agent integration removed");
-    }
-}
-
-fn applyCodexIntegration(allocator: std.mem.Allocator, comptime do_install: bool) void {
-    const settings_path = platform_dirs.openaiCodexHookSettingsPath(allocator) catch |err| {
-        std.log.warn("codex integration: cannot resolve hooks path: {}", .{err});
-        showStatusToast("Codex integration: cannot resolve home directory");
-        return;
-    };
-    defer allocator.free(settings_path);
-
-    const existing = std.fs.cwd().readFileAlloc(allocator, settings_path, 16 * 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => allocator.dupe(u8, "") catch {
-            showStatusToast("Codex integration: out of memory");
-            return;
-        },
-        else => {
-            std.log.warn("codex integration: read {s}: {}", .{ settings_path, err });
-            showStatusToast("Codex integration: failed to read hooks.json");
-            return;
-        },
-    };
-    defer allocator.free(existing);
-
-    const new_content = if (do_install)
-        codex_integration.install(allocator, existing)
-    else
-        codex_integration.uninstall(allocator, existing);
-    const result = new_content catch |err| {
-        std.log.warn("codex integration: transform failed: {}", .{err});
-        showStatusToast("Codex integration: hooks.json parse error");
-        return;
-    };
-    defer allocator.free(result);
-
-    const settings_dir = std.fs.path.dirname(settings_path) orelse settings_path;
-    std.fs.cwd().makePath(settings_dir) catch |err| {
-        std.log.warn("codex integration: makePath {s}: {}", .{ settings_dir, err });
-        showStatusToast("Codex integration: cannot create hooks directory");
-        return;
-    };
-
-    platform_atomic_file.writeFileReplaceSafe(settings_path, result) catch |err| {
-        std.log.warn("codex integration: write {s}: {}", .{ settings_path, err });
-        showStatusToast("Codex integration: failed to write hooks.json");
-        return;
-    };
-
-    if (do_install) {
-        showStatusToast("Codex agent integration installed");
-    } else {
-        showStatusToast("Codex agent integration removed");
-    }
 }
 
 fn openStoredPromptUrl() void {

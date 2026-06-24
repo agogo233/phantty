@@ -1,6 +1,7 @@
 const app_metadata = @import("app_metadata.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
 const std = @import("std");
+const command_palette_history_view = @import("command_palette_history_view.zig");
 
 pub const CommandAction = enum {
     new_tab,
@@ -9,7 +10,6 @@ pub const CommandAction = enum {
     toggle_ai_copilot,
     manage_ai_profiles,
     select_agent_history,
-    load_copilot_conversation,
     split_right,
     split_down,
     split_left,
@@ -42,10 +42,7 @@ pub const CommandAction = enum {
     download_update,
     open_latest_release,
     show_whats_new,
-    install_claude_code_integration,
-    remove_claude_code_integration,
-    install_codex_integration,
-    remove_codex_integration,
+    show_integration_prompt,
     open_skill_center,
     open_port_forwarding,
     split_preview,
@@ -63,8 +60,7 @@ pub const command_entries = [_]CommandEntry{
     .{ .title = "New Copilot", .detail = "Open a new Copilot tab with the default AI config", .shortcut = "", .action = .new_agent },
     .{ .title = "Toggle Copilot", .detail = "Open or close the Copilot sidebar on the current terminal", .shortcut = "", .action = .toggle_ai_copilot },
     .{ .title = "Manage AI Profiles", .detail = "Create, edit, or delete saved AI profiles", .shortcut = "", .action = .manage_ai_profiles },
-    .{ .title = "Select Copilot History", .detail = "Open the command-center Copilot history picker", .shortcut = "", .action = .select_agent_history },
-    .{ .title = "Load Copilot Conversation", .detail = "Reopen a saved Copilot sidebar conversation", .shortcut = "", .action = .load_copilot_conversation },
+    .{ .title = "Copilot History", .detail = "Open the command-center Copilot history picker", .shortcut = "", .action = .select_agent_history },
     .{ .title = "Skill Center", .detail = "Manage Claude Code / Codex skills and local executable tools", .shortcut = "", .action = .open_skill_center },
     .{ .title = "Split Right", .detail = "Create a panel to the right", .shortcut = "", .action = .split_right },
     .{ .title = "Split Down", .detail = "Create a panel below", .shortcut = "", .action = .split_down },
@@ -99,13 +95,24 @@ pub const command_entries = [_]CommandEntry{
     .{ .title = "Download Update", .detail = "Download the latest update to your Downloads folder", .shortcut = "", .action = .download_update },
     .{ .title = "Open Latest Release", .detail = "Open the latest WispTerm GitHub Release", .shortcut = "", .action = .open_latest_release },
     .{ .title = "What's New", .detail = "Show what changed in this version of WispTerm", .shortcut = app_metadata.version, .action = .show_whats_new },
-    .{ .title = "Install Claude Code Integration", .detail = "Add WispTerm agent hooks to ~/.claude/settings.json", .shortcut = "", .action = .install_claude_code_integration },
-    .{ .title = "Remove Claude Code Integration", .detail = "Remove WispTerm agent hooks from ~/.claude/settings.json", .shortcut = "", .action = .remove_claude_code_integration },
-    .{ .title = "Install Codex Integration", .detail = "Add WispTerm agent hooks to ~/.codex/hooks.json", .shortcut = "", .action = .install_codex_integration },
-    .{ .title = "Remove Codex Integration", .detail = "Remove WispTerm agent hooks from ~/.codex/hooks.json", .shortcut = "", .action = .remove_codex_integration },
+    .{ .title = "Install Integration", .detail = "Show the prompt for Codex, Claude Code, or another agent to generate its own WispTerm hook", .shortcut = "", .action = .show_integration_prompt },
     .{ .title = "Port Forwarding", .detail = "Manage SSH port forwarding rules", .shortcut = "", .action = .open_port_forwarding },
     .{ .title = "Split Preview", .detail = "Open a preview panel on the right", .shortcut = "", .action = .split_preview },
 };
+
+test "command center exposes generic integration prompt action only" {
+    var found_generic = false;
+    for (command_entries) |entry| {
+        try std.testing.expect(!std.mem.eql(u8, entry.title, "Install Claude Code Integration"));
+        try std.testing.expect(!std.mem.eql(u8, entry.title, "Remove Claude Code Integration"));
+        if (std.mem.eql(u8, entry.title, "Install Integration")) {
+            found_generic = true;
+            try std.testing.expectEqual(CommandAction.show_integration_prompt, entry.action);
+            try std.testing.expect(std.mem.indexOf(u8, entry.detail, "prompt") != null);
+        }
+    }
+    try std.testing.expect(found_generic);
+}
 
 pub const CommandPaletteMode = enum {
     commands,
@@ -128,6 +135,7 @@ pub const State = struct {
     command_palette_filter_len: usize = 0,
     command_palette_mode: CommandPaletteMode = .commands,
     command_palette_history_selected: usize = 0,
+    command_palette_history_source: command_palette_history_view.SourceFilter = .all,
     startup_shortcuts_visible: bool = false,
     session_launcher_visible: bool = false,
     session_launcher_selected: usize = 0,
@@ -184,10 +192,22 @@ pub const State = struct {
         self.ai_list_visible = false;
         self.ai_form_visible = false;
         self.ai_history_source_visible = false;
+        self.command_palette_history_source = .all;
+        self.command_palette_history_selected = 0;
+        self.command_palette_filter_len = 0;
     }
 
     pub fn commandPaletteLeaveAgentHistory(self: *State) void {
         self.commandPaletteSetMode(.commands);
+    }
+
+    pub fn commandPaletteCycleHistorySource(self: *State) void {
+        self.command_palette_history_source = switch (self.command_palette_history_source) {
+            .all => .sidebar,
+            .sidebar => .tab,
+            .tab => .all,
+        };
+        self.command_palette_history_selected = 0;
     }
 
     pub fn commandPaletteShouldRefreshAgentHistory(self: *const State, loaded_revision: u64, latest_revision: u64) bool {
@@ -304,15 +324,12 @@ test "command center includes Manage AI Profiles action" {
     try std.testing.expectEqual(CommandAction.manage_ai_profiles, findCommandAction("Manage AI Profiles"));
 }
 
-test "command center includes Select Copilot History action" {
-    try std.testing.expectEqual(CommandAction.select_agent_history, findCommandAction("Select Copilot History"));
+test "command center includes Copilot History action" {
+    try std.testing.expectEqual(CommandAction.select_agent_history, findCommandAction("Copilot History"));
 }
 
-test "command catalog includes Load Copilot Conversation" {
-    try std.testing.expectEqual(
-        CommandAction.load_copilot_conversation,
-        findCommandAction("Load Copilot Conversation"),
-    );
+test "command catalog no longer has a Load Copilot Conversation entry" {
+    try std.testing.expectEqual(@as(?CommandAction, null), findCommandAction("Load Copilot Conversation"));
 }
 
 test "command center includes update check actions" {
@@ -534,4 +551,23 @@ test "clicking an agent history row updates selection and returns that row" {
 
     try std.testing.expectEqual(@as(?usize, 2), state.commandPaletteActivateHistoryRow(2, 3));
     try std.testing.expectEqual(@as(?usize, 2), state.commandPaletteSelectedAgentHistoryIndex(3));
+}
+
+test "command palette: history source cycles and resets on open" {
+    var state = State{};
+    state.commandPaletteOpenAgentHistory();
+    try std.testing.expectEqual(command_palette_history_view.SourceFilter.all, state.command_palette_history_source);
+    state.commandPaletteCycleHistorySource();
+    try std.testing.expectEqual(command_palette_history_view.SourceFilter.sidebar, state.command_palette_history_source);
+    state.commandPaletteCycleHistorySource();
+    try std.testing.expectEqual(command_palette_history_view.SourceFilter.tab, state.command_palette_history_source);
+    state.commandPaletteCycleHistorySource();
+    try std.testing.expectEqual(command_palette_history_view.SourceFilter.all, state.command_palette_history_source);
+    state.command_palette_history_source = .tab;
+    state.command_palette_history_selected = 5;
+    state.command_palette_filter_len = 3;
+    state.commandPaletteOpenAgentHistory();
+    try std.testing.expectEqual(command_palette_history_view.SourceFilter.all, state.command_palette_history_source);
+    try std.testing.expectEqual(@as(usize, 0), state.command_palette_history_selected);
+    try std.testing.expectEqual(@as(usize, 0), state.command_palette_filter_len);
 }

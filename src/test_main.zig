@@ -811,7 +811,7 @@ comptime {
 }
 
 test "app version metadata is exposed for CLI and command center" {
-    const expected_version = "1.28.0";
+    const expected_version = "1.29.0";
     try std.testing.expectEqualStrings("WispTerm", app_metadata.name);
     try std.testing.expectEqualStrings(expected_version, app_metadata.version);
     try std.testing.expect(std.mem.indexOf(u8, app_metadata.release_notes, "# WispTerm v" ++ expected_version) != null);
@@ -862,4 +862,15 @@ test "copilot picker is rendered and key-routed" {
     try std.testing.expect(std.mem.indexOf(u8, input_src, "copilot_picker.isVisible()") != null);
     const aw_src = @embedFile("AppWindow.zig");
     try std.testing.expect(std.mem.indexOf(u8, aw_src, "renderCopilotPicker(") != null);
+}
+
+test "merged copilot history picker tags sidebar rows and restores by origin" {
+    const overlays_src = @embedFile("renderer/overlays.zig");
+    // Right column shows the Sidebar tag for sidebar-origin rows.
+    try std.testing.expect(std.mem.indexOf(u8, overlays_src, "cmd_palette_sidebar_tag") != null);
+    // Activation branches on the row's copilot flag and loads into the sidebar.
+    const act_idx = std.mem.indexOf(u8, overlays_src, "fn commandPaletteActivateAgentHistoryIndex(") orelse return error.Missing;
+    const act = overlays_src[act_idx..];
+    try std.testing.expect(std.mem.indexOf(u8, act, ".copilot)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, act, "loadCopilotConversationById(") != null);
 }

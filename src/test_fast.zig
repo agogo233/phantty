@@ -52,6 +52,7 @@ test {
     _ = @import("close_confirm.zig");
     _ = @import("command_palette_model.zig");
     _ = @import("command_center_state.zig");
+    _ = @import("command_palette_history_view.zig");
     _ = @import("platform/window_state_codec.zig");
     _ = @import("platform/dxgi_core.zig");
     _ = @import("platform/console_host_policy.zig");
@@ -84,6 +85,7 @@ test {
     _ = @import("ctl/control.zig");
     _ = @import("ctl/server.zig");
     _ = @import("ctl/client.zig");
+    _ = @import("ctl/ui_state.zig");
     _ = @import("png_dimensions.zig");
     _ = @import("pdf_preview.zig");
     _ = @import("preview_gallery.zig");
@@ -135,6 +137,7 @@ test {
     _ = @import("ime_caret.zig");
     _ = @import("sync_output.zig");
     _ = @import("agent_history.zig");
+    _ = @import("agent_history_store.zig");
     _ = @import("render_diagnostics.zig");
     _ = @import("diag_log.zig");
     _ = @import("notification.zig");
@@ -163,8 +166,7 @@ test {
     _ = @import("tool_registry.zig");
     _ = @import("tool_import.zig");
     _ = @import("agent_detector.zig");
-    _ = @import("claude_integration.zig");
-    _ = @import("codex_integration.zig");
+    _ = @import("agent_integration_prompt.zig");
     _ = @import("jupyter_detect.zig");
     _ = @import("jupyter_picker.zig");
     _ = @import("copilot_picker.zig");
