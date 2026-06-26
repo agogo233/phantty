@@ -31,12 +31,78 @@ test "remote file ssh helpers include short keepalive options" {
     try std.testing.expect(std.mem.indexOf(u8, remote_file_source, "\"ServerAliveCountMax=2\"") != null);
 }
 
+test "ai title worker rejects API error results" {
+    const source = @embedFile("ai_chat_request.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn titleThreadMain") orelse return error.MissingTitleWorker;
+    const rest = source[start..];
+    const end = std.mem.indexOf(u8, rest, "pub fn summaryThreadMain") orelse return error.MissingSummaryWorker;
+    const body = rest[0..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "result.api_error") != null);
+}
+
+test "ai title request does not use the old 64 token budget" {
+    const source = @embedFile("ai_chat.zig");
+    const start = std.mem.indexOf(u8, source, "fn buildTitleRequestLocked") orelse return error.MissingTitleRequestBuilder;
+    const rest = source[start..];
+    const end = std.mem.indexOf(u8, rest, "// titleThreadMain has moved") orelse return error.MissingTitleRequestEnd;
+    const body = rest[0..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, ".max_tokens = 64") == null);
+}
+
+test "ssh browser tunnel readiness probes HTTP through the tunnel" {
+    const source = @embedFile("ssh_tunnel.zig");
+    {
+        const start = std.mem.indexOf(u8, source, "fn waitForTunnelReady") orelse return error.MissingTunnelReady;
+        const rest = source[start..];
+        const end = std.mem.indexOf(u8, rest, "fn childHasExited") orelse return error.MissingTunnelReadyEnd;
+        const body = rest[0..end];
+        try std.testing.expect(std.mem.indexOf(u8, body, "localHttpReadyOnce") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "canConnectToLocalPort") == null);
+    }
+    {
+        const start = std.mem.indexOf(u8, source, "fn findReusableTunnel") orelse return error.MissingTunnelReuse;
+        const rest = source[start..];
+        const end = std.mem.indexOf(u8, rest, "fn spawnSshTunnel") orelse return error.MissingTunnelReuseEnd;
+        const body = rest[0..end];
+        try std.testing.expect(std.mem.indexOf(u8, body, "localHttpReadyOnce") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "canConnectToLocalPort") == null);
+    }
+}
+
+test "agent SSH connection resolver uses the surface registry, not tab threadlocals" {
+    const source = @embedFile("appwindow/surface_snapshots.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn agentSshConnectionForSurface") orelse return error.MissingAgentSshResolver;
+    const rest = source[start..];
+    const end = std.mem.indexOf(u8, rest, "test \"agent SSH") orelse return error.MissingAgentSshResolverEnd;
+    const body = rest[0..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "surface_registry.acquireById") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tab.g_") == null);
+}
+
+test "agent request disables worker snapshot fallback when UI capture fails" {
+    const source = @embedFile("ai_chat.zig");
+    const start = std.mem.indexOf(u8, source, "fn buildRequestLocked") orelse return error.MissingBuildRequestLocked;
+    const rest = source[start..];
+    const end = std.mem.indexOf(u8, rest, "var weixin_ctx") orelse return error.MissingBuildRequestSnapshotEnd;
+    const body = rest[0..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "host.collectSnapshot") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "catch null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tool_host = null") != null);
+}
+
 test {
     _ = @import("input/command_dispatch.zig");
+    _ = @import("input/file_explorer_keymap.zig");
+    _ = @import("file_explorer/action.zig");
+    _ = @import("input/effects.zig");
+    _ = @import("input/dirty_guard.zig");
+    _ = @import("input/command_palette_effect_guard.zig");
+    _ = @import("input/overlay_effect_guard.zig");
     _ = @import("input/click_tracker.zig");
     _ = @import("input/hit_test.zig");
     _ = @import("input/mouse_wheel_scroll.zig");
     _ = @import("input/mouse_report.zig");
+    _ = @import("input/mouse_dispatch.zig");
     _ = @import("input/preview_path.zig");
     _ = @import("input/preview_close_button.zig");
     _ = @import("input/ls_path_context.zig");
@@ -44,7 +110,30 @@ test {
     _ = @import("input/underline_span.zig");
     _ = @import("input/file_drop_path.zig");
     _ = @import("input/sdl_keymap.zig");
+    _ = @import("ui/close_shortcut_confirm.zig");
+    _ = @import("ui/window_metrics.zig");
     _ = @import("renderer/overlays/profile_codec.zig");
+    _ = @import("renderer/overlays/command_palette_input.zig");
+    _ = @import("renderer/overlays/command_palette_layout.zig");
+    _ = @import("renderer/overlays/settings_page.zig");
+    _ = @import("renderer/overlays/toasts.zig");
+    _ = @import("renderer/overlays/confirm_modals.zig");
+    _ = @import("renderer/overlays/ssh_profiles.zig");
+    _ = @import("renderer/overlays/ssh_profiles_layout.zig");
+    _ = @import("renderer/overlays/ai_profiles.zig");
+    _ = @import("renderer/overlays/session_launcher.zig");
+    _ = @import("renderer/overlays/state.zig");
+    _ = @import("renderer/overlays/state_guard.zig");
+    // Cross-cutting architecture ratchets (file size + global-state / import-hub /
+    // side-effect freezes). See docs/decoupling-guide.md.
+    _ = @import("source_guards/scan.zig");
+    _ = @import("source_guards/file_size_guard.zig");
+    _ = @import("source_guards/global_state_guard.zig");
+    _ = @import("source_guards/import_hub_guard.zig");
+    _ = @import("source_guards/side_effect_guard.zig");
+    _ = @import("source_guards/layered_dependency_guard.zig");
+    _ = @import("source_guards/overlay_boundary_guard.zig");
+    _ = @import("source_guards/input_feature_boundary_guard.zig");
     _ = @import("renderer/overlays/transfer_toast_model.zig");
     _ = @import("renderer/overlays/update_prompt_model.zig");
     _ = @import("renderer/overlays/whats_new_model.zig");
@@ -77,7 +166,14 @@ test {
     _ = @import("apprt/window_registry.zig");
     _ = @import("appwindow/active_tab.zig");
     _ = @import("appwindow/frame_latency.zig");
+    _ = @import("appwindow/frame_scheduler.zig");
     _ = @import("appwindow/render_gate.zig");
+    _ = @import("appwindow/ui_effect.zig");
+    _ = @import("appwindow/window_state.zig");
+    _ = @import("appwindow/remote_state.zig");
+    _ = @import("appwindow/state.zig");
+    _ = @import("appwindow/state_guard.zig");
+    _ = @import("appwindow/p3_1_guard.zig");
     _ = @import("scp.zig");
     _ = @import("surface_registry.zig");
     _ = @import("ctl/protocol.zig");
@@ -115,12 +211,9 @@ test {
     _ = @import("skill_scan.zig");
     _ = @import("skill_install.zig");
     _ = @import("ssh_error.zig");
-    _ = @import("skill_inventory.zig");
-    _ = @import("skill_inventory_cache.zig");
     _ = @import("skill_center.zig");
     _ = @import("renderer/skill_center_renderer.zig");
     _ = @import("renderer/port_forwarding_renderer.zig");
-    _ = @import("skill_pairing.zig");
     _ = @import("skill_transfer_cmd.zig");
     _ = @import("skill_transfer.zig");
     _ = @import("skill_diff.zig");
@@ -129,6 +222,7 @@ test {
     _ = @import("ai_history_resume.zig");
     _ = @import("ai_history_session.zig");
     _ = @import("browser_url.zig");
+    _ = @import("text_search.zig");
     _ = @import("ssh_prompt.zig");
     _ = @import("selection_unit.zig");
     _ = @import("scrollbar_model.zig");

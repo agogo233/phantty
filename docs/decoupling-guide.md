@@ -88,23 +88,30 @@ renderer has **no platform-runtime leakage** (no win32/DirectWrite/WebView2 —
 true ✅), but the **GPU API itself is not behind an interface** (false ❌). The
 two claims are split in the updated roadmap.
 
-**Gap 2 — Several files conflate presentation with business logic (Axis B).**
+**Gap 2 — Several UI files conflate presentation with business logic (Axis B).**
 
-Large files mix *what a feature does* with *how it is drawn / how input is
-routed*, which makes the logic hard to test and hard to reuse under a different
-host:
+These are WispTerm's largest files. None crosses the 10,000-line backstop, yet
+each is hard to change because it carries several roles at once — the problem is
+entanglement, not raw size. For contrast, Ghostty's largest files are *bigger*
+(`terminal/PageList.zig` ~14.8k lines, `terminal/Terminal.zig` ~13.3k,
+`config/Config.zig` ~10.9k, `terminal/Screen.zig` ~10.5k) but each owns one
+coherent domain object with explicit state ownership and no scattered module
+globals, so they stay tractable. WispTerm's files are smaller and harder.
 
-| File | Size | What is tangled |
+| File | Lines | What is tangled |
 |------|------|-----------------|
-| `src/ai_chat.zig` | 248 KB | AI conversation/state/protocol logic + UI state |
-| `src/renderer/overlays.zig` | 171 KB | Many unrelated overlay renderers in one module |
-| `src/AppWindow.zig` | 149 KB / 3,742 ln | Window orchestration + GL binding + tab/split + input routing |
-| `src/input.zig` | 136 KB / 3,462 ln | Platform input handling + keybind parsing + command dispatch |
-| `src/renderer/ai_chat_renderer.zig` | 73 KB | Chat rendering (also a heavy `gl.*` site) |
+| `src/ai_chat.zig` | ~8,760 | agent config + dynamic tools + global callbacks + session lifecycle + summary/title generation + streaming + test hooks |
+| `src/renderer/overlays.zig` | ~7,670 | overlay facade + per-overlay state + input handling + layout + rendering, for many unrelated overlays in one module |
+| `src/AppWindow.zig` | ~7,090 | window orchestration + 123 imports (29 re-exported as a hub) + 67 top-level `g_*` globals + render/input routing |
+| `src/input.zig` | ~7,040 | platform events + mouse selection + panel swap + preview + AI copilot + browser + terminal mouse report + repaint side effects |
 
-These are not bugs; they are accreted responsibility. The roadmap decomposes
-them along the presentation/logic line, touching each file once (see
-[§4](#4-execution-strategy-approach-c)).
+These are accreted responsibility, not bugs. The `feat/ui-state-debt` refactor
+(PR #310) started the decomposition: it pulled `AppWindow.zig` from 10,521 down
+to ~7,090 lines, introduced the `UiEffect` boundary and the `appwindow/` state
+structs, and extracted feature bridge/control/snapshot modules — each locked by
+a source-scan guard. The remaining work, and the ratchets that now stop these
+files regrowing, are in
+[§8 — structural-debt governance](#8-structural-debt-governance-axis-b-in-practice).
 
 ---
 
@@ -135,7 +142,8 @@ The fix for Gap 1 is the abstraction Ghostty already ships and that
 - **`src/renderer/opengl/`** and **`src/renderer/metal/`** each expose the
   *same* primitive set: `Target`, `RenderPass`, `Frame`, `Pipeline`, `Buffer`,
   `Texture`, `Sampler`, `shaders` (Metal adds `IOSurfaceLayer`, `api`).
-- **`cell.zig` / `cursor.zig` / `image.zig` / `row.zig`** stay API-agnostic —
+- **`cell_geometry.zig`** (cell/cursor/selection geometry, consumed by
+  `cell_renderer.zig`) and **`image_renderer.zig`** stay API-agnostic —
   they build geometry/instances, not GL/Metal calls.
 
 ### WispTerm target layout
@@ -256,14 +264,24 @@ with **A**. **D** is deferred until a macOS SDK environment exists.
 ### Phase B — Presentation/logic separation (non-renderer files)
 *Verifiable on Windows; runs in parallel with A.*
 
-- **B1** `input.zig` (3,462 ln): extract keybind parsing and command dispatch
-  from platform input-event handling into pure, unit-testable modules
-  (continuing `input_shortcuts.zig` / `keybind.zig`). *Ghostty: `input/` +
-  `Binding.zig` are separate from apprt input.*
-- **B2** `ai_chat.zig` (248 KB): separate conversation/state/protocol logic
-  from UI state; split into independently testable sub-modules.
-- **B3** `AppWindow.zig` (3,742 ln): layer tab/split orchestration, render
-  orchestration, and input routing (GL binding already removed in A2).
+> **Status (ui-state-debt P1–P3 landed, PR #310).** The `UiEffect` boundary
+> (`appwindow/ui_effect.zig` + `AppWindow.applyUiEffect`) and the `appwindow/`
+> state structs (`state.zig` / `window_state.zig` / `remote_state.zig`) exist,
+> and `AppWindow.zig` shed its weixin/agent/remote-sync/control/snapshot glue
+> into `appwindow/*` (10,521 → ~7,090 lines). B1/B3 are **in progress**, not
+> done. The per-file decomposition that remains and the ratchets that keep these
+> files from regrowing are in [§8](#8-structural-debt-governance-axis-b-in-practice).
+
+- **B1** `input.zig` (~7,040 ln): continue extracting the input pipeline by
+  concern (dispatch, selection, panel drag, preview, terminal mouse report) and
+  route every repaint through `UiEffect`. *Ghostty: `input/` + `Binding.zig` are
+  separate from apprt input.*
+- **B2** `ai_chat.zig` (~8,760 ln): separate agent config / session / protocol /
+  tools / streaming / summary-title from UI callbacks; inject a `Host` interface
+  instead of holding global UI triggers. Split into testable sub-modules.
+- **B3** `AppWindow.zig` (~7,090 ln): keep reducing it toward an orchestration
+  root — lifecycle, main loop, module assembly — and stop using it as the import
+  hub (GL binding already removed in A2).
 - **B4** Add unit tests for the extracted pure logic (runnable locally with
   `zig test` — see the test-execution note in project memory).
 
@@ -330,10 +348,193 @@ that gets real runtime coverage on Linux.
 | `src/renderer/gpu/backend.zig` | `src/renderer/backend.zig` | `Backend{opengl,metal,webgl}`; `default(target)` → Metal on Darwin |
 | `src/renderer/gpu/opengl/*` | `src/renderer/opengl/*` | `Target/Frame/RenderPass/Pipeline/Buffer/Texture/Sampler/shaders` |
 | `src/renderer/gpu/metal/*` | `src/renderer/metal/*` | Phase D; mirrors opengl with MSL shaders |
-| API-agnostic cell/cursor/image | `src/renderer/cell.zig`, `cursor.zig`, `image.zig` | Build geometry, not GL/Metal calls |
+| `src/renderer/cell_geometry.zig`, `image_renderer.zig` | `src/renderer/cell.zig`, `cursor.zig`, `image.zig` | API-agnostic; build geometry, not GL/Metal calls |
 | `src/platform/pty_posix.zig` | `src/pty.zig` (POSIX) | `openpty`/`fork`/`exec` + `ioctl(TIOCSWINSZ)` |
 | `src/platform/window_backend_macos.zig` | Swift/AppKit + `src/apprt/embedded.zig` | AppKit host owns its own event loop |
 | `src/platform/font_backend_macos.zig` | `src/font/discovery.zig` | CoreText discovery + fallback |
 
 > `remote/` is out of scope for the Ghostty comparison and for these
 > platform-leakage checks (per `AGENTS.md`, `ROADMAP.md`, and `KNOWN_ISSUES.md`).
+
+---
+
+## 8. Structural-debt governance (Axis B in practice)
+
+Axis B used to be a roadmap aspiration. It is now governed mechanically so the
+monolith UI files cannot quietly regrow while they are being decomposed. This
+section is the playbook the `AGENTS.md` "Cohesion and coupling" section points
+to.
+
+### 8.1 The criterion
+
+Cohesion and coupling — **not** line count — decide whether a file is too big. A
+file is fine when it owns one coherent responsibility, exposes a clear API, has
+explicit state ownership, a stable dependency direction, and real test coverage.
+The smell is entanglement: presentation mixed with business mutation, input
+dispatch mixed with rendering, global mutable state scattered across facades, a
+file becoming the import hub for unrelated features.
+
+The sharpest case of that entanglement is the **integration layer owning feature
+state**. `AppWindow.zig`, `input.zig`, and `renderer/overlays.zig` are an
+integration layer: they *coordinate* features (module assembly + render/input
+routing, event dispatch, overlay facade/registry) and are **not** terminal
+"core". The **feature domains** are the modules that own their own state and
+behavior — `ai_chat*`, `weixin/*`, the `skill_*` modules, `file_explorer.zig`,
+the `tmux_*` controllers, and the `remote_*` client/sync code. Today the
+integration layer holds feature `g_*` globals, re-exports unrelated feature
+modules, and reaches into feature internals; that is exactly what the §8.2
+ratchets freeze and shrink. Treat each ratchet step as moving one responsibility
+back to the domain that owns it. The architecture-doc summary of this split is
+[architecture.md § Integration layer vs feature domains](architecture.md#integration-layer-vs-feature-domains).
+
+Two numeric signals sit on top of that judgment, neither of which is the goal:
+
+- **> 5,000 lines** — a soft signal to review responsibility, dependency
+  direction, import fan-in/out, state ownership, and test boundaries. Not
+  enforced.
+- **≥ 10,000 lines** — a hard backstop (`file_size_guard`). A *runaway tripwire,
+  not a health certificate*: a file well under it can still be tangled, and one
+  approaching it has usually already lost cohesion. `check-sizes` prevents
+  uncontrolled growth; it does not certify architectural health.
+
+### 8.2 The boundary guards (`src/source_guards/`)
+
+These are the primary enforcement mechanism. Each is a source-scan test (the
+`@embedFile`-and-count idiom of `input/dirty_guard.zig`) that **freezes a count
+at today's value; the count may only shrink**. Adding a new occurrence fails the
+gate — you must first remove one, or use the pattern the guard names.
+
+| Guard | Freezes | Today's ceiling | Escape hatch |
+|---|---|---|---|
+| `file_size_guard` | lines in any `src/**/*.zig` (whole tree, future files too) | < 10,000 | split by responsibility; never raise the limit |
+| `global_state_guard` | top-level `g_*` / `threadlocal` in the four monoliths | AppWindow 67, input 55, overlays 48, ai_chat 20 | new state → an explicit state struct (`appwindow/state.zig`, …) |
+| `import_hub_guard` | `pub const X = @import(...)` re-exports in `AppWindow.zig` | 29 | import the real module directly, not via `AppWindow.X` |
+| `side_effect_guard` | direct `g_force_rebuild` / `g_cells_valid` writes in the four monoliths | AppWindow 63, input 81, overlays 12, ai_chat 0 | return a `UiEffect`; land it via `AppWindow.applyUiEffect` |
+
+They run in `zig build test` and — since `test-full` is now a superset of `test`
+— in the pre-merge gate. The file-size backstop is also a standalone command,
+`zig build check-sizes`.
+
+**Next guard (documented, not yet mechanized): layered-dependency.** A scan that
+forbids reverse imports across the layer model in §8.5 — e.g. `renderer/overlays/*`
+importing `AppWindow.zig`, or `input/*` importing a concrete renderer. It needs
+per-edge allowlists seeded from current violations, so it lands once those edges
+have converged rather than freezing the violations in place.
+
+### 8.3 Remediation priority
+
+Decompose in this order. The point of the ordering is to *freeze new debt first*
+and *move state before functions*, so the work never makes the files larger on
+the way to making them smaller.
+
+1. **Freeze new debt (done — the §8.2 ratchets).** No new `g_*` in the monoliths,
+   no new `AppWindow` re-export hub entry, no new direct dirty write, no file
+   over 10k. New input paths return a `UiEffect` / result; new overlays own their
+   state/input/render modules.
+2. **Finish the side-effect boundary.** Extend `UiEffect` returns from input to
+   every overlay handler, command palette, confirm modal, settings page, and
+   session launcher, so all repaint/rebuild/wake requests flow through
+   `AppWindow.applyUiEffect`. Ratchet `side_effect_guard` down as each converts.
+3. **Split state before functions.** Move scattered globals into explicit state
+   owners (`AppWindow.State`, `InputState`, `OverlayState`, `AiChatState`,
+   `RemoteState`, `BrowserState`, `PreviewState`) and ratchet `global_state_guard`
+   down. Moving functions before state only manufactures more imports.
+4. **Dismantle the import hub.** Stop routing unrelated modules through
+   `AppWindow`; convert callers to direct imports / narrow interfaces and ratchet
+   `import_hub_guard` down.
+5. **Split the big files by domain** (§8.4), in the order overlays → input →
+   ai_chat → AppWindow: overlays decompose naturally by feature; input by event
+   type and consumer; ai_chat needs its `Host`/`State`/`Session` boundaries
+   designed first; AppWindow thins out last, once its dependencies have boundaries.
+
+### 8.4 Per-file target decomposition
+
+Targets, not a mandate to hit a line number. The aim is local understandability.
+
+**`AppWindow.zig` → an orchestration root**, not a god-window. It should own
+window lifecycle, the main loop, platform-window binding, and module assembly —
+a *composer* that initializes the pieces and passes state in. Candidate splits:
+`appwindow/lifecycle.zig`, `appwindow/main_loop.zig`, `appwindow/render_bridge.zig`,
+`appwindow/state.zig`, `appwindow/actions.zig`, `appwindow/agent_bridge.zig`,
+`appwindow/remote_bridge.zig` (joining the existing `ui_effect.zig`,
+`weixin_bridge.zig`, `remote_sync.zig`, `surface_snapshots.zig`,
+`control_api.zig`). Crucially, stop adding `pub const X = @import(...)` re-exports.
+
+**`input.zig` → an input pipeline.** Split by event scenario rather than size:
+`input/pipeline.zig` (entry/dispatch), `input/key_dispatch.zig`,
+`input/mouse_dispatch.zig`, `input/selection.zig`, `input/panel_drag.zig`,
+`input/terminal_mouse.zig`, `input/overlay_dispatch.zig`,
+`input/browser_dispatch.zig`, `input/preview_dispatch.zig`, plus the existing
+`input/command_dispatch.zig` / `input/effects.zig`. Handlers should return a
+result instead of poking globals:
+
+```zig
+pub const InputResult = struct {
+    consumed: bool = false,
+    action: ?InputAction = null,
+    effect: UiEffect = .none,
+};
+```
+
+**`renderer/overlays.zig` → facade + registry.** `overlays.zig` keeps only the
+facade/registry; each overlay moves to its own module/dir
+(`command_palette/`, `settings/`, `confirm/`, `session_launcher/`,
+`ssh_profiles/`, `ai_profiles/`, `toasts/`, `update_prompt/`) with a uniform
+trio — `state.zig`, `input.zig`, `render.zig` (`+ layout.zig`/`model.zig` as
+needed) — behind a uniform interface:
+
+```zig
+pub fn visible(state: *const State) bool
+pub fn handleKey(state: *State, ev: KeyEvent) UiEffect
+pub fn handleMouse(state: *State, ev: MouseEvent) UiEffect
+pub fn render(ctx: *RenderContext, state: *const State) void
+```
+
+**`ai_chat.zig` → an agent domain.** Split by domain, not by slicing:
+`ai_chat/session.zig`, `ai_chat/settings.zig`, `ai_chat/tool_state.zig`,
+`ai_chat/access.zig`, `ai_chat/stream.zig`, `ai_chat/summary.zig`,
+`ai_chat/title.zig`, `ai_chat/memory.zig`, `ai_chat/slash_commands.zig`,
+`ai_chat/host.zig`, `ai_chat/test_support.zig`. Collapse the scattered global UI
+callbacks into one injected `Host` interface:
+
+```zig
+pub const Host = struct {
+    resume_session: ?*const fn (...) void = null,
+    open_copilot_picker: ?*const fn (...) void = null,
+    export_markdown: ?*const fn (...) void = null,
+    switch_model: ?*const fn (...) void = null,
+};
+```
+
+`AppWindow` injects the `Host`; `ai_chat` stops reaching back for window details.
+
+### 8.5 The layer model
+
+The dependency direction these guards defend. Imports should flow downward only:
+
+- **`platform/*`** — platform capabilities only; never imports app business.
+- **core / domain** (terminal state, IO, `ai_chat/*` domain) — no UI/renderer
+  imports.
+- **`input/*`** — produces actions/effects; does not render directly.
+- **`renderer/*`** — renders view state; does not perform business mutation.
+- **`appwindow/*`** — orchestration; does not carry concrete feature business.
+- **`ai_chat/*`** — owns agent/session/protocol/tools; does not know window
+  details (reaches the UI only through an injected `Host`).
+- **`remote/*`** — an independent security boundary; does not reach into
+  main-app state (also out of scope for the Ghostty/platform-leakage checks).
+
+The reverse edges worth locking first (the layered-dependency guard in §8.2):
+`renderer/overlays/*` must not import `AppWindow.zig` (only narrow types such as
+`appwindow/ui_effect.zig`); `input/*` must not import a concrete renderer module;
+`ai_chat.zig` must not hold a set of UI-trigger callbacks directly.
+
+Restated as rules for new code, against the integration-layer/feature-domain
+split above: **feature domains must not depend on `AppWindow`** — they expose a
+query/action API and receive context explicitly rather than reaching back
+through the window; **`input/*` only dispatches** — it decides who handles an
+event and returns a `UiEffect`, and must not read a feature's internal `g_*`
+state to do so; **overlays receive capabilities through an injected
+Host/Context**, not by importing `AppWindow.zig`. Prefer explicit context
+structs, feature-owned query/action APIs, and `UiEffect` returns over scattered
+globals — and each time you touch a monolith, lower the matching §8.2 ratchet so
+the boundary converges instead of being re-frozen in place.

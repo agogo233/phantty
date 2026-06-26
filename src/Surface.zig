@@ -17,7 +17,7 @@ const termio = @import("termio.zig");
 const Config = @import("config.zig");
 const Renderer = @import("renderer/Renderer.zig");
 const remote = @import("remote_client.zig");
-const threading = @import("threading.zig");
+const threading = @import("platform/threading.zig");
 const agent_detector = @import("agent_detector.zig");
 const window_backend = @import("platform/window_backend.zig");
 const sync_output = @import("sync_output.zig");
@@ -719,17 +719,6 @@ pub const ResizePolicy = enum {
 /// on the IO thread via queueIo() with 25ms coalescing.
 ///
 /// Returns true if the grid dimensions changed (resize was queued).
-pub fn setScreenSize(
-    self: *Surface,
-    screen_width: u32,
-    screen_height: u32,
-    cell_width: f32,
-    cell_height: f32,
-    explicit_padding: renderer.size.Padding,
-) bool {
-    return self.setScreenSizeWithPolicy(screen_width, screen_height, cell_width, cell_height, explicit_padding, .coalesced);
-}
-
 pub fn setScreenSizeWithPolicy(
     self: *Surface,
     screen_width: u32,
@@ -780,10 +769,45 @@ pub fn setScreenSizeWithPolicy(
     return false;
 }
 
+/// Number of notify+yield attempts to give the writer thread a chance to drain
+/// a full mailbox before we give up on a write. Bounded so we never spin.
+const MAILBOX_FULL_RETRIES = 64;
+
+const mailbox_log = std.log.scoped(.mailbox);
+
 /// Send a message to the IO writer thread via the mailbox.
+///
+/// On a full ring, control messages (resize) are accepted by the mailbox via
+/// last-writer-wins/drop-oldest. A WRITE message instead reports `.full` and is
+/// NOT enqueued, so we notify the writer thread and retry a bounded number of
+/// times, yielding between attempts to let it drain. If it is still full after
+/// the bound we log a visible warning rather than silently dropping input.
 pub fn queueIo(self: *Surface, msg: termio.Message) void {
-    self.mailbox.send(msg);
-    self.mailbox.notify();
+    var attempt: usize = 0;
+    while (true) {
+        switch (self.mailbox.send(msg)) {
+            .queued, .coalesced => {
+                self.mailbox.notify();
+                return;
+            },
+            .full => {
+                // Wake the writer so it drains, then yield and retry. The mutex
+                // is released between attempts (send() locks per call), so the
+                // writer's pop() can make progress.
+                self.mailbox.notify();
+                attempt += 1;
+                if (attempt >= MAILBOX_FULL_RETRIES) {
+                    mailbox_log.warn(
+                        "mailbox full after {d} retries; dropping write message to avoid stall",
+                        .{MAILBOX_FULL_RETRIES},
+                    );
+                    msg.deinit();
+                    return;
+                }
+                std.Thread.yield() catch {};
+            },
+        }
+    }
 }
 
 /// Queue bytes to the PTY input pipe through the IO writer thread.

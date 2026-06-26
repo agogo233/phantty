@@ -5,6 +5,8 @@ const build_options = @import("build_options");
 const std = @import("std");
 const app_metadata = @import("app_metadata.zig");
 const command_center_state = @import("command_center_state.zig");
+const keybind = @import("keybind.zig");
+const command_dispatch = @import("input/command_dispatch.zig");
 
 comptime {
     @setEvalBranchQuota(8_000_000);
@@ -42,12 +44,6 @@ comptime {
     const update_install_source = @embedFile("update_install.zig");
     if (std.mem.indexOf(u8, update_install_source, "@import(\"builtin\").os.tag") != null) {
         @compileError("update_install.zig must use platform/update_package.zig for OS package selection");
-    }
-    const threading_source = @embedFile("threading.zig");
-    if (std.mem.indexOf(u8, threading_source, "Windows") != null or
-        std.mem.indexOf(u8, threading_source, "surface_thread_stack_size") != null)
-    {
-        @compileError("threading.zig must get platform-specific thread spawn policy from platform/threading.zig");
     }
     const platform_threading_source = @embedFile("platform/threading.zig");
     if (std.mem.indexOf(u8, platform_threading_source, "Windows") != null) {
@@ -418,13 +414,6 @@ comptime {
     {
         @compileError("browser_panel.zig must use platform_webview URL helpers instead of WebView2 UTF-16 details");
     }
-    const system_browser_source = @embedFile("system_browser.zig");
-    if (std.mem.indexOf(u8, system_browser_source, "ShellExecute") != null or
-        std.mem.indexOf(u8, system_browser_source, "shellExecute") != null or
-        std.mem.indexOf(u8, system_browser_source, "Windows-specific") != null)
-    {
-        @compileError("system_browser.zig must stay backend-neutral and delegate URL opening to platform/open_url.zig");
-    }
     const open_url_source = @embedFile("platform/open_url.zig");
     if (std.mem.indexOf(u8, open_url_source, "ShellExecute") != null or
         std.mem.indexOf(u8, open_url_source, "windowsShellExecuteSucceeded") != null)
@@ -657,12 +646,16 @@ comptime {
     _ = @import("renderer/ai_history_renderer.zig");
     _ = @import("agent_detector.zig");
     _ = @import("Surface.zig");
+    _ = @import("termio/Mailbox.zig");
     _ = @import("agent_prompt_answer.zig");
     _ = @import("App.zig");
     _ = @import("AppWindow.zig");
     _ = @import("surface_registry.zig");
     _ = @import("png_dimensions.zig");
     _ = @import("appwindow/flush_scheduler.zig");
+    _ = @import("appwindow/window_state.zig");
+    _ = @import("appwindow/remote_state.zig");
+    _ = @import("appwindow/state.zig");
     _ = @import("appwindow/split_layout.zig");
     _ = @import("appwindow/tab.zig");
     _ = @import("appwindow/thread_message.zig");
@@ -684,6 +677,7 @@ comptime {
     _ = @import("input/clipboard.zig");
     _ = @import("clipboard_osc52.zig");
     _ = @import("input/click_tracker.zig");
+    _ = @import("input/mouse_dispatch.zig");
     _ = @import("input/command_dispatch.zig");
     _ = @import("input/hit_test.zig");
     _ = @import("input/key.zig");
@@ -776,6 +770,15 @@ comptime {
     _ = @import("renderer/overlay_keys.zig");
     _ = @import("close_confirm.zig");
     _ = @import("renderer/overlays.zig");
+    _ = @import("renderer/overlays/confirm_modals.zig");
+    _ = @import("renderer/overlays/command_palette_input.zig");
+    _ = @import("renderer/overlays/command_palette_layout.zig");
+    _ = @import("renderer/overlays/settings_page.zig");
+    _ = @import("renderer/overlays/ssh_profiles.zig");
+    _ = @import("renderer/overlays/ai_profiles.zig");
+    _ = @import("renderer/overlays/session_launcher.zig");
+    _ = @import("renderer/overlays/state.zig");
+    _ = @import("renderer/overlays/toasts.zig");
     _ = @import("selection_unit.zig");
     _ = @import("session_persist.zig");
     _ = @import("agent_memory.zig");
@@ -783,8 +786,6 @@ comptime {
     _ = @import("skill_scan.zig");
     _ = @import("skill_install.zig");
     _ = @import("skill_local_fs.zig");
-    _ = @import("skill_inventory.zig");
-    _ = @import("skill_inventory_cache.zig");
     _ = @import("skill_center.zig");
     _ = @import("renderer/skill_center_renderer.zig");
     _ = @import("port_forward_rule.zig");
@@ -801,7 +802,6 @@ comptime {
     _ = @import("ssh_prompt.zig");
     _ = @import("ssh_tunnel.zig");
     _ = @import("startup_tabs.zig");
-    _ = @import("system_browser.zig");
     _ = @import("split_tree.zig");
     _ = @import("preview_pane.zig");
     _ = @import("renderer/markdown_preview_renderer.zig");
@@ -827,11 +827,45 @@ test "command center browser entries do not expose backend implementation names"
     }
 }
 
-test "copilot conversation picker has a keybind action and dispatch" {
-    const kb_src = @embedFile("keybind.zig");
-    try std.testing.expect(std.mem.indexOf(u8, kb_src, "copilot_conversation_picker") != null);
-    const input_src = @embedFile("input.zig");
-    try std.testing.expect(std.mem.indexOf(u8, input_src, ".copilot_conversation_picker =>") != null);
+// Behavior tests (converted from source-string greps): instead of asserting the
+// keybind action *name* appears in keybind.zig and that input.zig contains a
+// `.copilot_conversation_picker =>` dispatch arm, call the real catalog/seam
+// functions and assert what they actually do at runtime. This proves the action
+// is a real, parseable, default-bound keybind and that the extracted dispatch
+// resolver wires it to the copilot picker command — the same facts the greps
+// encoded, but checked through behavior rather than text. The same assertions
+// also live in src/input/command_dispatch.zig so they run in the fast suite
+// (`zig build test`); these copies keep coverage in the full `test-full` binary.
+test "copilot conversation picker is a real, default-bound keybind action" {
+    // The action name resolves to the enum value (the action exists in the catalog).
+    try std.testing.expectEqual(
+        keybind.Action.copilot_conversation_picker,
+        keybind.Action.parse("copilot_conversation_picker").?,
+    );
+
+    // A default keybind binds something to it (so the picker is reachable out of the box).
+    var bound = false;
+    for (keybind.default_bindings) |binding| {
+        if (binding.action == .copilot_conversation_picker) {
+            bound = true;
+            break;
+        }
+    }
+    try std.testing.expect(bound);
+}
+
+test "copilot conversation picker action dispatches to the picker command" {
+    // The extracted dispatch resolver maps the action to the copilot picker
+    // command in the early phase (this replaces grepping input.zig for the arm).
+    try std.testing.expectEqual(
+        command_dispatch.Command.copilot_conversation_picker,
+        command_dispatch.resolve(.copilot_conversation_picker, .early).?,
+    );
+    // It only fires in the early phase, mirroring the real key-routing order.
+    try std.testing.expectEqual(
+        @as(?command_dispatch.Command, null),
+        command_dispatch.resolve(.copilot_conversation_picker, .late),
+    );
 }
 
 test "activeCopilotSession installs the history-change hook" {

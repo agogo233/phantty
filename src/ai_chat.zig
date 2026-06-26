@@ -104,7 +104,7 @@ pub const Message = struct {
     reasoning_collapsed: bool = true,
     reasoning_auto_expand: bool = false,
 
-    fn deinit(self: Message, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
         if (self.model_context) |ctx| allocator.free(ctx);
         if (self.reasoning) |reasoning| allocator.free(reasoning);
@@ -3193,7 +3193,7 @@ pub const Session = struct {
     /// Assumes self.mutex is held. Returns the captured history change for the
     /// caller to notify after unlocking.
     fn clearMessagesLocked(self: *Session) ?PendingHistoryChange {
-        for (self.messages.items) |msg| msg.deinit(self.allocator);
+        for (self.messages.items) |m| m.deinit(self.allocator);
         self.messages.clearRetainingCapacity();
         self.scroll_px = 0;
         self.suggestion_selected = 0;
@@ -3312,7 +3312,7 @@ pub const Session = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.clearSelectionLocked();
-        self.input_cursor = previousUtf8Boundary(self.input(), self.input_cursor);
+        self.input_cursor = ai_chat_composer.cursorLeft(self.input(), self.input_cursor);
         self.input_scroll_follow_cursor = true;
         self.suggestion_selected = 0;
     }
@@ -3321,7 +3321,7 @@ pub const Session = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.clearSelectionLocked();
-        self.input_cursor = nextUtf8Boundary(self.input(), self.input_cursor);
+        self.input_cursor = ai_chat_composer.cursorRight(self.input(), self.input_cursor);
         self.input_scroll_follow_cursor = true;
         self.suggestion_selected = 0;
     }
@@ -3657,8 +3657,7 @@ pub const Session = struct {
 
     fn rollbackMessagesFromLocked(self: *Session, start: usize) void {
         while (self.messages.items.len > start) {
-            var msg = self.messages.pop().?;
-            msg.deinit(self.allocator);
+            if (self.messages.pop()) |m| m.deinit(self.allocator) else break;
         }
     }
 
@@ -3959,14 +3958,17 @@ pub const Session = struct {
 
         const settings = currentAgentSettings();
         const agent_enabled = self.agent_enabled or settings.enabled;
-        const tool_host = if (agent_enabled) currentToolHost() else null;
+        var tool_host = if (agent_enabled) currentToolHost() else null;
         var tool_snapshot: ?ToolSnapshot = null;
         errdefer if (tool_snapshot) |snapshot| snapshot.deinit(self.allocator);
         if (tool_host) |host| {
             // The tab model is thread-local to the UI thread. Capture the agent
             // view before spawning the request worker so tools do not read an
             // empty thread-local copy from the background thread.
-            tool_snapshot = host.collectSnapshot(host.ctx, self.allocator) catch null;
+            tool_snapshot = host.collectSnapshot(host.ctx, self.allocator) catch blk: {
+                tool_host = null;
+                break :blk null;
+            };
         }
 
         var weixin_ctx: ?WeixinReplyContext = null;
@@ -4732,7 +4734,7 @@ fn buildTitleRequestLocked(session: *Session, turn: ai_chat_title.FirstTurn) !*C
         .thinking_enabled = false,
         .reasoning_effort = reasoning_effort,
         .stream = false,
-        .max_tokens = 64,
+        .max_tokens = 512,
         .agent_enabled = false,
         .copilot = false,
         .tool_host = null,
@@ -6200,6 +6202,30 @@ test "ai_chat: applyGeneratedTitle ignores empty model output" {
     defer session.deinit();
     applyGeneratedTitle(session, "   \n  ");
     try std.testing.expectEqualStrings(DEFAULT_NAME, session.title());
+}
+
+test "ai_chat: title request leaves enough budget for reasoning providers" {
+    const allocator = std.testing.allocator;
+    const session = try Session.init(
+        allocator,
+        DEFAULT_NAME,
+        "https://api.example.com",
+        "secret",
+        "model-a",
+        "system",
+        "enabled",
+        "high",
+        "false",
+        "true",
+    );
+    defer session.deinit();
+
+    session.mutex.lock();
+    const req = try buildTitleRequestLocked(session, .{ .user = "hello", .assistant = "world" });
+    session.mutex.unlock();
+    defer req.deinit();
+
+    try std.testing.expect(req.max_tokens >= 256);
 }
 
 test "ai chat endpoint normalization" {

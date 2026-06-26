@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_search = @import("text_search.zig");
 
 pub const ProviderId = enum {
     codex,
@@ -31,16 +32,6 @@ pub const CategoryCounts = struct {
     reasonix: usize = 0,
     subagent: usize = 0,
 };
-
-pub fn categoryMatches(category: CategoryFilter, provider: ProviderId) bool {
-    return switch (category) {
-        .all => true,
-        .codex => provider == .codex,
-        .claude => provider == .claude,
-        .reasonix => provider == .reasonix,
-        .subagent => false,
-    };
-}
 
 pub fn isSubagentSession(meta: SessionMeta) bool {
     const title = std.mem.trimLeft(u8, meta.title, " \t\r\n");
@@ -154,28 +145,11 @@ pub fn lessRecent(_: void, lhs: SessionMeta, rhs: SessionMeta) bool {
 
 pub fn metadataMatches(meta: SessionMeta, query: []const u8) bool {
     if (query.len == 0) return true;
-    return containsIgnoreCase(meta.title, query) or
-        containsIgnoreCase(meta.summary, query) or
-        containsIgnoreCase(meta.project_dir, query) or
-        containsIgnoreCase(meta.session_id, query) or
-        containsIgnoreCase(meta.source_path, query);
-}
-
-fn containsIgnoreCase(haystack: []const u8, query: []const u8) bool {
-    if (query.len == 0) return true;
-    if (query.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i + query.len <= haystack.len) : (i += 1) {
-        var matched = true;
-        for (query, 0..) |qch, j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(qch)) {
-                matched = false;
-                break;
-            }
-        }
-        if (matched) return true;
-    }
-    return false;
+    return text_search.containsIgnoreCase(meta.title, query) or
+        text_search.containsIgnoreCase(meta.summary, query) or
+        text_search.containsIgnoreCase(meta.project_dir, query) or
+        text_search.containsIgnoreCase(meta.session_id, query) or
+        text_search.containsIgnoreCase(meta.source_path, query);
 }
 
 test "ai_history_types: provider labels are stable" {
@@ -234,15 +208,37 @@ test "ai_history_types: recent sort is descending with session id tie break" {
     try std.testing.expectEqualStrings("b", rows[2].session_id);
 }
 
-test "ai_history_types: categoryMatches respects provider" {
-    try std.testing.expect(categoryMatches(.all, .codex));
-    try std.testing.expect(categoryMatches(.all, .claude));
-    try std.testing.expect(categoryMatches(.codex, .codex));
-    try std.testing.expect(!categoryMatches(.codex, .claude));
-    try std.testing.expect(categoryMatches(.claude, .claude));
-    try std.testing.expect(!categoryMatches(.claude, .codex));
-    try std.testing.expect(categoryMatches(.reasonix, .reasonix));
-    try std.testing.expect(!categoryMatches(.reasonix, .codex));
+test "ai_history_types: categoryMatchesMeta respects provider" {
+    const codex: SessionMeta = .{
+        .provider = .codex,
+        .session_id = "codex",
+        .title = "Codex task",
+        .source_path = "codex.jsonl",
+        .resume_kind = .codex_resume,
+    };
+    const claude: SessionMeta = .{
+        .provider = .claude,
+        .session_id = "claude",
+        .title = "Claude task",
+        .source_path = "claude.jsonl",
+        .resume_kind = .claude_resume,
+    };
+    const reasonix: SessionMeta = .{
+        .provider = .reasonix,
+        .session_id = "reasonix",
+        .title = "Reasonix task",
+        .source_path = "reasonix.jsonl",
+        .resume_kind = .reasonix_resume,
+    };
+
+    try std.testing.expect(categoryMatchesMeta(.all, codex));
+    try std.testing.expect(categoryMatchesMeta(.all, claude));
+    try std.testing.expect(categoryMatchesMeta(.codex, codex));
+    try std.testing.expect(!categoryMatchesMeta(.codex, claude));
+    try std.testing.expect(categoryMatchesMeta(.claude, claude));
+    try std.testing.expect(!categoryMatchesMeta(.claude, codex));
+    try std.testing.expect(categoryMatchesMeta(.reasonix, reasonix));
+    try std.testing.expect(!categoryMatchesMeta(.reasonix, codex));
 }
 
 test "ai_history_types: You are titles are classified as subagent metadata" {

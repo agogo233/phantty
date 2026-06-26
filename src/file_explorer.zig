@@ -12,6 +12,11 @@ const file_backend = @import("file_backend.zig");
 const platform_local_path = @import("platform/local_path.zig");
 const ui_perf = @import("ui_perf.zig");
 const active_tab_state = @import("appwindow/active_tab.zig");
+const action = @import("file_explorer/action.zig");
+
+/// Domain-owned file-explorer keyboard intent (re-exported so callers route
+/// keys through `handleAction` instead of poking internals directly).
+pub const Action = action.Action;
 
 pub const DEFAULT_WIDTH: f32 = 240;
 pub const MIN_WIDTH: f32 = 160;
@@ -194,6 +199,38 @@ pub fn width() f32 {
 pub fn isVisibleForActiveTab() bool {
     const owner = g_owner_tab orelse return false;
     return g_visible and owner == active_tab_state.g_active_tab;
+}
+
+/// Narrow, read-only queries used by the input layer so it does not have to
+/// reach into file-explorer globals directly. These preserve the exact
+/// semantics of the underlying `g_*` reads.
+pub fn isFocused() bool {
+    return g_focused;
+}
+
+/// Current inline-operation mode (rename / new file / new dir / confirm delete).
+pub fn opMode() OpMode {
+    return g_op_mode;
+}
+
+/// True when any inline file operation is active (not `.none`).
+pub fn hasActiveOp() bool {
+    return g_op_mode != .none;
+}
+
+/// True when the panel is showing the agent-history view rather than files.
+pub fn isAgentHistoryPanel() bool {
+    return g_panel_mode == .agent_history;
+}
+
+/// True when the panel is showing the file-tree view (not agent history).
+pub fn isFilesPanel() bool {
+    return g_panel_mode == .files;
+}
+
+/// True when the explorer is browsing a remote (SSH) location.
+pub fn isRemoteMode() bool {
+    return g_mode == .remote;
 }
 
 pub fn openForActiveTab() void {
@@ -510,45 +547,6 @@ fn copyRootPathOnly(path: []const u8) void {
     const len = @min(path.len, g_root_path.len);
     @memcpy(g_root_path[0..len], path[0..len]);
     g_root_path_len = len;
-}
-
-/// Enter remote mode with the given SSH connection.
-pub fn enterRemoteMode(conn: *const ssh_connection.SshConnection, remote_cwd: []const u8) void {
-    g_async_context_id +%= 1;
-    g_mode = .remote;
-    g_ssh_conn = conn.*;
-    g_has_ssh_conn = true;
-    if (remote_cwd.len > 0) {
-        setRoot(remote_cwd);
-    } else {
-        g_root_path_len = 0;
-        rescanRemote();
-    }
-}
-
-/// Switch back to local mode.
-pub fn enterLocalMode() void {
-    g_async_context_id +%= 1;
-    g_pending_async_list = null;
-    g_loading = false;
-    g_mode = .local;
-    g_has_ssh_conn = false;
-    g_entry_count = 0;
-    g_root_path_len = 0;
-}
-
-/// Enter WSL mode. Paths are Linux-style and listed via the platform backend.
-pub fn enterWslMode(wsl_cwd: []const u8) void {
-    g_async_context_id +%= 1;
-    g_pending_async_list = null;
-    g_loading = false;
-    g_mode = .wsl;
-    g_has_ssh_conn = false;
-    if (wsl_cwd.len > 0) {
-        setRoot(wsl_cwd);
-    } else {
-        setRoot("~");
-    }
 }
 
 pub fn setRoot(path: []const u8) void {
@@ -1559,6 +1557,28 @@ pub fn moveSelection(delta: i32) void {
     ensureSelectedVisible();
 }
 
+/// Perform a typed navigation-key intent by delegating to the existing
+/// `moveSelection`/`toggleExpand` operations. This is the narrow command API
+/// input.zig uses so it no longer calls those internals — or reads the
+/// `g_selected`/`g_entry_count`/`g_entries` globals for the Enter decision —
+/// directly. Behavior matches the previous inline key branch exactly.
+pub fn handleAction(act: Action) void {
+    switch (act) {
+        .move_selection_up => moveSelection(-1),
+        .move_selection_down => moveSelection(1),
+        .toggle_selected_expand => {
+            // Enter on a directory toggles expand; on a file it is a no-op
+            // (toggleExpand also guards is_dir, so the inner check just avoids
+            // the call, preserving the original conditional shape).
+            if (g_selected) |sel| {
+                if (sel < g_entry_count and g_entries[sel].is_dir) {
+                    toggleExpand(sel);
+                }
+            }
+        },
+    }
+}
+
 fn ensureSelectedVisible() void {
     const sel = g_selected orelse return;
     const row_h = rowHeight();
@@ -1695,17 +1715,6 @@ pub fn uploadFolder(local_path: []const u8) void {
     _ = startTransferJob(.upload, &g_ssh_conn, local_path, dst, name, scp.transferDirWithControl);
 }
 
-pub fn uploadLocalFileToRemoteSpec(local_path: []const u8, dst_spec: []const u8, display_name: []const u8, conn: *const ssh_connection.SshConnection) bool {
-    return uploadLocalPathToRemoteSpecWithTransferFns(
-        local_path,
-        dst_spec,
-        display_name,
-        conn,
-        scp.transferWithControl,
-        scp.transferDirWithControl,
-    );
-}
-
 fn uploadLocalFileToRemoteSpecWithTransfer(local_path: []const u8, dst_spec: []const u8, display_name: []const u8, conn: *const ssh_connection.SshConnection, transfer_fn: TransferFn) bool {
     return startTransferJob(.upload, conn, local_path, dst_spec, display_name, transfer_fn);
 }
@@ -1740,10 +1749,6 @@ pub fn uploadLocalFileToRemoteSpecWithCompletion(
     completion: TransferCompletion,
 ) bool {
     return startTransferJobWithCompletion(.upload, conn, local_path, dst_spec, display_name, pickUploadTransferFn(local_path), completion);
-}
-
-pub fn downloadRemoteFileToPath(remote_path: []const u8, local_path: []const u8, display_name: []const u8, conn: *const ssh_connection.SshConnection) bool {
-    return downloadRemotePathToPath(remote_path, local_path, display_name, conn, false);
 }
 
 pub fn downloadRemotePathToPath(remote_path: []const u8, local_path: []const u8, display_name: []const u8, conn: *const ssh_connection.SshConnection, is_dir: bool) bool {
@@ -2268,6 +2273,64 @@ test "file_explorer: moveHistorySelection walks selected row" {
     try std.testing.expectEqual(@as(?usize, 2), g_history_selected);
 }
 
+test "file_explorer: handleAction move intents walk the selection" {
+    g_panel_mode = .files;
+    g_row_height = 20;
+    g_visible_height = 200;
+    g_entry_count = 5;
+    g_scroll_offset = 0;
+    g_selected = 0;
+
+    handleAction(.move_selection_down);
+    try std.testing.expectEqual(@as(?usize, 1), g_selected);
+
+    handleAction(.move_selection_down);
+    handleAction(.move_selection_down);
+    try std.testing.expectEqual(@as(?usize, 3), g_selected);
+
+    handleAction(.move_selection_up);
+    try std.testing.expectEqual(@as(?usize, 2), g_selected);
+
+    // Matches moveSelection(-1) clamping at the top row.
+    handleAction(.move_selection_up);
+    handleAction(.move_selection_up);
+    handleAction(.move_selection_up);
+    try std.testing.expectEqual(@as(?usize, 0), g_selected);
+}
+
+test "file_explorer: handleAction toggle collapses an expanded directory and no-ops on a file" {
+    // Mirrors the Enter branch the input.zig key handler used to run inline:
+    // route to toggleExpand only when the selection is a directory. Use the
+    // collapse direction (in-memory, no filesystem) to keep the test
+    // deterministic — listing a fabricated path is environment-dependent.
+    g_panel_mode = .files;
+    g_mode = .local;
+    g_entry_count = 3;
+    g_entries[0] = .{ .is_dir = true, .expanded = true, .depth = 0 };
+    // One synthetic child of entry 0, so collapse has something to remove.
+    g_entries[1] = .{ .is_dir = false, .expanded = false, .depth = 1 };
+    g_entries[2] = .{ .is_dir = false, .expanded = false, .depth = 0 };
+
+    // Selected directory (expanded): Enter toggles it to collapsed and drops
+    // the child row.
+    g_selected = 0;
+    handleAction(.toggle_selected_expand);
+    try std.testing.expect(!g_entries[0].expanded);
+    try std.testing.expectEqual(@as(usize, 2), g_entry_count);
+
+    // Selected file: Enter is a no-op (entry untouched).
+    g_entries[1] = .{ .is_dir = false, .expanded = false, .depth = 0 };
+    g_selected = 1;
+    handleAction(.toggle_selected_expand);
+    try std.testing.expect(!g_entries[1].expanded);
+    try std.testing.expectEqual(@as(usize, 2), g_entry_count);
+
+    // No selection: Enter is a no-op (no crash).
+    g_selected = null;
+    handleAction(.toggle_selected_expand);
+    try std.testing.expectEqual(@as(?usize, null), g_selected);
+}
+
 test "file_explorer: history scroll does not mutate file scroll" {
     g_panel_mode = .files;
     g_row_height = 20;
@@ -2301,6 +2364,48 @@ test "file_explorer: switching to agent history clears file op state" {
     try std.testing.expectEqual(@as(u8, 0), g_input_len);
     try std.testing.expectEqual(@as(f32, 77), g_scroll_offset);
     try std.testing.expectEqual(@as(f32, 12), g_history_scroll_offset);
+}
+
+test "file_explorer: narrow query accessors reflect global state" {
+    const prev_focused = g_focused;
+    const prev_op_mode = g_op_mode;
+    const prev_panel_mode = g_panel_mode;
+    const prev_mode = g_mode;
+    defer {
+        g_focused = prev_focused;
+        g_op_mode = prev_op_mode;
+        g_panel_mode = prev_panel_mode;
+        g_mode = prev_mode;
+    }
+
+    g_focused = true;
+    try std.testing.expect(isFocused());
+    g_focused = false;
+    try std.testing.expect(!isFocused());
+
+    g_op_mode = .none;
+    try std.testing.expect(!hasActiveOp());
+    try std.testing.expectEqual(OpMode.none, opMode());
+    g_op_mode = .rename;
+    try std.testing.expect(hasActiveOp());
+    try std.testing.expectEqual(OpMode.rename, opMode());
+    g_op_mode = .confirm_delete;
+    try std.testing.expect(hasActiveOp());
+    try std.testing.expectEqual(OpMode.confirm_delete, opMode());
+
+    g_panel_mode = .files;
+    try std.testing.expect(isFilesPanel());
+    try std.testing.expect(!isAgentHistoryPanel());
+    g_panel_mode = .agent_history;
+    try std.testing.expect(isAgentHistoryPanel());
+    try std.testing.expect(!isFilesPanel());
+
+    g_mode = .remote;
+    try std.testing.expect(isRemoteMode());
+    g_mode = .local;
+    try std.testing.expect(!isRemoteMode());
+    g_mode = .wsl;
+    try std.testing.expect(!isRemoteMode());
 }
 
 test "file_explorer: syncPanelForTabKind resets focus and mode" {

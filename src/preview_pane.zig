@@ -1,7 +1,7 @@
 //! A file/markdown/image preview as a split-tree leaf. Refcounted because
 //! SplitTree is immutable: every edit clones the tree and refs each leaf so
 //! versions share payloads. State here was previously the threadlocal globals
-//! in markdown_preview_panel.zig.
+//! in preview panes.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const markdown_preview = @import("markdown_preview.zig");
@@ -119,14 +119,30 @@ pub fn unref(self: *PreviewPane, gpa: Allocator) void {
     }
 }
 
-pub fn title(self: *const PreviewPane) []const u8 { return self.title_buf[0..self.title_len]; }
-pub fn path(self: *const PreviewPane) []const u8 { return self.path_buf[0..self.path_len]; }
-pub fn sourceText(self: *const PreviewPane) []const u8 { return self.source orelse ""; }
-pub fn contentGeneration(self: *const PreviewPane) u64 { return self.content_generation; }
-pub fn currentSourceKind(self: *const PreviewPane) PreviewSourceKind { return self.source_kind; }
-pub fn imageZoom(self: *const PreviewPane) f32 { return self.image_zoom; }
-pub fn imagePanX(self: *const PreviewPane) f32 { return self.image_pan_x; }
-pub fn imagePanY(self: *const PreviewPane) f32 { return self.image_pan_y; }
+pub fn title(self: *const PreviewPane) []const u8 {
+    return self.title_buf[0..self.title_len];
+}
+pub fn path(self: *const PreviewPane) []const u8 {
+    return self.path_buf[0..self.path_len];
+}
+pub fn sourceText(self: *const PreviewPane) []const u8 {
+    return self.source orelse "";
+}
+pub fn contentGeneration(self: *const PreviewPane) u64 {
+    return self.content_generation;
+}
+pub fn currentSourceKind(self: *const PreviewPane) PreviewSourceKind {
+    return self.source_kind;
+}
+pub fn imageZoom(self: *const PreviewPane) f32 {
+    return self.image_zoom;
+}
+pub fn imagePanX(self: *const PreviewPane) f32 {
+    return self.image_pan_x;
+}
+pub fn imagePanY(self: *const PreviewPane) f32 {
+    return self.image_pan_y;
+}
 
 fn setTitlePath(self: *PreviewPane, t: []const u8, p: []const u8) void {
     self.title_len = @min(t.len, self.title_buf.len);
@@ -165,8 +181,6 @@ pub fn scrollBy(self: *PreviewPane, delta: f32) void {
     if (self.kind.isRaster()) return;
     self.scroll_offset = @max(0, @min(self.max_scroll, self.scroll_offset + delta));
 }
-
-pub fn isContentTruncated(self: *const PreviewPane) bool { return self.content_truncated; }
 
 pub fn zoomImageBySteps(self: *PreviewPane, steps: usize, zoom_in: bool) bool {
     if (!self.kind.isRaster()) return false;
@@ -219,15 +233,25 @@ pub fn beginAsyncLoad(self: *PreviewPane, kind: markdown_preview.Kind, t: []cons
 fn beginAsyncLoadWith(self: *PreviewPane, kind: markdown_preview.Kind, t: []const u8, p: []const u8, source_kind: PreviewSourceKind, read_fn: PreviewReadFn) bool {
     self.request_id +%= 1;
     self.source_kind = source_kind;
-    if (p.len > 512) { self.applyOwned(kind, t, p, std.heap.page_allocator.dupe(u8, FAILED_SOURCE) catch null, .failed); return false; }
+    if (p.len > 512) {
+        self.applyOwned(kind, t, p, std.heap.page_allocator.dupe(u8, FAILED_SOURCE) catch null, .failed);
+        return false;
+    }
     self.applyOwned(kind, t, p, std.heap.page_allocator.dupe(u8, LOADING_SOURCE) catch null, .loading);
     const alloc = std.heap.page_allocator;
     const job = alloc.create(PreviewJob) catch return false;
     job.* = .{ .request_id = self.request_id, .kind = kind, .source_kind = source_kind, .path_len = p.len, .title_len = @min(t.len, 256), .read_fn = read_fn, .render_fn = self.pdf_render_fn, .owner = self };
     @memcpy(job.path_buf[0..p.len], p);
     @memcpy(job.title_buf[0..job.title_len], t[0..job.title_len]);
-    self.jobs.append(alloc, job) catch { alloc.destroy(job); return false; };
-    job.thread = std.Thread.spawn(.{}, jobThread, .{job}) catch { _ = self.jobs.pop(); alloc.destroy(job); return false; };
+    self.jobs.append(alloc, job) catch {
+        alloc.destroy(job);
+        return false;
+    };
+    job.thread = std.Thread.spawn(.{}, jobThread, .{job}) catch {
+        _ = self.jobs.pop();
+        alloc.destroy(job);
+        return false;
+    };
     return true;
 }
 
@@ -237,13 +261,17 @@ pub fn tickAsync(self: *PreviewPane) bool {
     var i: usize = 0;
     while (i < self.jobs.items.len) {
         const job = self.jobs.items[i];
-        if (!job.done.load(.acquire)) { i += 1; continue; }
+        if (!job.done.load(.acquire)) {
+            i += 1;
+            continue;
+        }
         if (job.thread) |th| th.join();
         _ = self.jobs.orderedRemove(i);
         defer destroyJob(job);
         if (job.request_id != self.request_id) continue;
         if (job.status == .ready and job.source != null) {
-            const s = job.source.?; job.source = null;
+            const s = job.source.?;
+            job.source = null;
             const keep_zoom: ?f32 = if (job.is_pdf_flip) self.image_zoom else null;
             self.applyOwned(job.kind, job.title_buf[0..job.title_len], job.path_buf[0..job.path_len], s, .ready);
             self.content_truncated = job.truncated;
@@ -450,7 +478,10 @@ fn freeSource(self: *PreviewPane) void {
 }
 
 fn resetJobs(self: *PreviewPane) void {
-    for (self.jobs.items) |job| { if (job.thread) |th| th.join(); destroyJob(job); }
+    for (self.jobs.items) |job| {
+        if (job.thread) |th| th.join();
+        destroyJob(job);
+    }
     self.jobs.clearAndFree(std.heap.page_allocator);
 }
 
@@ -462,7 +493,11 @@ fn destroyJob(job: *PreviewJob) void {
 }
 
 pub fn unloadImageTexture(self: *PreviewPane) void {
-    if (self.image_texture != 0) { var t = gpu.Texture.fromHandle(self.image_texture); t.destroy(); self.image_texture = 0; }
+    if (self.image_texture != 0) {
+        var t = gpu.Texture.fromHandle(self.image_texture);
+        t.destroy();
+        self.image_texture = 0;
+    }
     self.image_width = 0;
     self.image_height = 0;
     self.image_generation = std.math.maxInt(u64);
@@ -593,7 +628,10 @@ test "PreviewPane: async load applies content then clears job" {
     try std.testing.expect(p.beginAsyncLoadWith(.markdown, "a.md", "a.md", .local, previewReadOkForTest));
     try std.testing.expectEqual(LoadStatus.loading, p.load_status);
     var attempts: usize = 0;
-    while (p.jobs.items.len > 0 and attempts < 200) : (attempts += 1) { _ = p.tickAsync(); if (p.jobs.items.len > 0) std.Thread.sleep(std.time.ns_per_ms); }
+    while (p.jobs.items.len > 0 and attempts < 200) : (attempts += 1) {
+        _ = p.tickAsync();
+        if (p.jobs.items.len > 0) std.Thread.sleep(std.time.ns_per_ms);
+    }
     try std.testing.expectEqual(LoadStatus.ready, p.load_status);
     try std.testing.expectEqualStrings("# Loaded\n", p.sourceText());
 }
@@ -735,12 +773,12 @@ test "PreviewPane: truncated text read is ready and flags content as truncated" 
     try std.testing.expect(p.beginAsyncLoadWith(.text, "big.log", "big.log", .local, fakeTruncatedReadOk));
     drainJobs(p);
     try std.testing.expectEqual(LoadStatus.ready, p.load_status);
-    try std.testing.expect(p.isContentTruncated());
+    try std.testing.expect(p.content_truncated);
     try std.testing.expectEqualStrings("line1\nline2\n", p.sourceText());
 
     // Loading new content clears the truncated flag.
     p.open(.markdown, "b.md", "b.md", "# hi");
-    try std.testing.expect(!p.isContentTruncated());
+    try std.testing.expect(!p.content_truncated);
 }
 
 test "PreviewPane: scrollBy clamps to the renderer-reported max_scroll" {
