@@ -129,8 +129,9 @@ today's structural debt so it can only **shrink**:
 - **`file_size_guard`** — no `src/**/*.zig` over 10,000 lines (a runaway
   backstop; also `zig build check-sizes`).
 - **`global_state_guard`** — the top-level `g_*` / `threadlocal` count in
-  `AppWindow.zig` / `input.zig` / `renderer/overlays.zig` / `ai_chat.zig` may
-  only shrink; new state belongs in an explicit state struct.
+  `AppWindow.zig` / `input.zig` / `renderer/overlays.zig` /
+  `assistant/conversation/session.zig` may only shrink; new state belongs in an
+  explicit state struct.
 - **`import_hub_guard`** — `AppWindow.zig`'s `pub const X = @import(...)`
   re-export count may only shrink; import the real module directly, not via
   `AppWindow.X`.
@@ -147,8 +148,8 @@ the contributor-facing summary is in [`AGENTS.md`](../AGENTS.md).
 
 A second boundary cuts *across* the core, orthogonal to the platform seam: the
 distinction between the **integration layer** that coordinates features and the
-**feature domains** that own them. The four monoliths above sit on the wrong
-side of it today, which is why they carry the ratchets.
+**feature domains** that own them. The watched integration/session files still
+carry historical boundary debt, which is why they carry the ratchets.
 
 - **Integration layer** — `src/AppWindow.zig`, `src/input.zig`, and
   `src/renderer/overlays.zig`. These *coordinate*: AppWindow assembles modules
@@ -158,11 +159,18 @@ side of it today, which is why they carry the ratchets.
   they hold a feature's `g_*` globals or reach into a feature's internals, that
   is the entanglement the ratchets are freezing — not a property of being a host.
 
-- **Feature domains** — each owns its own state, query/action API, and tests:
-  `ai_chat*` (agent/session/tools/streaming), `weixin/*`, the `skill_*` modules,
-  `file_explorer.zig`, the `tmux_*` controllers, and the `remote_*` client/sync
-  code. A domain is responsible for its own behavior; the integration layer only
-  wires it in and asks it to do things.
+- **Feature domains** — each owns its own state, query/action API, and tests.
+  A domain is responsible for its own behavior; the integration layer only wires
+  it in and asks it to do things. The current AI/agent ownership split is:
+  `assistant/` owns WispTerm's Assistant/Copilot conversation experience;
+  `agent/` owns WispTerm's own agent permissions, config, memory, file editing,
+  and conversation history; `agent_tools/` owns model tool-call runtime wrappers;
+  and `terminal_agents/` owns adapters for external terminal agent applications
+  such as Claude Code, Codex, Reasonix, and Subagent. In particular,
+  `terminal_agents/sessions/` owns discovery, transcript preview, and resume
+  commands for those external terminal agents. Other feature domains include
+  `weixin/*`, `skill/`, `file_explorer.zig`, `tmux/*`, and the remote
+  client/sync code.
 
 Guidance for new code (these keep the boundary from re-tangling):
 

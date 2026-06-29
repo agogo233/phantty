@@ -1,10 +1,10 @@
 //! Skill Center action/input and async operation glue for AppWindow.
 
 const std = @import("std");
-const ai_chat = @import("../ai_chat.zig");
-const ai_chat_request = @import("../ai_chat_request.zig");
+const ai_chat = @import("../assistant/conversation/session.zig");
+const ai_chat_request = @import("../assistant/conversation/request.zig");
 const clipboard = @import("../input/clipboard.zig");
-const first_party_tools = @import("../first_party_tools.zig");
+const first_party_tools = @import("../tools/first_party.zig");
 const i18n = @import("../i18n.zig");
 const overlays = @import("../renderer/overlays.zig");
 const platform_atomic_file = @import("../platform/atomic_file.zig");
@@ -13,19 +13,19 @@ const platform_file_dialog = @import("../platform/file_dialog.zig");
 const platform_pty_command = @import("../platform/pty_command.zig");
 const platform_wsl = @import("../platform/wsl.zig");
 const remote_file = @import("../platform/remote_file.zig");
-const scp = @import("../scp.zig");
-const skill_center = @import("../skill_center.zig");
-const skill_install = @import("../skill_install.zig");
-const skill_local_fs = @import("../skill_local_fs.zig");
-const skill_scan = @import("../skill_scan.zig");
-const skill_transfer = @import("../skill_transfer.zig");
-const skill_transfer_cmd = @import("../skill_transfer_cmd.zig");
-const ssh_connection = @import("../ssh_connection.zig");
-const ssh_error = @import("../ssh_error.zig");
+const scp = @import("../ssh/scp.zig");
+const skill_center = @import("../skill/center.zig");
+const skill_install = @import("../skill/install.zig");
+const skill_local_fs = @import("../skill/local_fs.zig");
+const skill_scan = @import("../skill/scan.zig");
+const skill_transfer = @import("../skill/transfer.zig");
+const skill_transfer_cmd = @import("../skill/transfer_cmd.zig");
+const ssh_connection = @import("../ssh/connection.zig");
+const ssh_error = @import("../ssh/error.zig");
 const tab = @import("tab.zig");
-const tool_import = @import("../tool_import.zig");
-const tool_registry = @import("../tool_registry.zig");
-const tool_skill_draft = @import("../tool_skill_draft.zig");
+const tool_import = @import("../tools/import.zig");
+const tool_registry = @import("../tools/registry.zig");
+const tool_skill_draft = @import("../tools/skill_draft.zig");
 const update_install = @import("../update_install.zig");
 const window_backend = @import("../platform/window_backend.zig");
 

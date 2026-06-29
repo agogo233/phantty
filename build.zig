@@ -396,6 +396,13 @@ test "desktop executable emission defaults to implemented platform backends" {
     try std.testing.expect(defaultEmitDesktopExe(PlatformFeatures.forOs(.macos)));
 }
 
+test "standalone filetool build contract is declared" {
+    const source = @embedFile("build.zig");
+    try expectSourceContains(source, ".name = \"wispterm-filetool\"");
+    try expectSourceContains(source, "src/wispterm_filetool.zig");
+    try expectSourceContains(source, "b.step(\"wispterm-filetool\"");
+}
+
 test "shared compile checks default to platforms without desktop backends" {
     try std.testing.expect(!defaultEmitSharedCompileChecks(PlatformFeatures.forOs(.windows)));
     try std.testing.expect(!defaultEmitSharedCompileChecks(PlatformFeatures.forOs(.linux)));
@@ -594,7 +601,7 @@ pub fn build(b: *std.Build) void {
 
         if (target.result.os.tag == .windows) {
             const askpass_mod = b.createModule(.{
-                .root_source_file = b.path("src/ssh_askpass.zig"),
+                .root_source_file = b.path("src/ssh/askpass.zig"),
                 .target = target,
                 .optimize = optimize,
             });
@@ -628,6 +635,19 @@ pub fn build(b: *std.Build) void {
         const wisptermctl_step = b.step("wisptermctl", "Build the standalone wisptermctl CLI client (separate artifact; not bundled with the app)");
         wisptermctl_step.dependOn(&b.addInstallArtifact(ctl_exe, .{}).step);
     }
+
+    const filetool_mod = b.createModule(.{
+        .root_source_file = b.path("src/wispterm_filetool.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const filetool_exe = b.addExecutable(.{
+        .name = "wispterm-filetool",
+        .root_module = filetool_mod,
+    });
+    if (platform.supports_gui_subsystem) filetool_exe.subsystem = .Console;
+    const filetool_step = b.step("wispterm-filetool", "Build the standalone remote-side file edit helper");
+    filetool_step.dependOn(&b.addInstallArtifact(filetool_exe, .{}).step);
 
     b.installDirectory(.{
         .source_dir = b.path("plugins"),
@@ -759,6 +779,26 @@ pub fn build(b: *std.Build) void {
         });
         test_full_step.dependOn(&b.addRunArtifact(posix_tests).step);
     }
+
+    // `test-ctl`: the agent-control loopback socket round-trip, runnable on EVERY
+    // host including Windows. This is the regression guard the v1.30.0 "malformed
+    // response" bug slipped through — the round-trip only ran on non-Windows hosts
+    // (posix_tests above), and the broken Stream.read it replaced misbehaves only
+    // on Windows overlapped sockets. Lean (pure std + sockets), so it links
+    // without the app graph; libc only where the socket syscalls need it (Windows
+    // uses ws2_32 directly via ctl/transport.zig, so no libc there).
+    const ctl_socket_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl/socket_test.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = optimize,
+        .link_libc = b.graph.host.result.os.tag != .windows,
+    });
+    const ctl_socket_tests = b.addTest(.{
+        .name = "wispterm-ctl-socket-test",
+        .root_module = ctl_socket_test_mod,
+    });
+    const test_ctl_step = b.step("test-ctl", "Run the agent-control loopback socket round-trip (all hosts, incl. Windows)");
+    test_ctl_step.dependOn(&b.addRunArtifact(ctl_socket_tests).step);
 
     const shared_test_mod = b.createModule(.{
         .root_source_file = b.path("src/shared_compile_test.zig"),

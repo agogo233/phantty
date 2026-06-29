@@ -9,6 +9,7 @@
 ///
 /// TabState in main.zig becomes a thin wrapper: `{ surface: *Surface }`.
 const std = @import("std");
+const builtin = @import("builtin");
 const ghostty_vt = @import("ghostty-vt");
 const Pty = @import("pty.zig").Pty;
 const Command = @import("Command.zig");
@@ -18,17 +19,18 @@ const Config = @import("config.zig");
 const Renderer = @import("renderer/Renderer.zig");
 const remote = @import("remote_client.zig");
 const threading = @import("platform/threading.zig");
-const agent_detector = @import("agent_detector.zig");
+const agent_detector = @import("terminal_agents/detector.zig");
 const window_backend = @import("platform/window_backend.zig");
 const sync_output = @import("sync_output.zig");
 const notification = @import("notification.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
 const surface_registry = @import("surface_registry.zig");
 const platform_process = @import("platform/process.zig");
-const ssh_connection_mod = @import("ssh_connection.zig");
+const ssh_connection_mod = @import("ssh/connection.zig");
 const clipboard_osc52 = @import("clipboard_osc52.zig");
 
 const Surface = @This();
+const io_log = std.log.scoped(.surface_io);
 
 // ============================================================================
 // Types
@@ -46,6 +48,43 @@ pub const Selection = struct {
     end_row: usize = 0,
     /// Active selections are rendered and copied; anchor-only clicks are not.
     active: bool = false,
+};
+
+pub const Operation = enum {
+    event_loop,
+    pty_read,
+    pty_write,
+    pty_resize,
+    terminal_resize,
+    thread_spawn,
+    thread_shutdown,
+};
+
+pub const IoFailure = struct {
+    operation: Operation,
+    error_code: anyerror,
+    timestamp_ms: i64,
+};
+
+pub const ExitReason = enum {
+    eof,
+    broken_pipe,
+    user_closed,
+};
+
+pub const ExitInfo = struct {
+    reason: ExitReason,
+    status: ?Command.Exit = null,
+    timestamp_ms: i64,
+};
+
+pub const IoState = union(enum) {
+    starting,
+    running,
+    stopping,
+    stopped,
+    exited: ExitInfo,
+    failed: IoFailure,
 };
 
 /// OSC parser state machine — handles sequences split across PTY reads.
@@ -127,7 +166,10 @@ pub const VtHandler = struct {
     /// the handler's terminal pointer, which aliases `&surface.terminal`.
     fn writePtyResponse(handler: *InnerHandler, data: [:0]const u8) void {
         const surface: *Surface = @fieldParentPtr("terminal", handler.terminal);
-        surface.queuePtyWrite(data);
+        surface.queuePtyWrite(data) catch |err| mailbox_log.warn(
+            "dropped terminal query reply ({d} bytes): {s}",
+            .{ data.len, @errorName(err) },
+        );
     }
 
     pub fn deinit(self: *VtHandler) void {
@@ -239,6 +281,11 @@ sync_output_state: sync_output.State = .{},
 
 /// Set when the PTY process has exited.
 exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+/// Thread-safe terminal IO lifecycle. `exited` remains as the cheap legacy
+/// stop flag; this carries the reason surfaced to callers and UI.
+io_state_mutex: std.Thread.Mutex = .{},
+io_state: IoState = .starting,
 
 /// Set while the IO writer thread is resizing PTY and terminal state.
 /// The reader thread still drains PTY output during this window, but
@@ -447,6 +494,8 @@ fn finishInit(
     surface.dirty = std.atomic.Value(bool).init(true);
     surface.sync_output_state = .{};
     surface.exited = std.atomic.Value(bool).init(false);
+    surface.io_state_mutex = .{};
+    surface.io_state = .starting;
     surface.resize_in_progress = std.atomic.Value(bool).init(false);
 
     // Desktop-notification state. `allocator.create` returns undefined memory
@@ -523,6 +572,7 @@ fn finishInit(
     // Spawn IO writer thread (xev event loop — handles resize, future messages)
     surface.io_writer_thread = std.Thread.spawn(threading.surface_thread_spawn_config, termio.Thread.threadMain, .{ thread_state, surface }) catch |err| {
         std.debug.print("Failed to spawn IO writer thread: {}\n", .{err});
+        surface.failIo(.thread_spawn, err);
         return err;
     };
     errdefer {
@@ -534,8 +584,11 @@ fn finishInit(
     // Spawn IO reader thread (blocking PTY output loop)
     surface.io_reader_thread = std.Thread.spawn(threading.surface_thread_spawn_config, termio.ReadThread.threadMain, .{surface}) catch |err| {
         std.debug.print("Failed to spawn IO reader thread: {}\n", .{err});
+        surface.failIo(.thread_spawn, err);
         return err;
     };
+
+    surface.setIoRunning();
 
     // The renderer thread is kept as a future integration point, but the actual
     // snapshot/rebuild path still runs on the main thread today. Starting it now
@@ -615,7 +668,7 @@ pub fn deinit(self: *Surface, allocator: std.mem.Allocator) void {
     }
 
     // 2. Signal both IO threads to stop.
-    self.exited.store(true, .release);
+    self.beginStopping();
 
     // Stop the writer thread (xev event loop) via its stop async
     if (self.io_thread_state) |state| {
@@ -634,6 +687,7 @@ pub fn deinit(self: *Surface, allocator: std.mem.Allocator) void {
         thread.join();
         self.io_reader_thread = null;
     }
+    self.markStopped();
     self.remote_client = null;
 
     // Clean up writer thread state and mailbox
@@ -701,6 +755,149 @@ pub fn setSshConnectionValue(self: *Surface, conn: SshConnection) void {
     self.ssh_connection = conn;
 }
 
+pub fn currentIoState(self: *Surface) IoState {
+    self.io_state_mutex.lock();
+    defer self.io_state_mutex.unlock();
+    return self.io_state;
+}
+
+pub fn acceptsInput(self: *Surface) bool {
+    return switch (self.currentIoState()) {
+        .running => true,
+        else => false,
+    };
+}
+
+fn setIoRunning(self: *Surface) void {
+    self.io_state_mutex.lock();
+    defer self.io_state_mutex.unlock();
+    if (self.io_state == .starting) self.io_state = .running;
+}
+
+pub fn beginStopping(self: *Surface) void {
+    self.io_state_mutex.lock();
+    defer self.io_state_mutex.unlock();
+    switch (self.io_state) {
+        .failed, .exited, .stopped => {},
+        else => self.io_state = .stopping,
+    }
+    self.exited.store(true, .release);
+}
+
+pub fn markStopped(self: *Surface) void {
+    self.io_state_mutex.lock();
+    defer self.io_state_mutex.unlock();
+    switch (self.io_state) {
+        .failed, .exited, .stopped => {},
+        else => self.io_state = .stopped,
+    }
+}
+
+pub fn pollExitStatus(self: *Surface) ?Command.Exit {
+    return self.command.wait(false) catch |err| {
+        io_log.warn("process exit poll failed err={s}", .{@errorName(err)});
+        return null;
+    };
+}
+
+pub fn markExited(self: *Surface, reason: ExitReason, status: ?Command.Exit) void {
+    const info: ExitInfo = .{
+        .reason = reason,
+        .status = status,
+        .timestamp_ms = std.time.milliTimestamp(),
+    };
+    var should_notify = false;
+
+    self.io_state_mutex.lock();
+    switch (self.io_state) {
+        .failed, .exited, .stopped => {},
+        .stopping => self.io_state = .stopped,
+        else => {
+            self.io_state = .{ .exited = info };
+            should_notify = true;
+        },
+    }
+    self.exited.store(true, .release);
+    self.io_state_mutex.unlock();
+
+    if (!should_notify) return;
+    io_log.info("surface io exited reason={s}", .{@tagName(reason)});
+    self.requestWriterStop();
+    self.paintIoStatus(.{ .exited = info });
+    window_backend.postWakeup();
+}
+
+pub fn failIo(self: *Surface, operation: Operation, err: anyerror) void {
+    const failure: IoFailure = .{
+        .operation = operation,
+        .error_code = err,
+        .timestamp_ms = std.time.milliTimestamp(),
+    };
+    var should_notify = false;
+
+    self.io_state_mutex.lock();
+    switch (self.io_state) {
+        .failed, .exited, .stopped => {},
+        else => {
+            self.io_state = .{ .failed = failure };
+            should_notify = true;
+        },
+    }
+    self.exited.store(true, .release);
+    self.io_state_mutex.unlock();
+
+    if (!should_notify) return;
+    if (builtin.is_test) {
+        io_log.warn("surface io failed operation={s} err={s}", .{ @tagName(operation), @errorName(err) });
+    } else {
+        io_log.err("surface io failed operation={s} err={s}", .{ @tagName(operation), @errorName(err) });
+    }
+    self.requestWriterStop();
+    if (self.io_reader_thread != null) self.pty.cancelOutputRead();
+    self.paintIoStatus(.{ .failed = failure });
+    window_backend.postWakeup();
+}
+
+fn requestWriterStop(self: *Surface) void {
+    if (self.io_thread_state) |state| {
+        state.stop.notify() catch |err| {
+            io_log.warn("failed to notify io writer stop err={s}", .{@errorName(err)});
+        };
+    }
+}
+
+fn paintIoStatus(self: *Surface, state: IoState) void {
+    self.render_state.mutex.lock();
+    defer self.render_state.mutex.unlock();
+
+    var buf: [256]u8 = undefined;
+    const message = switch (state) {
+        .failed => |failure| std.fmt.bufPrint(
+            &buf,
+            "\r\n[WispTerm] Terminal IO failed during {s}: {s}\r\n",
+            .{ @tagName(failure.operation), @errorName(failure.error_code) },
+        ) catch return,
+        .exited => |info| exited: {
+            if (info.status) |status| switch (status) {
+                .exited => |code| break :exited std.fmt.bufPrint(
+                    &buf,
+                    "\r\n[WispTerm] Process exited with code {d}.\r\n",
+                    .{code},
+                ) catch return,
+                .unknown => {},
+            };
+            break :exited std.fmt.bufPrint(&buf, "\r\n[WispTerm] Process exited.\r\n", .{}) catch return;
+        },
+        else => return,
+    };
+
+    self.terminal.printString(message) catch |err| {
+        io_log.warn("failed to paint io status err={s}", .{@errorName(err)});
+        return;
+    };
+    self.clearSynchronizedOutputLocked();
+}
+
 // ============================================================================
 // Size and Resize
 // ============================================================================
@@ -759,6 +956,8 @@ pub fn setScreenSizeWithPolicy(
         // Terminal rows/cols and pixel dimensions are updated together in
         // the IO thread, under the render-state lock.
         const grid: renderer.size.GridSize = .{ .cols = new_cols, .rows = new_rows };
+        // queueIo stores the resize on the mailbox's infallible control lane;
+        // a grid change always triggers a UI rebuild regardless of IO state.
         switch (resize_policy) {
             .coalesced => self.queueIo(.{ .resize = grid }),
             .immediate => self.queueIo(.{ .resize_immediate = grid }),
@@ -775,47 +974,72 @@ const MAILBOX_FULL_RETRIES = 64;
 
 const mailbox_log = std.log.scoped(.mailbox);
 
-/// Send a message to the IO writer thread via the mailbox.
-///
-/// On a full ring, control messages (resize) are accepted by the mailbox via
-/// last-writer-wins/drop-oldest. A WRITE message instead reports `.full` and is
-/// NOT enqueued, so we notify the writer thread and retry a bounded number of
-/// times, yielding between attempts to let it drain. If it is still full after
-/// the bound we log a visible warning rather than silently dropping input.
+/// Failure modes of queuePtyWrite. A caller MUST handle these — there is no
+/// silent-drop path. A fire-and-forget caller may `catch |e| log...` but the
+/// outcome is always surfaced.
+pub const QueueWriteError = error{
+    /// The owning surface is no longer accepting input (stopping/exited/failed);
+    /// the PTY process is gone and the IO writer thread is tearing down.
+    SurfaceExited,
+    /// The payload ring stayed full across the bounded notify+retry window;
+    /// the write was NOT delivered and NOT dropped behind the caller's back.
+    BackpressureTimeout,
+    /// Allocating the heap copy for a large write failed.
+    OutOfMemory,
+};
+
+/// Queue a resize (control-lane) message to the IO writer thread. Infallible:
+/// resize uses the mailbox's last-writer-wins control fields, which never
+/// occupy a payload slot and can never report `.full`. Writes must NOT go
+/// through here — use queuePtyWrite, which surfaces backpressure.
 pub fn queueIo(self: *Surface, msg: termio.Message) void {
-    var attempt: usize = 0;
-    while (true) {
-        switch (self.mailbox.send(msg)) {
-            .queued, .coalesced => {
-                self.mailbox.notify();
-                return;
-            },
-            .full => {
-                // Wake the writer so it drains, then yield and retry. The mutex
-                // is released between attempts (send() locks per call), so the
-                // writer's pop() can make progress.
-                self.mailbox.notify();
-                attempt += 1;
-                if (attempt >= MAILBOX_FULL_RETRIES) {
-                    mailbox_log.warn(
-                        "mailbox full after {d} retries; dropping write message to avoid stall",
-                        .{MAILBOX_FULL_RETRIES},
-                    );
-                    msg.deinit();
-                    return;
-                }
-                std.Thread.yield() catch {};
-            },
-        }
+    switch (msg) {
+        .resize => |grid| self.mailbox.setResize(grid),
+        .resize_immediate => |grid| self.mailbox.setImmediateResize(grid),
+        .write_small, .write_alloc => unreachable, // use queuePtyWrite
     }
+    self.mailbox.notify();
 }
 
 /// Queue bytes to the PTY input pipe through the IO writer thread.
 /// This mirrors Ghostty's write-message boundary so local and remote input
 /// share the same PTY write path instead of writing directly to the pipe.
-pub fn queuePtyWrite(self: *Surface, data: []const u8) void {
-    const msg = termio.Message.writeReq(self.allocator, data) catch return;
-    self.queueIo(msg);
+///
+/// On a full payload ring we notify the writer and retry a bounded number of
+/// times, yielding between attempts to let it drain (the mutex is released
+/// between attempts). If it is still full after the bound we RETURN
+/// `error.BackpressureTimeout` rather than discarding the bytes and pretending
+/// success — the caller decides how loud to be. We NEVER use msg.deinit() to
+/// implicitly mean "delivered".
+pub fn queuePtyWrite(self: *Surface, data: []const u8) QueueWriteError!void {
+    if (!self.acceptsInput()) return error.SurfaceExited;
+
+    const msg = termio.Message.writeReq(self.allocator, data) catch
+        return error.OutOfMemory;
+
+    var attempt: usize = 0;
+    while (true) {
+        switch (self.mailbox.sendWrite(msg)) {
+            .queued => {
+                self.mailbox.notify();
+                return;
+            },
+            .full => {
+                // Wake the writer so it drains, then yield and retry. The mutex
+                // is released between attempts (sendWrite locks per call), so
+                // the writer's popWrite() can make progress.
+                self.mailbox.notify();
+                attempt += 1;
+                if (attempt >= MAILBOX_FULL_RETRIES) {
+                    // The bytes were never enqueued; free our copy and report
+                    // the backpressure instead of silently dropping input.
+                    msg.deinit();
+                    return error.BackpressureTimeout;
+                }
+                std.Thread.yield() catch {};
+            },
+        }
+    }
 }
 
 pub fn attachRemoteClient(self: *Surface, client: ?*remote.Client) void {
@@ -827,7 +1051,10 @@ pub fn attachRemoteClient(self: *Surface, client: ?*remote.Client) void {
 
 fn remoteWrite(ctx: *anyopaque, data: []const u8) void {
     const surface: *Surface = @ptrCast(@alignCast(ctx));
-    surface.queuePtyWrite(data);
+    surface.queuePtyWrite(data) catch |err| mailbox_log.warn(
+        "dropped remote write ({d} bytes): {s}",
+        .{ data.len, @errorName(err) },
+    );
 }
 
 /// Get the padding for rendering. Returns the computed padding
@@ -1451,6 +1678,9 @@ fn vtResponseHarness(surface: *Surface) !void {
     });
     surface.mailbox = try termio.Mailbox.init();
     surface.vt_stream = surface.initVtStream();
+    surface.io_state_mutex = .{};
+    surface.io_state = .running;
+    surface.exited = std.atomic.Value(bool).init(false);
 }
 
 fn vtResponseHarnessDeinit(surface: *Surface) void {
@@ -1462,7 +1692,7 @@ fn vtResponseHarnessDeinit(surface: *Surface) void {
 fn expectPtyResponse(surface: *Surface, expected: []const u8) !void {
     // The popped message owns the bytes; assert while it is still in scope so
     // the slice into write_small.data stays valid.
-    const msg = surface.mailbox.pop() orelse return error.NoPtyResponse;
+    const msg = surface.mailbox.popWrite() orelse return error.NoPtyResponse;
     switch (msg) {
         .write_small => |*w| try std.testing.expectEqualStrings(expected, w.data[0..w.len]),
         else => return error.UnexpectedMessage,
@@ -1484,4 +1714,138 @@ test "kitty keyboard query is answered back to the PTY (issue #302)" {
     surface.vt_stream.nextSlice("\x1b[>1u");
     surface.vt_stream.nextSlice("\x1b[?u");
     try expectPtyResponse(&surface, "\x1b[?1u");
+}
+
+// queuePtyWrite needs surface.allocator, surface.mailbox, and the IO lifecycle
+// state (acceptsInput gates writes), so a tiny harness is enough to exercise its
+// outcome contract. io_state must be .running for writes to be accepted.
+fn writeOutcomeHarness(surface: *Surface) !void {
+    surface.allocator = std.testing.allocator;
+    surface.mailbox = try termio.Mailbox.init();
+    surface.exited = std.atomic.Value(bool).init(false);
+    surface.io_state_mutex = .{};
+    surface.io_state = .running;
+}
+
+fn writeOutcomeHarnessDeinit(surface: *Surface) void {
+    surface.mailbox.deinit();
+}
+
+test "queuePtyWrite returns SurfaceExited when the surface stops accepting input" {
+    var surface: Surface = undefined;
+    try writeOutcomeHarness(&surface);
+    defer writeOutcomeHarnessDeinit(&surface);
+
+    surface.io_state = .stopped; // acceptsInput() is true only while .running
+    try std.testing.expectError(error.SurfaceExited, surface.queuePtyWrite("hello"));
+}
+
+test "queuePtyWrite returns BackpressureTimeout when the payload ring stays full" {
+    var surface: Surface = undefined;
+    try writeOutcomeHarness(&surface);
+    defer writeOutcomeHarnessDeinit(&surface);
+
+    // Saturate the payload ring directly so every queuePtyWrite retry sees a
+    // full ring (no writer thread is draining it in this harness).
+    while (true) {
+        var small: termio.Message.WriteSmall = .{ .len = 1 };
+        small.data[0] = 'x';
+        if (surface.mailbox.sendWrite(.{ .write_small = small }) == .full) break;
+    }
+
+    // The write is neither delivered nor silently dropped — it is reported.
+    try std.testing.expectError(error.BackpressureTimeout, surface.queuePtyWrite("y"));
+
+    // The original queued writes are untouched: the full ring evicted nothing.
+    var drained: usize = 0;
+    while (surface.mailbox.popWrite()) |msg| {
+        msg.deinit();
+        drained += 1;
+    }
+    try std.testing.expect(drained > 0);
+}
+
+test "queuePtyWrite enqueues a write onto the payload ring on success" {
+    var surface: Surface = undefined;
+    try writeOutcomeHarness(&surface);
+    defer writeOutcomeHarnessDeinit(&surface);
+
+    try surface.queuePtyWrite("ok");
+
+    const msg = surface.mailbox.popWrite() orelse return error.MissingMessage;
+    defer msg.deinit();
+    switch (msg) {
+        .write_small => |*w| try std.testing.expectEqualStrings("ok", w.data[0..w.len]),
+        else => return error.UnexpectedMessage,
+    }
+}
+
+fn ioStateHarness(surface: *Surface) !void {
+    surface.allocator = std.testing.allocator;
+    surface.terminal = try ghostty_vt.Terminal.init(std.testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    surface.render_state = renderer.State.init(&surface.terminal);
+    surface.surface_renderer = Renderer.init(surface);
+    surface.io_state_mutex = .{};
+    surface.io_state = .running;
+    surface.exited = std.atomic.Value(bool).init(false);
+    surface.dirty = std.atomic.Value(bool).init(false);
+    surface.io_thread_state = null;
+    surface.io_writer_thread = null;
+    surface.io_reader_thread = null;
+}
+
+fn ioStateHarnessDeinit(surface: *Surface) void {
+    surface.surface_renderer.deinit();
+    surface.terminal.deinit(std.testing.allocator);
+}
+
+test "Surface failIo records first failure, wakes rendering, and blocks input" {
+    var surface: Surface = undefined;
+    try ioStateHarness(&surface);
+    defer ioStateHarnessDeinit(&surface);
+
+    try std.testing.expect(surface.acceptsInput());
+
+    surface.failIo(.pty_write, error.BrokenPipe);
+    try std.testing.expect(!surface.acceptsInput());
+    try std.testing.expect(surface.exited.load(.acquire));
+    try std.testing.expect(surface.dirty.load(.acquire));
+
+    switch (surface.currentIoState()) {
+        .failed => |failure| {
+            try std.testing.expectEqual(Operation.pty_write, failure.operation);
+            try std.testing.expectEqual(error.BrokenPipe, failure.error_code);
+        },
+        else => return error.ExpectedFailedState,
+    }
+
+    surface.failIo(.pty_resize, error.ResizeFailed);
+    switch (surface.currentIoState()) {
+        .failed => |failure| {
+            try std.testing.expectEqual(Operation.pty_write, failure.operation);
+            try std.testing.expectEqual(error.BrokenPipe, failure.error_code);
+        },
+        else => return error.ExpectedFailedState,
+    }
+}
+
+test "Surface markExited preserves a normal exit as non-failure and blocks input" {
+    var surface: Surface = undefined;
+    try ioStateHarness(&surface);
+    defer ioStateHarnessDeinit(&surface);
+
+    surface.markExited(.eof, .{ .exited = 0 });
+
+    try std.testing.expect(!surface.acceptsInput());
+    try std.testing.expect(surface.exited.load(.acquire));
+    switch (surface.currentIoState()) {
+        .exited => |info| {
+            try std.testing.expectEqual(ExitReason.eof, info.reason);
+            try std.testing.expectEqual(@as(?Command.Exit, .{ .exited = 0 }), info.status);
+        },
+        else => return error.ExpectedExitedState,
+    }
 }

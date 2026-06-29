@@ -5,13 +5,13 @@ const AppWindow = @import("../AppWindow.zig");
 const file_explorer = AppWindow.file_explorer;
 const browser_panel = AppWindow.browser_panel;
 const overlays = AppWindow.overlays;
-const scp = @import("../scp.zig");
+const scp = @import("../ssh/scp.zig");
 const platform_clipboard = @import("../platform/clipboard.zig");
 const platform_remote_file = @import("../platform/remote_file.zig");
 const Surface = @import("../Surface.zig");
 const selection_unit = @import("../selection_unit.zig");
 const file_drop_path = @import("file_drop_path.zig");
-const ai_chat_composer_layout = @import("../ai_chat_composer_layout.zig");
+const ai_chat_composer_layout = @import("../assistant/conversation/composer_layout.zig");
 
 fn isPasteStripByte(byte: u8) bool {
     return switch (byte) {
@@ -54,9 +54,19 @@ fn mutatePasteData(data: []u8, bracketed: bool) void {
     }
 }
 
+const pty_write_log = std.log.scoped(.pty_write);
+
 /// Write data to the PTY's input pipe (us -> child stdin).
+///
+/// This is the keyboard/paste input boundary, so it is intentionally
+/// fire-and-forget: there is no caller positioned to recover from backpressure.
+/// queuePtyWrite still surfaces its outcome — on failure we log a visible
+/// warning instead of silently swallowing input.
 pub fn writeToPty(surface: *Surface, data: []const u8) void {
-    surface.queuePtyWrite(data);
+    surface.queuePtyWrite(data) catch |err| pty_write_log.warn(
+        "dropped {d} bytes of input: {s}",
+        .{ data.len, @errorName(err) },
+    );
 }
 
 pub fn writePasteToPty(surface: *Surface, allocator: std.mem.Allocator, data: []const u8) void {

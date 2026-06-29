@@ -4,7 +4,7 @@
 const build_options = @import("build_options");
 const std = @import("std");
 const app_metadata = @import("app_metadata.zig");
-const command_center_state = @import("command_center_state.zig");
+const command_center_state = @import("command/center_state.zig");
 const keybind = @import("keybind.zig");
 const command_dispatch = @import("input/command_dispatch.zig");
 
@@ -122,7 +122,7 @@ comptime {
         @compileError("ssh_hosts profile schema must only add server auth fields; port forwarding must not extend it");
     }
 
-    const ssh_tunnel_source = @embedFile("ssh_tunnel.zig");
+    const ssh_tunnel_source = @embedFile("ssh/tunnel.zig");
     if (std.mem.indexOf(u8, ssh_tunnel_source, "\"-L\"") == null or
         std.mem.indexOf(u8, ssh_tunnel_source, "\"-R\"") != null)
     {
@@ -144,6 +144,20 @@ comptime {
         {
             @compileError("shared PTY/termio code must describe platform-neutral PTY behavior");
         }
+    }
+
+    const termio_thread_source = @embedFile("termio/Thread.zig");
+    if (std.mem.indexOf(u8, termio_thread_source, "self.loop.run(.until_done) catch {};") != null or
+        std.mem.indexOf(u8, termio_thread_source, "surface.pty.writeInput(data) catch {};") != null or
+        std.mem.indexOf(u8, termio_thread_source, "surface.pty.setSize(.{ .ws_col = grid.cols, .ws_row = grid.rows }) catch {};") != null or
+        std.mem.indexOf(u8, termio_thread_source, "surface.terminal.resize(surface.allocator, grid.cols, grid.rows) catch {};") != null)
+    {
+        @compileError("termio Thread IO errors must route through Surface.failIo instead of catch {}");
+    }
+
+    const termio_read_source = @embedFile("termio/ReadThread.zig");
+    if (std.mem.indexOf(u8, termio_read_source, "surface.exited.store(true, .release);") != null) {
+        @compileError("ReadThread exits must route through Surface IoState helpers so UI wakeups and reasons stay consistent");
     }
 
     const update_check_source = @embedFile("update_check.zig");
@@ -407,12 +421,12 @@ comptime {
         @compileError("platform/process.zig must expose local-shell fallback argv as one narrow API instead of public shell variant plumbing");
     }
 
-    const browser_panel_source = @embedFile("browser_panel.zig");
+    const browser_panel_source = @embedFile("browser/panel.zig");
     if (std.mem.indexOf(u8, browser_panel_source, "[MAX_URL_BYTES]u16") != null or
         std.mem.indexOf(u8, browser_panel_source, "urlToWide") != null or
         std.mem.indexOf(u8, browser_panel_source, "utf8ToUtf16Le") != null)
     {
-        @compileError("browser_panel.zig must use platform_webview URL helpers instead of WebView2 UTF-16 details");
+        @compileError("browser/panel.zig must use platform_webview URL helpers instead of WebView2 UTF-16 details");
     }
     const open_url_source = @embedFile("platform/open_url.zig");
     if (std.mem.indexOf(u8, open_url_source, "ShellExecute") != null or
@@ -529,129 +543,165 @@ comptime {
         @compileError("renderer/overlays.zig must use platform-local shell launcher names instead of PowerShell-specific shared identifiers");
     }
 
-    const command_center_source = @embedFile("command_center_state.zig");
+    const command_center_source = @embedFile("command/center_state.zig");
     if (std.mem.indexOf(u8, command_center_source, "Choose PowerShell") != null or
         std.mem.indexOf(u8, command_center_source, "WSL") != null or
         std.mem.indexOf(u8, command_center_source, "SESSION_LAUNCHER_ROW_AI_AGENT: usize = 3") != null)
     {
-        @compileError("command_center_state.zig must get session launcher labels and rows from platform/pty_command.zig");
+        @compileError("command/center_state.zig must get session launcher labels and rows from platform/pty_command.zig");
     }
 
-    const ai_chat_source = @embedFile("ai_chat.zig");
-    const ai_chat_request_source = @embedFile("ai_chat_request.zig");
-    const ai_chat_tools_source = @embedFile("ai_chat_tools.zig");
+    const ai_chat_source = @embedFile("assistant/conversation/session.zig");
+    const ai_chat_request_source = @embedFile("assistant/conversation/request.zig");
+    const agent_tools_source = @embedFile("agent_tools/mod.zig");
+    const agent_tools_exec_source = @embedFile("agent_tools/exec.zig");
     if (std.mem.indexOf(u8, ai_chat_source, "toolSchema(\"powershell_exec\"") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "toolSchema(\"powershell_exec\"") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "toolSchema(\"powershell_exec\"") != null or
+        std.mem.indexOf(u8, agent_tools_source, "toolSchema(\"powershell_exec\"") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "toolSchema(\"powershell_exec\"") != null or
         std.mem.indexOf(u8, ai_chat_source, "toolSchema(\"wsl_session_exec\"") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "toolSchema(\"wsl_session_exec\"") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "toolSchema(\"wsl_session_exec\"") != null or
+        std.mem.indexOf(u8, agent_tools_source, "toolSchema(\"wsl_session_exec\"") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "toolSchema(\"wsl_session_exec\"") != null or
         std.mem.indexOf(u8, ai_chat_source, "std.mem.eql(u8, call.name, \"powershell_exec\")") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "std.mem.eql(u8, call.name, \"powershell_exec\")") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "std.mem.eql(u8, call.name, \"powershell_exec\")") != null or
+        std.mem.indexOf(u8, agent_tools_source, "std.mem.eql(u8, call.name, \"powershell_exec\")") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "std.mem.eql(u8, call.name, \"powershell_exec\")") != null or
         std.mem.indexOf(u8, ai_chat_source, "requestApproval(\"powershell_exec\"") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "requestApproval(\"powershell_exec\"") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "requestApproval(\"powershell_exec\"") != null or
+        std.mem.indexOf(u8, agent_tools_source, "requestApproval(\"powershell_exec\"") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "requestApproval(\"powershell_exec\"") != null or
         std.mem.indexOf(u8, ai_chat_source, "powershellExecTool") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "powershellExecTool") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "powershellExecTool") != null or
+        std.mem.indexOf(u8, agent_tools_source, "powershellExecTool") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "powershellExecTool") != null or
         std.mem.indexOf(u8, ai_chat_source, "@embedFile(\"prompt.md\")") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "@embedFile(\"prompt.md\")") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "@embedFile(\"prompt.md\")") != null or
+        std.mem.indexOf(u8, agent_tools_source, "@embedFile(\"prompt.md\")") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "@embedFile(\"prompt.md\")") != null or
         std.mem.indexOf(u8, ai_chat_source, "defaultSystemPromptForOs(.windows)") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "defaultSystemPromptForOs(.windows)") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "defaultSystemPromptForOs(.windows)") != null or
+        std.mem.indexOf(u8, agent_tools_source, "defaultSystemPromptForOs(.windows)") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "defaultSystemPromptForOs(.windows)") != null or
         std.mem.indexOf(u8, ai_chat_source, "tabNewToolPropertiesJsonForOs(.windows)") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "tabNewToolPropertiesJsonForOs(.windows)") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "tabNewToolPropertiesJsonForOs(.windows)") != null or
+        std.mem.indexOf(u8, agent_tools_source, "tabNewToolPropertiesJsonForOs(.windows)") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "tabNewToolPropertiesJsonForOs(.windows)") != null or
         std.mem.indexOf(u8, ai_chat_source, "tabKindUsageForOs(.windows)") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "tabKindUsageForOs(.windows)") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "tabKindUsageForOs(.windows)") != null or
+        std.mem.indexOf(u8, agent_tools_source, "tabKindUsageForOs(.windows)") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "tabKindUsageForOs(.windows)") != null or
         std.mem.indexOf(u8, ai_chat_source, ".windows_create_process") != null or
         std.mem.indexOf(u8, ai_chat_request_source, ".windows_create_process") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, ".windows_create_process") != null or
+        std.mem.indexOf(u8, agent_tools_source, ".windows_create_process") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, ".windows_create_process") != null or
         std.mem.indexOf(u8, ai_chat_source, "Use kind=default, powershell, pwsh, cmd, wsl, or command") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "Use kind=default, powershell, pwsh, cmd, wsl, or command") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "Use kind=default, powershell, pwsh, cmd, wsl, or command") != null or
+        std.mem.indexOf(u8, agent_tools_source, "Use kind=default, powershell, pwsh, cmd, wsl, or command") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "Use kind=default, powershell, pwsh, cmd, wsl, or command") != null or
         std.mem.indexOf(u8, ai_chat_source, "Optional explicit Windows command line") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "Optional explicit Windows command line") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "Optional explicit Windows command line") != null or
+        std.mem.indexOf(u8, agent_tools_source, "Optional explicit Windows command line") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "Optional explicit Windows command line") != null or
         std.mem.indexOf(u8, ai_chat_source, "Use default, powershell, pwsh, cmd, wsl, or command") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "Use default, powershell, pwsh, cmd, wsl, or command") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "Use default, powershell, pwsh, cmd, wsl, or command") != null)
+        std.mem.indexOf(u8, agent_tools_source, "Use default, powershell, pwsh, cmd, wsl, or command") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "Use default, powershell, pwsh, cmd, wsl, or command") != null)
     {
-        @compileError("ai_chat.zig must get local command tool names, labels, default prompts, and tab kind text from platform modules");
+        @compileError("assistant/conversation/session.zig must get local command tool names, labels, default prompts, and tab kind text from platform modules");
     }
     if (std.mem.indexOf(u8, ai_chat_source, "localShellFallback(") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "localShellFallback(") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "localShellFallback(") != null or
+        std.mem.indexOf(u8, agent_tools_source, "localShellFallback(") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "localShellFallback(") != null or
         std.mem.indexOf(u8, ai_chat_source, "localShellCommandArgv(") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "localShellCommandArgv(") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "localShellCommandArgv(") != null)
+        std.mem.indexOf(u8, agent_tools_source, "localShellCommandArgv(") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "localShellCommandArgv(") != null)
     {
-        @compileError("ai_chat.zig must ask platform/process.zig for fallback argv without handling shell variants directly");
+        @compileError("assistant/conversation/session.zig must ask platform/process.zig for fallback argv without handling shell variants directly");
     }
     if (std.mem.indexOf(u8, ai_chat_source, ".title = try allocator.dupe(u8, \"PowerShell\")") != null or
         std.mem.indexOf(u8, ai_chat_request_source, ".title = try allocator.dupe(u8, \"PowerShell\")") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, ".title = try allocator.dupe(u8, \"PowerShell\")") != null or
+        std.mem.indexOf(u8, agent_tools_source, ".title = try allocator.dupe(u8, \"PowerShell\")") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, ".title = try allocator.dupe(u8, \"PowerShell\")") != null or
         std.mem.indexOf(u8, ai_chat_source, ".cwd = try allocator.dupe(u8, \"C:\\\\Users\")") != null or
         std.mem.indexOf(u8, ai_chat_request_source, ".cwd = try allocator.dupe(u8, \"C:\\\\Users\")") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, ".cwd = try allocator.dupe(u8, \"C:\\\\Users\")") != null or
+        std.mem.indexOf(u8, agent_tools_source, ".cwd = try allocator.dupe(u8, \"C:\\\\Users\")") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, ".cwd = try allocator.dupe(u8, \"C:\\\\Users\")") != null or
         std.mem.indexOf(u8, ai_chat_source, ".snapshot = try allocator.dupe(u8, \"PS C:\\\\Users>\")") != null or
         std.mem.indexOf(u8, ai_chat_request_source, ".snapshot = try allocator.dupe(u8, \"PS C:\\\\Users>\")") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, ".snapshot = try allocator.dupe(u8, \"PS C:\\\\Users>\")") != null or
+        std.mem.indexOf(u8, agent_tools_source, ".snapshot = try allocator.dupe(u8, \"PS C:\\\\Users>\")") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, ".snapshot = try allocator.dupe(u8, \"PS C:\\\\Users>\")") != null or
         std.mem.indexOf(u8, ai_chat_source, ".tool_name = try allocator.dupe(u8, \"powershell_exec\")") != null or
         std.mem.indexOf(u8, ai_chat_request_source, ".tool_name = try allocator.dupe(u8, \"powershell_exec\")") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, ".tool_name = try allocator.dupe(u8, \"powershell_exec\")") != null or
+        std.mem.indexOf(u8, agent_tools_source, ".tool_name = try allocator.dupe(u8, \"powershell_exec\")") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, ".tool_name = try allocator.dupe(u8, \"powershell_exec\")") != null or
         std.mem.indexOf(u8, ai_chat_source, "running powershell_exec") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "running powershell_exec") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "running powershell_exec") != null or
+        std.mem.indexOf(u8, agent_tools_source, "running powershell_exec") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "running powershell_exec") != null or
         std.mem.indexOf(u8, ai_chat_source, "Get-ChildItem") != null or
         std.mem.indexOf(u8, ai_chat_request_source, "Get-ChildItem") != null or
-        std.mem.indexOf(u8, ai_chat_tools_source, "Get-ChildItem") != null)
+        std.mem.indexOf(u8, agent_tools_source, "Get-ChildItem") != null or
+        std.mem.indexOf(u8, agent_tools_exec_source, "Get-ChildItem") != null)
     {
-        @compileError("ai_chat.zig shared tests must use platform-neutral terminal fixtures unless explicitly testing platform prompt variants");
+        @compileError("assistant/conversation/session.zig shared tests must use platform-neutral terminal fixtures unless explicitly testing platform prompt variants");
     }
 
-    const agent_detector_source = @embedFile("agent_detector.zig");
+    const agent_detector_source = @embedFile("terminal_agents/detector.zig");
     if (std.mem.indexOf(u8, agent_detector_source, "detect(\"PowerShell\", \"PS C:\\\\Users> ls\")") != null) {
-        @compileError("agent_detector.zig generic shell tests must use platform-neutral terminal fixtures");
+        @compileError("terminal_agents/detector.zig generic shell tests must use platform-neutral terminal fixtures");
     }
 }
 
 comptime {
-    _ = @import("ai_chat.zig");
-    _ = @import("ai_chat_request.zig");
-    _ = @import("ai_model_switch.zig");
-    _ = @import("ai_chat_tools.zig");
-    _ = @import("ai_chat_skills.zig");
-    _ = @import("ai_chat_types.zig");
-    _ = @import("ai_agent_access.zig");
-    _ = @import("ai_chat_protocol.zig");
-    _ = @import("ai_chat_markdown.zig");
-    _ = @import("agent_history.zig");
-    _ = @import("ai_chat_composer_layout.zig");
-    _ = @import("ai_chat_input_text.zig");
-    _ = @import("ai_chat_composer.zig");
-    _ = @import("ai_loop_schedule.zig");
-    _ = @import("ai_loop_store.zig");
-    _ = @import("ai_history_types.zig");
-    _ = @import("ai_history_provider_codex.zig");
-    _ = @import("ai_history_provider_claude.zig");
-    _ = @import("ai_history_provider_reasonix.zig");
-    _ = @import("ai_history_source.zig");
-    _ = @import("ai_history_cache.zig");
-    _ = @import("ai_history_resume.zig");
-    _ = @import("ai_history_session.zig");
-    _ = @import("renderer/ai_history_renderer.zig");
-    _ = @import("agent_detector.zig");
+    _ = @import("assistant/conversation/session.zig");
+    _ = @import("assistant/conversation/request.zig");
+    _ = @import("assistant/conversation/model_switch.zig");
+    _ = @import("agent_tools/mod.zig");
+    _ = @import("assistant/conversation/skills.zig");
+    _ = @import("assistant/conversation/types.zig");
+    _ = @import("agent/access.zig");
+    _ = @import("assistant/conversation/protocol.zig");
+    _ = @import("assistant/conversation/markdown.zig");
+    _ = @import("agent/history.zig");
+    _ = @import("assistant/conversation/composer_layout.zig");
+    _ = @import("assistant/conversation/input_text.zig");
+    _ = @import("assistant/conversation/composer.zig");
+    _ = @import("assistant/conversation/presentation.zig");
+    _ = @import("assistant/loop/schedule.zig");
+    _ = @import("assistant/loop/store.zig");
+    _ = @import("terminal_agents/sessions/types.zig");
+    _ = @import("terminal_agents/sessions/provider_codex.zig");
+    _ = @import("terminal_agents/sessions/provider_claude.zig");
+    _ = @import("terminal_agents/sessions/provider_reasonix.zig");
+    _ = @import("terminal_agents/sessions/source.zig");
+    _ = @import("terminal_agents/sessions/cache.zig");
+    _ = @import("terminal_agents/sessions/resume.zig");
+    _ = @import("terminal_agents/sessions/session.zig");
+    _ = @import("renderer/terminal_agents/sessions.zig");
+    _ = @import("terminal_agents/detector.zig");
     _ = @import("Surface.zig");
     _ = @import("termio/Mailbox.zig");
-    _ = @import("agent_prompt_answer.zig");
+    _ = @import("terminal_agents/prompt_answer.zig");
     _ = @import("App.zig");
     _ = @import("AppWindow.zig");
+    _ = @import("agent_tools/args.zig");
+    _ = @import("agent_tools/mod.zig");
+    _ = @import("agent_tools/research.zig");
+    _ = @import("agent_tools/knowledge.zig");
+    _ = @import("agent_tools/memory.zig");
+    _ = @import("agent_tools/output.zig");
+    _ = @import("agent_tools/terminal.zig");
+    _ = @import("agent_tools/sessions.zig");
+    _ = @import("agent_tools/access.zig");
+    _ = @import("agent_tools/files.zig");
+    _ = @import("agent_tools/exec.zig");
+    _ = @import("agent_tools/dynamic.zig");
+    _ = @import("agent_tools/weixin.zig");
     _ = @import("surface_registry.zig");
-    _ = @import("png_dimensions.zig");
+    _ = @import("preview/png_dimensions.zig");
     _ = @import("appwindow/flush_scheduler.zig");
     _ = @import("appwindow/window_state.zig");
     _ = @import("appwindow/remote_state.zig");
@@ -659,20 +709,21 @@ comptime {
     _ = @import("appwindow/split_layout.zig");
     _ = @import("appwindow/tab.zig");
     _ = @import("appwindow/thread_message.zig");
-    _ = @import("scp.zig");
+    _ = @import("ssh/scp.zig");
     _ = @import("diag_log.zig");
-    _ = if (build_options.webview) @import("browser_panel.zig") else @import("browser_panel_stub.zig");
-    _ = @import("browser_url.zig");
+    _ = if (build_options.webview) @import("browser/panel.zig") else @import("browser/panel_stub.zig");
+    _ = @import("browser/url.zig");
     _ = @import("build_guards.zig");
-    _ = @import("command_center_state.zig");
-    _ = @import("command_palette_model.zig");
-    _ = @import("openssh_config_import.zig");
+    _ = @import("command/center_state.zig");
+    _ = @import("command/palette_model.zig");
+    _ = @import("ssh/openssh_config_import.zig");
     _ = @import("config.zig");
     _ = @import("i18n.zig");
     _ = @import("config_watcher.zig");
     _ = @import("file_backend.zig");
     _ = @import("file_explorer.zig");
-    _ = @import("first_party_tools.zig");
+    _ = @import("research/commands.zig");
+    _ = @import("tools/first_party.zig");
     _ = @import("input.zig");
     _ = @import("input/clipboard.zig");
     _ = @import("clipboard_osc52.zig");
@@ -684,7 +735,7 @@ comptime {
     _ = @import("input/preview_source.zig");
     _ = @import("input/preview_image_drag.zig");
     _ = @import("input_shortcuts.zig");
-    _ = @import("html_server.zig");
+    _ = @import("html/server.zig");
     _ = @import("keybind.zig");
     _ = @import("kitty_graphics_unit.zig");
     _ = @import("renderer/cell_update_unit.zig");
@@ -692,7 +743,7 @@ comptime {
     _ = @import("input/underline_span.zig");
     _ = @import("surface_output_unit.zig");
     _ = @import("link_open.zig");
-    _ = @import("markdown_preview.zig");
+    _ = @import("preview/markdown.zig");
     _ = @import("markdown_text.zig");
     _ = @import("memory_debug.zig");
     _ = @import("wispterm_docs.zig");
@@ -748,7 +799,7 @@ comptime {
     _ = @import("platform/window_backend.zig");
     _ = @import("platform/window_state.zig");
     _ = @import("platform/wsl.zig");
-    _ = @import("preview_token.zig");
+    _ = @import("preview/token.zig");
     _ = @import("quick_terminal.zig");
     _ = @import("remote_client.zig");
     _ = @import("remote_snapshot.zig");
@@ -775,35 +826,35 @@ comptime {
     _ = @import("renderer/overlays/command_palette_layout.zig");
     _ = @import("renderer/overlays/settings_page.zig");
     _ = @import("renderer/overlays/ssh_profiles.zig");
-    _ = @import("renderer/overlays/ai_profiles.zig");
+    _ = @import("renderer/overlays/assistant_profiles.zig");
     _ = @import("renderer/overlays/session_launcher.zig");
     _ = @import("renderer/overlays/state.zig");
     _ = @import("renderer/overlays/toasts.zig");
     _ = @import("selection_unit.zig");
     _ = @import("session_persist.zig");
-    _ = @import("agent_memory.zig");
-    _ = @import("skill_registry.zig");
-    _ = @import("skill_scan.zig");
-    _ = @import("skill_install.zig");
-    _ = @import("skill_local_fs.zig");
-    _ = @import("skill_center.zig");
+    _ = @import("agent/memory.zig");
+    _ = @import("skill/registry.zig");
+    _ = @import("skill/scan.zig");
+    _ = @import("skill/install.zig");
+    _ = @import("skill/local_fs.zig");
+    _ = @import("skill/center.zig");
     _ = @import("renderer/skill_center_renderer.zig");
-    _ = @import("port_forward_rule.zig");
-    _ = @import("ssh_profile_store.zig");
-    _ = @import("port_forward_manager.zig");
-    _ = @import("port_forwarding.zig");
+    _ = @import("port_forward/rule.zig");
+    _ = @import("ssh/profile_store.zig");
+    _ = @import("port_forward/manager.zig");
+    _ = @import("port_forward/forwarding.zig");
     _ = @import("renderer/port_forwarding_renderer.zig");
-    _ = @import("command_registry.zig");
-    _ = @import("tool_registry.zig");
-    _ = @import("tool_import.zig");
-    _ = @import("tool_skill_draft.zig");
+    _ = @import("command/registry.zig");
+    _ = @import("tools/registry.zig");
+    _ = @import("tools/import.zig");
+    _ = @import("tools/skill_draft.zig");
     _ = @import("scrollbar_model.zig");
-    _ = @import("ai_chat_scrollbar_model.zig");
-    _ = @import("ssh_prompt.zig");
-    _ = @import("ssh_tunnel.zig");
+    _ = @import("assistant/conversation/scrollbar_model.zig");
+    _ = @import("ssh/prompt.zig");
+    _ = @import("ssh/tunnel.zig");
     _ = @import("startup_tabs.zig");
     _ = @import("split_tree.zig");
-    _ = @import("preview_pane.zig");
+    _ = @import("preview/pane.zig");
     _ = @import("renderer/markdown_preview_renderer.zig");
     _ = @import("ui_perf.zig");
     _ = @import("update_check.zig");
@@ -811,7 +862,7 @@ comptime {
 }
 
 test "app version metadata is exposed for CLI and command center" {
-    const expected_version = "1.29.0";
+    const expected_version = "1.31.0";
     try std.testing.expectEqualStrings("WispTerm", app_metadata.name);
     try std.testing.expectEqualStrings(expected_version, app_metadata.version);
     try std.testing.expect(std.mem.indexOf(u8, app_metadata.release_notes, "# WispTerm v" ++ expected_version) != null);
@@ -884,9 +935,9 @@ test "snapshotTab records copilot_session_id for terminal tabs" {
 test "copilot load de-dups against open tabs" {
     const tab_src = @embedFile("appwindow/tab.zig");
     try std.testing.expect(std.mem.indexOf(u8, tab_src, "pub fn switchToCopilotTabBySessionId(") != null);
-    const aw_src = @embedFile("AppWindow.zig");
-    const load_idx = std.mem.indexOf(u8, aw_src, "pub fn loadCopilotConversationById(") orelse return error.Missing;
-    try std.testing.expect(std.mem.indexOf(u8, aw_src[load_idx..], "switchToCopilotTabBySessionId(") != null);
+    const sidebar_src = @embedFile("appwindow/copilot_sidebar.zig");
+    const load_idx = std.mem.indexOf(u8, sidebar_src, "pub fn loadConversationById(") orelse return error.Missing;
+    try std.testing.expect(std.mem.indexOf(u8, sidebar_src[load_idx..], "switchToCopilotTabBySessionId(") != null);
 }
 
 test "copilot picker is rendered and key-routed" {

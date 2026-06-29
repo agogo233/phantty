@@ -2,9 +2,9 @@
 
 const std = @import("std");
 const Surface = @import("../Surface.zig");
-const ai_chat = @import("../ai_chat.zig");
-const agent_detector = @import("../agent_detector.zig");
-const preview_diagnostics = @import("../preview_diagnostics.zig");
+const ai_chat = @import("../assistant/conversation/session.zig");
+const agent_detector = @import("../terminal_agents/detector.zig");
+const preview_diagnostics = @import("../preview/diagnostics.zig");
 const remote = @import("../remote_client.zig");
 const remote_snapshot = @import("../remote_snapshot.zig");
 const surface_registry = @import("../surface_registry.zig");
@@ -158,7 +158,13 @@ pub fn agentWriteSurface(ctx: *anyopaque, surface_id: []const u8, surface_ptr: *
     if (!surface_registry.acquire(surface_ptr, surface_id)) return false;
     defer surface_registry.release();
     const surface: *Surface = @ptrCast(@alignCast(surface_ptr));
-    surface.queuePtyWrite(data);
+    surface.queuePtyWrite(data) catch |err| {
+        std.log.scoped(.agent).warn(
+            "dropped agent write ({d} bytes): {s}",
+            .{ data.len, @errorName(err) },
+        );
+        return false;
+    };
     return true;
 }
 

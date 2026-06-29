@@ -5,9 +5,9 @@
 //! Supports local (std.fs), WSL, and remote SSH/SCP modes.
 
 const std = @import("std");
-const ssh_connection = @import("ssh_connection.zig");
-const agent_history = @import("agent_history.zig");
-const scp = @import("scp.zig");
+const ssh_connection = @import("ssh/connection.zig");
+const agent_history = @import("agent/history.zig");
+const scp = @import("ssh/scp.zig");
 const file_backend = @import("file_backend.zig");
 const platform_local_path = @import("platform/local_path.zig");
 const ui_perf = @import("ui_perf.zig");
@@ -47,6 +47,19 @@ pub const TerminalPanelTarget = union(enum) {
     },
     wsl: []const u8,
     local: []const u8,
+};
+
+pub const SourceSnapshot = union(enum) {
+    local,
+    wsl,
+    remote: ssh_connection.SshConnection,
+};
+
+pub const EntryView = struct {
+    index: usize,
+    name: []const u8,
+    path: []const u8,
+    is_dir: bool,
 };
 
 pub threadlocal var g_visible: bool = false;
@@ -208,6 +221,19 @@ pub fn isFocused() bool {
     return g_focused;
 }
 
+pub fn focus() void {
+    g_focused = true;
+}
+
+pub fn blur() void {
+    g_focused = false;
+}
+
+pub fn blurAndCancelOp() void {
+    blur();
+    if (hasActiveOp()) cancelOp();
+}
+
 /// Current inline-operation mode (rename / new file / new dir / confirm delete).
 pub fn opMode() OpMode {
     return g_op_mode;
@@ -231,6 +257,52 @@ pub fn isFilesPanel() bool {
 /// True when the explorer is browsing a remote (SSH) location.
 pub fn isRemoteMode() bool {
     return g_mode == .remote;
+}
+
+pub fn sourceSnapshot() ?SourceSnapshot {
+    return switch (g_mode) {
+        .local => .local,
+        .wsl => .wsl,
+        .remote => if (g_has_ssh_conn) .{ .remote = g_ssh_conn } else null,
+    };
+}
+
+pub fn entryAt(idx: usize) ?EntryView {
+    if (idx >= g_entry_count) return null;
+    return entryViewAssumeValid(idx);
+}
+
+pub fn rowIndexAtListY(relative_y: f64) ?usize {
+    if (!std.math.isFinite(relative_y) or relative_y < 0) return null;
+    const row_h: f64 = @floatCast(rowHeight());
+    if (row_h <= 0) return null;
+    const scrolled_y = relative_y + @as(f64, @floatCast(g_scroll_offset));
+    if (!std.math.isFinite(scrolled_y) or scrolled_y < 0) return null;
+    const idx: usize = @intFromFloat(scrolled_y / row_h);
+    if (idx >= g_entry_count) return null;
+    return idx;
+}
+
+pub fn selectEntry(idx: usize) ?EntryView {
+    if (idx >= g_entry_count) return null;
+    g_selected = idx;
+    return entryViewAssumeValid(idx);
+}
+
+pub fn toggleDirectoryAt(idx: usize) bool {
+    if (idx >= g_entry_count or !g_entries[idx].is_dir) return false;
+    toggleExpand(idx);
+    return true;
+}
+
+fn entryViewAssumeValid(idx: usize) EntryView {
+    const entry = &g_entries[idx];
+    return .{
+        .index = idx,
+        .name = entry.name_buf[0..entry.name_len],
+        .path = entry.path_buf[0..entry.path_len],
+        .is_dir = entry.is_dir,
+    };
 }
 
 pub fn openForActiveTab() void {
@@ -1576,6 +1648,11 @@ pub fn handleAction(act: Action) void {
                 }
             }
         },
+        .rename_selected => startRename(),
+        .refresh => refresh(),
+        .create_file => startNewFile(),
+        .create_directory => startNewDir(),
+        .delete_selected => startDelete(),
     }
 }
 

@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const control_mod = @import("control.zig");
+const transport = @import("transport.zig");
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 pub const default_rows: u32 = 1000;
@@ -92,7 +93,9 @@ pub const Server = struct {
         var chunk: [4096]u8 = undefined;
         while (buf.items.len < MAX_REQUEST_BYTES) {
             if (self.stop_flag.load(.acquire)) return; // bail promptly on shutdown
-            const n = stream.read(&chunk) catch break; // includes recv timeout (WouldBlock)
+            // posix.recv, not the deprecated Stream.read: the latter is broken on
+            // Windows overlapped sockets (ReadFile + NULL OVERLAPPED). See transport.zig.
+            const n = transport.recv(stream.handle, &chunk) catch break; // includes recv timeout (WouldBlock)
             if (n == 0) break;
             try buf.appendSlice(self.allocator, chunk[0..n]);
             if (std.mem.indexOfScalar(u8, buf.items, '\n') != null) break;
@@ -100,7 +103,7 @@ pub const Server = struct {
         const nl = std.mem.indexOfScalar(u8, buf.items, '\n') orelse buf.items.len;
         const reply = try self.dispatch(buf.items[0..nl]);
         defer self.allocator.free(reply);
-        stream.writeAll(reply) catch {};
+        transport.sendAll(stream.handle, reply) catch {};
     }
 
     /// Parse + authenticate + act. Returns an owned, newline-terminated reply.
@@ -139,6 +142,13 @@ pub const Server = struct {
                     return protocol.encodeError(self.allocator, "surface not found");
                 return protocol.encodeOk(self.allocator);
             },
+            .spawn => {
+                // Queued for the UI thread (tab creation is not thread-safe here);
+                // ok means "accepted", not "tab is already visible".
+                if (!self.control.spawn(req.cwd, req.data))
+                    return protocol.encodeError(self.allocator, "spawn queue full or unavailable");
+                return protocol.encodeOk(self.allocator);
+            },
         }
     }
 };
@@ -173,6 +183,9 @@ const t = std.testing;
 const FakeControl = struct {
     sent: std.ArrayListUnmanaged(u8) = .empty,
     ui_published: bool = true,
+    spawned_cwd: std.ArrayListUnmanaged(u8) = .empty,
+    spawned_cmd: std.ArrayListUnmanaged(u8) = .empty,
+    spawn_ok: bool = true,
     fn list_panes(ctx: *anyopaque, a: std.mem.Allocator) anyerror!?[]u8 {
         _ = ctx;
         return try a.dupe(u8, "{\"tabs\":[]}");
@@ -193,8 +206,15 @@ const FakeControl = struct {
         self.sent.appendSlice(t.allocator, data) catch return false;
         return true;
     }
+    fn spawn(ctx: *anyopaque, cwd: []const u8, command: []const u8) bool {
+        const self: *FakeControl = @ptrCast(@alignCast(ctx));
+        if (!self.spawn_ok) return false;
+        self.spawned_cwd.appendSlice(t.allocator, cwd) catch return false;
+        self.spawned_cmd.appendSlice(t.allocator, command) catch return false;
+        return true;
+    }
     fn iface(self: *FakeControl) control_mod.Control {
-        return .{ .ctx = self, .vtable = &.{ .list_panes = list_panes, .get_text = get_text, .send_text = send_text, .ui_state = ui_state } };
+        return .{ .ctx = self, .vtable = &.{ .list_panes = list_panes, .get_text = get_text, .send_text = send_text, .ui_state = ui_state, .spawn = spawn } };
     }
 };
 
@@ -250,6 +270,27 @@ test "dispatch panes / get-text / send-text happy + missing paths" {
     defer t.allocator.free(sr);
     try t.expect(std.mem.indexOf(u8, sr, "\"ok\":true") != null);
     try t.expectEqualStrings("echo hi\n", fc.sent.items);
+}
+
+test "dispatch spawn forwards cwd+command and reports queue-full" {
+    var fc = FakeControl{};
+    defer fc.sent.deinit(t.allocator);
+    defer fc.spawned_cwd.deinit(t.allocator);
+    defer fc.spawned_cmd.deinit(t.allocator);
+    var srv = fakeServer(&fc);
+
+    const s = try protocol.encodeRequest(t.allocator, .{ .token = "secret", .cmd = .spawn, .data = "claude -r abc", .cwd = "/work" });
+    defer t.allocator.free(s);
+    const sr = try srv.dispatch(s);
+    defer t.allocator.free(sr);
+    try t.expect(std.mem.indexOf(u8, sr, "\"ok\":true") != null);
+    try t.expectEqualStrings("/work", fc.spawned_cwd.items);
+    try t.expectEqualStrings("claude -r abc", fc.spawned_cmd.items);
+
+    fc.spawn_ok = false;
+    const sr2 = try srv.dispatch(s);
+    defer t.allocator.free(sr2);
+    try t.expect(std.mem.indexOf(u8, sr2, "spawn queue full") != null);
 }
 
 test "dispatch ui-state returns the published overlay JSON" {

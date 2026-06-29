@@ -25,14 +25,46 @@ test "input ssh download surfaces missing connection and helper probe failures" 
     try std.testing.expect(std.mem.indexOf(u8, input_source, "\"SSH helper unavailable\"") != null);
 }
 
+test "assistant conversation input routing owns keyboard target lookup" {
+    const routing_source = @embedFile("input/assistant_conversation.zig");
+    try std.testing.expect(std.mem.indexOf(u8, routing_source, "activeAiChat()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routing_source, "activeCopilotSessionForInput()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routing_source, ".copilot_sidebar") != null);
+
+    const input_source = @embedFile("input.zig");
+    try std.testing.expect(std.mem.indexOf(u8, input_source, "assistant_conversation.current(aiCopilotFocused())") != null);
+}
+
 test "remote file ssh helpers include short keepalive options" {
     const remote_file_source = @embedFile("platform/remote_file.zig");
     try std.testing.expect(std.mem.indexOf(u8, remote_file_source, "\"ServerAliveInterval=5\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, remote_file_source, "\"ServerAliveCountMax=2\"") != null);
 }
 
+test "remote file capture helpers use process_runner" {
+    const remote_file_source = @embedFile("platform/remote_file.zig");
+    try std.testing.expect(std.mem.indexOf(u8, remote_file_source, "process_runner.runCapture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, remote_file_source, "child_output") == null);
+}
+
+test "SSH profile persistence is owned by ssh_profile_store" {
+    const overlays_source = @embedFile("renderer/overlays.zig");
+    try std.testing.expect(std.mem.indexOf(u8, overlays_source, "ssh_profile_store.loadProfiles") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overlays_source, "ssh_profile_store.saveProfiles") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overlays_source, "fn sshProfilesPath") == null);
+    try std.testing.expect(std.mem.indexOf(u8, overlays_source, "decodeSshProfileLine") == null);
+}
+
+test "AI profile persistence is owned by assistant profile store" {
+    const overlays_source = @embedFile("renderer/overlays.zig");
+    try std.testing.expect(std.mem.indexOf(u8, overlays_source, "assistant_profile_store.loadProfiles") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overlays_source, "assistant_profile_store.saveProfiles") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overlays_source, "fn aiProfilesPath") == null);
+    try std.testing.expect(std.mem.indexOf(u8, overlays_source, "decodeAiProfileLine") == null);
+}
+
 test "ai title worker rejects API error results" {
-    const source = @embedFile("ai_chat_request.zig");
+    const source = @embedFile("assistant/conversation/request.zig");
     const start = std.mem.indexOf(u8, source, "pub fn titleThreadMain") orelse return error.MissingTitleWorker;
     const rest = source[start..];
     const end = std.mem.indexOf(u8, rest, "pub fn summaryThreadMain") orelse return error.MissingSummaryWorker;
@@ -41,7 +73,7 @@ test "ai title worker rejects API error results" {
 }
 
 test "ai title request does not use the old 64 token budget" {
-    const source = @embedFile("ai_chat.zig");
+    const source = @embedFile("assistant/conversation/session.zig");
     const start = std.mem.indexOf(u8, source, "fn buildTitleRequestLocked") orelse return error.MissingTitleRequestBuilder;
     const rest = source[start..];
     const end = std.mem.indexOf(u8, rest, "// titleThreadMain has moved") orelse return error.MissingTitleRequestEnd;
@@ -50,7 +82,7 @@ test "ai title request does not use the old 64 token budget" {
 }
 
 test "ssh browser tunnel readiness probes HTTP through the tunnel" {
-    const source = @embedFile("ssh_tunnel.zig");
+    const source = @embedFile("ssh/tunnel.zig");
     {
         const start = std.mem.indexOf(u8, source, "fn waitForTunnelReady") orelse return error.MissingTunnelReady;
         const rest = source[start..];
@@ -80,7 +112,7 @@ test "agent SSH connection resolver uses the surface registry, not tab threadloc
 }
 
 test "agent request disables worker snapshot fallback when UI capture fails" {
-    const source = @embedFile("ai_chat.zig");
+    const source = @embedFile("assistant/conversation/session.zig");
     const start = std.mem.indexOf(u8, source, "fn buildRequestLocked") orelse return error.MissingBuildRequestLocked;
     const rest = source[start..];
     const end = std.mem.indexOf(u8, rest, "var weixin_ctx") orelse return error.MissingBuildRequestSnapshotEnd;
@@ -120,7 +152,7 @@ test {
     _ = @import("renderer/overlays/confirm_modals.zig");
     _ = @import("renderer/overlays/ssh_profiles.zig");
     _ = @import("renderer/overlays/ssh_profiles_layout.zig");
-    _ = @import("renderer/overlays/ai_profiles.zig");
+    _ = @import("renderer/overlays/assistant_profiles.zig");
     _ = @import("renderer/overlays/session_launcher.zig");
     _ = @import("renderer/overlays/state.zig");
     _ = @import("renderer/overlays/state_guard.zig");
@@ -131,6 +163,9 @@ test {
     _ = @import("source_guards/global_state_guard.zig");
     _ = @import("source_guards/import_hub_guard.zig");
     _ = @import("source_guards/side_effect_guard.zig");
+    _ = @import("source_guards/process_runner_guard.zig");
+    _ = @import("source_guards/agent_tools_guard.zig");
+    _ = @import("source_guards/assistant_agent_boundary_guard.zig");
     _ = @import("source_guards/layered_dependency_guard.zig");
     _ = @import("source_guards/overlay_boundary_guard.zig");
     _ = @import("source_guards/input_feature_boundary_guard.zig");
@@ -139,99 +174,118 @@ test {
     _ = @import("renderer/overlays/whats_new_model.zig");
     _ = @import("renderer/ui_batch.zig");
     _ = @import("close_confirm.zig");
-    _ = @import("command_palette_model.zig");
-    _ = @import("command_center_state.zig");
-    _ = @import("command_palette_history_view.zig");
+    _ = @import("command/palette_model.zig");
+    _ = @import("command/center_state.zig");
+    _ = @import("command/palette_history_view.zig");
     _ = @import("platform/window_state_codec.zig");
     _ = @import("platform/dxgi_core.zig");
     _ = @import("platform/console_host_policy.zig");
     _ = @import("whats_new_gate.zig");
     _ = @import("startup_tabs.zig");
     _ = @import("config.zig");
-    _ = @import("ai_agent_config.zig");
-    _ = @import("ai_agent_access.zig");
-    _ = @import("agent_file_edit.zig");
-    _ = @import("agent_file_copy.zig");
-    _ = @import("ssh_connection.zig");
+    _ = @import("agent/config.zig");
+    _ = @import("agent/access.zig");
+    _ = @import("agent/file_edit.zig");
+    _ = @import("agent/remote_filetool.zig");
+    _ = @import("agent/file_copy.zig");
+    _ = @import("ssh/connection.zig");
     _ = @import("tmux/control.zig");
     _ = @import("tmux/layout.zig");
     _ = @import("tmux/protocol_test.zig");
     _ = @import("tmux/session.zig");
-    _ = @import("port_forward_rule.zig");
-    _ = @import("ssh_profile_store.zig");
-    _ = @import("port_forward_manager.zig");
-    _ = @import("port_forwarding.zig");
-    _ = @import("openssh_config_import.zig");
+    _ = @import("port_forward/rule.zig");
+    _ = @import("ssh/profile_store.zig");
+    _ = @import("port_forward/manager.zig");
+    _ = @import("port_forward/forwarding.zig");
+    _ = @import("ssh/openssh_config_import.zig");
     _ = @import("apprt/window_drag_region.zig");
     _ = @import("apprt/window_registry.zig");
     _ = @import("appwindow/active_tab.zig");
     _ = @import("appwindow/frame_latency.zig");
     _ = @import("appwindow/frame_scheduler.zig");
+    _ = @import("appwindow/png_writer.zig");
     _ = @import("appwindow/render_gate.zig");
+    _ = @import("appwindow/ui_screenshot.zig");
     _ = @import("appwindow/ui_effect.zig");
     _ = @import("appwindow/window_state.zig");
     _ = @import("appwindow/remote_state.zig");
     _ = @import("appwindow/state.zig");
     _ = @import("appwindow/state_guard.zig");
     _ = @import("appwindow/p3_1_guard.zig");
-    _ = @import("scp.zig");
+    _ = @import("ssh/scp.zig");
     _ = @import("surface_registry.zig");
     _ = @import("ctl/protocol.zig");
     _ = @import("ctl/discovery.zig");
     _ = @import("ctl/control.zig");
     _ = @import("ctl/server.zig");
     _ = @import("ctl/client.zig");
+    _ = @import("ctl/transport.zig");
     _ = @import("ctl/ui_state.zig");
-    _ = @import("png_dimensions.zig");
-    _ = @import("pdf_preview.zig");
-    _ = @import("preview_gallery.zig");
-    _ = @import("preview_diagnostics.zig");
+    _ = @import("preview/png_dimensions.zig");
+    _ = @import("preview/pdf.zig");
+    _ = @import("preview/gallery.zig");
+    _ = @import("preview/diagnostics.zig");
     _ = @import("file_backend.zig");
     _ = @import("file_explorer.zig");
     _ = @import("i18n.zig");
     _ = @import("markdown_text.zig");
-    _ = @import("ai_chat_composer_layout.zig");
-    _ = @import("ai_chat_input_text.zig");
-    _ = @import("ai_chat_composer.zig");
+    _ = @import("assistant/conversation/composer_layout.zig");
+    _ = @import("assistant/conversation/input_text.zig");
+    _ = @import("assistant/conversation/composer.zig");
     _ = @import("composer_detail_wrap.zig");
-    _ = @import("web_search.zig");
-    _ = @import("agent_prompt_answer.zig");
-    _ = @import("first_party_tools.zig");
-    _ = @import("web_read.zig");
-    _ = @import("web_read_cache.zig");
-    _ = @import("pubmed.zig");
-    _ = @import("ai_loop_schedule.zig");
-    _ = @import("ai_skill_distill.zig");
-    _ = @import("ai_history_types.zig");
-    _ = @import("ai_history_provider_codex.zig");
-    _ = @import("ai_history_provider_claude.zig");
-    _ = @import("ai_history_provider_reasonix.zig");
-    _ = @import("ai_history_source.zig");
-    _ = @import("ai_history_cache.zig");
-    _ = @import("skill_scan.zig");
-    _ = @import("skill_install.zig");
-    _ = @import("ssh_error.zig");
-    _ = @import("skill_center.zig");
+    _ = @import("assistant/conversation/presentation.zig");
+    _ = @import("agent_tools/args.zig");
+    _ = @import("agent_tools/mod.zig");
+    _ = @import("agent_tools/research.zig");
+    _ = @import("agent_tools/knowledge.zig");
+    _ = @import("agent_tools/memory.zig");
+    _ = @import("agent_tools/output.zig");
+    _ = @import("agent_tools/terminal.zig");
+    _ = @import("agent_tools/sessions.zig");
+    _ = @import("agent_tools/access.zig");
+    _ = @import("agent_tools/files.zig");
+    _ = @import("agent_tools/exec.zig");
+    _ = @import("agent_tools/dynamic.zig");
+    _ = @import("agent_tools/weixin.zig");
+    _ = @import("research/commands.zig");
+    _ = @import("research/web_search.zig");
+    _ = @import("terminal_agents/prompt_answer.zig");
+    _ = @import("tools/first_party.zig");
+    _ = @import("research/web_read.zig");
+    _ = @import("research/web_read_cache.zig");
+    _ = @import("research/pubmed.zig");
+    _ = @import("assistant/loop/schedule.zig");
+    _ = @import("assistant/conversation/distill.zig");
+    _ = @import("terminal_agents/sessions/types.zig");
+    _ = @import("terminal_agents/sessions/provider_codex.zig");
+    _ = @import("terminal_agents/sessions/provider_claude.zig");
+    _ = @import("terminal_agents/sessions/provider_reasonix.zig");
+    _ = @import("terminal_agents/sessions/source.zig");
+    _ = @import("terminal_agents/sessions/cache.zig");
+    _ = @import("skill/scan.zig");
+    _ = @import("skill/install.zig");
+    _ = @import("ssh/error.zig");
+    _ = @import("skill/center.zig");
     _ = @import("renderer/skill_center_renderer.zig");
     _ = @import("renderer/port_forwarding_renderer.zig");
-    _ = @import("skill_transfer_cmd.zig");
-    _ = @import("skill_transfer.zig");
-    _ = @import("skill_diff.zig");
-    _ = @import("tool_skill_draft.zig");
+    _ = @import("skill/transfer_cmd.zig");
+    _ = @import("skill/transfer.zig");
+    _ = @import("skill/diff.zig");
+    _ = @import("tools/skill_draft.zig");
     _ = @import("text_wrap.zig");
-    _ = @import("ai_history_resume.zig");
-    _ = @import("ai_history_session.zig");
-    _ = @import("browser_url.zig");
+    _ = @import("terminal_agents/sessions/resume.zig");
+    _ = @import("terminal_agents/sessions/session.zig");
+    _ = @import("browser/url.zig");
     _ = @import("text_search.zig");
-    _ = @import("ssh_prompt.zig");
+    _ = @import("ssh/prompt.zig");
     _ = @import("selection_unit.zig");
     _ = @import("scrollbar_model.zig");
     _ = @import("resize_gate.zig");
-    _ = @import("preview_token.zig");
+    _ = @import("preview/token.zig");
     _ = @import("ime_caret.zig");
     _ = @import("sync_output.zig");
-    _ = @import("agent_history.zig");
-    _ = @import("agent_history_store.zig");
+    _ = @import("agent/history.zig");
+    _ = @import("agent/history_store.zig");
     _ = @import("render_diagnostics.zig");
     _ = @import("diag_log.zig");
     _ = @import("notification.zig");
@@ -239,14 +293,15 @@ test {
     _ = @import("renderer/gpu/backend.zig");
     _ = @import("renderer/cell_geometry.zig");
     _ = @import("renderer/titlebar_layout.zig");
-    _ = @import("ai_chat_layout.zig");
-    _ = @import("ai_chat_types.zig");
-    _ = @import("ai_sidebar.zig");
-    _ = @import("copilot_hint_gate.zig");
+    _ = @import("assistant/conversation/layout.zig");
+    _ = @import("assistant/conversation/types.zig");
+    _ = @import("assistant/profile/store.zig");
+    _ = @import("assistant/sidebar/panel.zig");
+    _ = @import("assistant/sidebar/hint_gate.zig");
     _ = @import("appwindow/flush_scheduler.zig");
     _ = @import("appwindow/resize_throttle.zig");
     _ = @import("termio/read_coalesce.zig");
-    _ = @import("ai_chat_protocol.zig");
+    _ = @import("assistant/conversation/protocol.zig");
     _ = @import("weixin/types.zig");
     _ = @import("weixin/ilink_codec.zig");
     _ = @import("weixin/ilink_client.zig");
@@ -254,17 +309,22 @@ test {
     _ = @import("weixin/binding.zig");
     _ = @import("weixin/approval_reply.zig");
     _ = @import("weixin/question_reply.zig");
-    _ = @import("ai_chat_title.zig");
-    _ = @import("ai_model_switch.zig");
-    _ = @import("command_registry.zig");
-    _ = @import("tool_registry.zig");
-    _ = @import("tool_import.zig");
-    _ = @import("agent_detector.zig");
-    _ = @import("agent_integration_prompt.zig");
-    _ = @import("jupyter_detect.zig");
-    _ = @import("jupyter_picker.zig");
-    _ = @import("copilot_picker.zig");
-    _ = @import("html_server_model.zig");
+    _ = @import("assistant/conversation/title.zig");
+    _ = @import("assistant/conversation/model_switch.zig");
+    _ = @import("command/registry.zig");
+    _ = @import("tools/registry.zig");
+    _ = @import("tools/import.zig");
+    // Unified subprocess lifecycle: spawn → concurrent drain → timeout/cancel →
+    // reap-exactly-once. Spawn-based tests gate on non-Windows; type guards run
+    // everywhere.
+    _ = @import("process_runner.zig");
+    _ = @import("platform/process_group.zig");
+    _ = @import("terminal_agents/detector.zig");
+    _ = @import("terminal_agents/integration_prompt.zig");
+    _ = @import("jupyter/detect.zig");
+    _ = @import("jupyter/picker.zig");
+    _ = @import("assistant/sidebar/picker.zig");
+    _ = @import("html/server_model.zig");
     // Platform-aware agent prompt: pure string constants, no heavy deps.
     _ = @import("platform/agent_prompt.zig");
     // Pure login-shell argv logic (macOS bash/.bashrc fix). OS-agnostic, so it

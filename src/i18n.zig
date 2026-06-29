@@ -2,7 +2,7 @@
 //! 设计见 docs/superpowers/specs/2026-06-01-i18n-infrastructure-design.md
 const std = @import("std");
 const builtin = @import("builtin");
-const command_center_state = @import("command_center_state.zig");
+const command_center_state = @import("command/center_state.zig");
 const CommandAction = command_center_state.CommandAction;
 
 pub const Lang = enum { en, zh_CN };
@@ -814,6 +814,7 @@ pub fn commandTitle(action: CommandAction) ?[]const u8 {
         .show_version => "版本",
         .check_for_updates => "检查更新",
         .download_update => "下载更新",
+        .install_update => "立即更新",
         .open_latest_release => "打开最新发布",
         .show_whats_new => "更新内容",
         .show_integration_prompt => "安装集成",
@@ -865,6 +866,7 @@ pub fn commandDetail(action: CommandAction) ?[]const u8 {
         .show_version => "显示 WispTerm 版本",
         .check_for_updates => "在 GitHub Releases 检查是否有新版本",
         .download_update => "把最新更新下载到「下载」文件夹",
+        .install_update => "安装已下载的更新并重启（macOS）",
         .open_latest_release => "打开最新的 WispTerm GitHub Release",
         .show_whats_new => "查看本版本的更新内容",
         .show_integration_prompt => "显示给 Codex、Claude Code 或其他智能体生成 WispTerm hook 的 prompt",

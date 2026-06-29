@@ -11,7 +11,7 @@ const Config = @import("config.zig");
 const build_options = @import("build_options");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("split_tree.zig");
-const PreviewPane = @import("preview_pane.zig");
+const PreviewPane = @import("preview/pane.zig");
 const renderer = @import("renderer.zig");
 const window_backend = @import("platform/window_backend.zig");
 const App = @import("App.zig");
@@ -19,8 +19,8 @@ const Renderer = @import("renderer/Renderer.zig");
 const weixin_control = @import("weixin/control.zig");
 const ctl_control = @import("ctl/control.zig");
 const memory_debug = @import("memory_debug.zig");
-const agent_history = @import("agent_history.zig");
-const agent_history_store = @import("agent_history_store.zig");
+const agent_history = @import("agent/history.zig");
+const agent_history_store = @import("agent/history_store.zig");
 const close_confirm = @import("close_confirm.zig");
 const font_backend = @import("platform/font_backend.zig");
 const platform_display = @import("platform/display.zig");
@@ -32,7 +32,7 @@ const platform_menu = @import("platform/menu.zig");
 const platform_notifications = @import("platform/notifications.zig");
 const notif_mod = @import("notification.zig");
 const platform_pty_command = @import("platform/pty_command.zig");
-const copilot_hint_gate = @import("copilot_hint_gate.zig");
+const copilot_hint_gate = @import("assistant/sidebar/hint_gate.zig");
 const platform_window_state = @import("platform/window_state.zig");
 const platform_wsl = @import("platform/wsl.zig");
 const startup_tabs = @import("startup_tabs.zig");
@@ -41,39 +41,41 @@ const quick_terminal = @import("quick_terminal.zig");
 const keybind = @import("keybind.zig");
 const thread_message = @import("appwindow/thread_message.zig");
 const skill_center_actions = @import("appwindow/skill_center_actions.zig");
+const copilot_sidebar = @import("appwindow/copilot_sidebar.zig");
 const appwindow_state = @import("appwindow/state.zig");
 const render_diagnostics = @import("render_diagnostics.zig");
 const ime_caret = @import("ime_caret.zig");
 const hit_test = @import("input/hit_test.zig");
-pub const ai_chat = @import("ai_chat.zig");
-const ai_history_cache = @import("ai_history_cache.zig");
-const ai_history_resume = @import("ai_history_resume.zig");
-const ai_loop_store = @import("ai_loop_store.zig");
-const ai_history_types = @import("ai_history_types.zig");
-const ai_history_session = @import("ai_history_session.zig");
-const ai_history_source = @import("ai_history_source.zig");
-pub const skill_center = @import("skill_center.zig");
-const skill_install = @import("skill_install.zig");
+pub const ai_chat = @import("assistant/conversation/session.zig");
+const ai_chat_types = @import("assistant/conversation/types.zig");
+const ai_history_cache = @import("terminal_agents/sessions/cache.zig");
+const ai_history_resume = @import("terminal_agents/sessions/resume.zig");
+const ai_loop_store = @import("assistant/loop/store.zig");
+const ai_history_types = @import("terminal_agents/sessions/types.zig");
+const ai_history_session = @import("terminal_agents/sessions/session.zig");
+const ai_history_source = @import("terminal_agents/sessions/source.zig");
+pub const skill_center = @import("skill/center.zig");
+const skill_install = @import("skill/install.zig");
 const update_install = @import("update_install.zig");
 const clipboard = @import("input/clipboard.zig");
-const port_forwarding = @import("port_forwarding.zig");
-const port_forward_manager = @import("port_forward_manager.zig");
-const port_forward_rule = @import("port_forward_rule.zig");
-const ssh_profile_store = @import("ssh_profile_store.zig");
-const skill_scan = @import("skill_scan.zig");
-const skill_local_fs = @import("skill_local_fs.zig");
-const skill_transfer_cmd = @import("skill_transfer_cmd.zig");
-const tool_import = @import("tool_import.zig");
-const tool_registry = @import("tool_registry.zig");
-const tool_skill_draft = @import("tool_skill_draft.zig");
-const first_party_tools = @import("first_party_tools.zig");
-const ai_chat_request = @import("ai_chat_request.zig");
+const port_forwarding = @import("port_forward/forwarding.zig");
+const port_forward_manager = @import("port_forward/manager.zig");
+const port_forward_rule = @import("port_forward/rule.zig");
+const ssh_profile_store = @import("ssh/profile_store.zig");
+const skill_scan = @import("skill/scan.zig");
+const skill_local_fs = @import("skill/local_fs.zig");
+const skill_transfer_cmd = @import("skill/transfer_cmd.zig");
+const tool_import = @import("tools/import.zig");
+const tool_registry = @import("tools/registry.zig");
+const tool_skill_draft = @import("tools/skill_draft.zig");
+const first_party_tools = @import("tools/first_party.zig");
+const ai_chat_request = @import("assistant/conversation/request.zig");
 const remote_file = @import("platform/remote_file.zig");
-const ssh_connection = @import("ssh_connection.zig");
-const skill_transfer = @import("skill_transfer.zig");
-const skill_diff = @import("skill_diff.zig");
-const scp = @import("scp.zig");
-const ssh_error = @import("ssh_error.zig");
+const ssh_connection = @import("ssh/connection.zig");
+const skill_transfer = @import("skill/transfer.zig");
+const skill_diff = @import("skill/diff.zig");
+const scp = @import("ssh/scp.zig");
+const ssh_error = @import("ssh/error.zig");
 const i18n = @import("i18n.zig");
 pub const tab = @import("appwindow/tab.zig");
 const active_tab_state = @import("appwindow/active_tab.zig");
@@ -85,7 +87,6 @@ pub const ui_pipeline = @import("renderer/ui_pipeline.zig");
 pub const titlebar = @import("renderer/titlebar.zig");
 pub const input = @import("input.zig");
 pub const overlays = @import("renderer/overlays.zig");
-const copilot_picker = @import("copilot_picker.zig");
 const post_process = @import("renderer/post_process.zig");
 pub const gpu = @import("renderer/gpu/gpu.zig");
 pub const split_layout = @import("appwindow/split_layout.zig");
@@ -99,6 +100,8 @@ const control_api = @import("appwindow/control_api.zig");
 const remote_sync = @import("appwindow/remote_sync.zig");
 const weixin_bridge = @import("appwindow/weixin_bridge.zig");
 const agent_requests = @import("appwindow/agent_requests.zig");
+const appwindow_ui_screenshot = @import("appwindow/ui_screenshot.zig");
+const png_writer = @import("appwindow/png_writer.zig");
 const ui_effect = @import("appwindow/ui_effect.zig");
 pub const UiEffect = ui_effect.UiEffect;
 pub const background_image = @import("renderer/background_image.zig");
@@ -107,16 +110,16 @@ const file_explorer_renderer = @import("renderer/file_explorer_renderer.zig");
 const markdown_preview_renderer = @import("renderer/markdown_preview_renderer.zig");
 pub const weixin_qr_panel = @import("weixin/qr_panel.zig");
 const weixin_qr_renderer = @import("renderer/weixin_qr_renderer.zig");
-const html_server = @import("html_server.zig");
+const html_server = @import("html/server.zig");
 pub const browser_panel = if (build_options.webview)
-    @import("browser_panel.zig")
+    @import("browser/panel.zig")
 else
-    @import("browser_panel_stub.zig");
-pub const ai_chat_renderer = @import("renderer/ai_chat_renderer.zig");
-pub const ai_history_renderer = @import("renderer/ai_history_renderer.zig");
+    @import("browser/panel_stub.zig");
+pub const assistant_conversation_renderer = @import("renderer/assistant/conversation.zig");
+pub const terminal_agent_sessions_renderer = @import("renderer/terminal_agents/sessions.zig");
 const skill_center_renderer = @import("renderer/skill_center_renderer.zig");
 const port_forwarding_renderer = @import("renderer/port_forwarding_renderer.zig");
-const ai_sidebar = @import("ai_sidebar.zig");
+const ai_sidebar = @import("assistant/sidebar/panel.zig");
 pub const ui_perf = @import("ui_perf.zig");
 const log = std.log.scoped(.app_window);
 
@@ -231,7 +234,7 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
     ai_chat.setDefaultWorkingDir(app.ai_agent_working_dir);
     overlays.setSubagentProfileName(app.ai_subagent_profile);
     ai_chat.setSubagentProfileResolver(overlays.resolveSubagentProfileOverride);
-    @import("web_search.zig").setJinaApiKey(app.jina_api_key);
+    @import("research/web_search.zig").setJinaApiKey(app.jina_api_key);
     @import("pty.zig").setConsoleHostPreference(app.console_host_preference);
     // Copy shell command from App
     @memcpy(tab.g_shell_cmd_buf[0..app.shell_cmd_len], app.shell_cmd_buf[0..app.shell_cmd_len]);
@@ -1728,7 +1731,7 @@ fn renderAiChatFrame(fb_width: c_int, fb_height: c_int, titlebar_offset: f32, le
     if (activeAiChat()) |session| {
         const chat_x = left_panels_w;
         const chat_w = @as(f32, @floatFromInt(fb_width)) - left_panels_w - right_panels_w;
-        ai_chat_renderer.render(
+        assistant_conversation_renderer.render(
             session,
             @floatFromInt(fb_width),
             @floatFromInt(fb_height),
@@ -1752,7 +1755,7 @@ fn renderAiHistoryFrame(active_tab: *TabState, fb_width: c_int, fb_height: c_int
     titlebar.renderSidebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
     file_explorer_renderer.render(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
     if (active_tab.ai_history_session) |session| {
-        const draw: ai_history_renderer.DrawContext = .{
+        const draw: terminal_agent_sessions_renderer.DrawContext = .{
             .bg = g_theme.background,
             .fg = g_theme.foreground,
             .accent = g_theme.cursor_color,
@@ -1764,7 +1767,7 @@ fn renderAiHistoryFrame(active_tab: *TabState, fb_width: c_int, fb_height: c_int
         };
         session.mutex.lock();
         defer session.mutex.unlock();
-        ai_history_renderer.render(
+        terminal_agent_sessions_renderer.render(
             draw,
             session,
             @floatFromInt(fb_width),
@@ -2024,7 +2027,7 @@ fn renderAiCopilotPanel(fb_width: c_int, fb_height: c_int, titlebar_offset: f32)
     const bounds = ai_sidebar.boundsForWindow(@intCast(fb_width), @intCast(fb_height), titlebar_offset, left, 0);
     const chat_x: f32 = @floatFromInt(bounds.left);
     const chat_w: f32 = @floatFromInt(bounds.right - bounds.left);
-    ai_chat_renderer.render(session, @floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset, chat_x, chat_w, true); // copilot sidebar: status shown as a colored dot
+    assistant_conversation_renderer.render(session, @floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset, chat_x, chat_w, true); // copilot sidebar: status shown as a colored dot
     renderAiCopilotCloseButton(bounds, @floatFromInt(fb_height));
 }
 
@@ -2034,7 +2037,7 @@ fn renderAiCopilotCloseButton(bounds: ai_sidebar.Bounds, window_height: f32) voi
         .left = @floatFromInt(bounds.left),
         .right = @floatFromInt(bounds.right),
         .top = @floatFromInt(bounds.top),
-        .height = ai_chat_renderer.HEADER_H,
+        .height = assistant_conversation_renderer.HEADER_H,
     };
     const close = hit_test.panelCloseButtonRect(layout) orelse return;
     const close_x: f32 = @floatCast(close.left);
@@ -2554,6 +2557,15 @@ pub fn aiHistorySearchFocused() bool {
     return session.focus == .search;
 }
 
+/// True when a plain Space should preview the selected transcript instead of
+/// typing into the Search box (search unfocused, or focused with an empty
+/// query). Keeps "Press Space to load transcript" working from the default
+/// focus while still allowing spaces inside a non-empty query.
+pub fn aiHistorySpacePreviews() bool {
+    const session = activeAiHistory() orelse return false;
+    return session.spacePreviewsTranscript();
+}
+
 pub fn aiHistoryBackspaceFilter() bool {
     const session = activeAiHistory() orelse return false;
     session.mutex.lock();
@@ -2907,10 +2919,10 @@ pub fn aiHistoryHandleMousePress(xpos: f64, ypos: f64) bool {
     const left = leftPanelsWidth();
     const right = rightPanelsWidthForWindow(fb.width);
     const width = @as(f32, @floatFromInt(fb.width)) - left - right;
-    const visible_rows = ai_history_renderer.listVisibleCapacity(@floatFromInt(fb.height), currentTitlebarHeight(), font.g_titlebar_cell_height);
+    const visible_rows = terminal_agent_sessions_renderer.listVisibleCapacity(@floatFromInt(fb.height), currentTitlebarHeight(), font.g_titlebar_cell_height);
 
     session.mutex.lock();
-    const hit = ai_history_renderer.interactionHitTest(
+    const hit = terminal_agent_sessions_renderer.interactionHitTest(
         session,
         @floatFromInt(fb.width),
         @floatFromInt(fb.height),
@@ -3006,7 +3018,7 @@ fn tickAllPreviewPanes() bool {
 fn aiHistoryListVisibleRowsForWindow() usize {
     const win = g_window orelse return 1;
     const fb = window_backend.framebufferSize(win);
-    return ai_history_renderer.listVisibleCapacity(@floatFromInt(fb.height), currentTitlebarHeight(), font.g_titlebar_cell_height);
+    return terminal_agent_sessions_renderer.listVisibleCapacity(@floatFromInt(fb.height), currentTitlebarHeight(), font.g_titlebar_cell_height);
 }
 
 /// Number of day rows (excluding the pinned "All dates") visible in the DATE
@@ -3015,8 +3027,8 @@ fn aiHistoryDateDaySlotsForWindow() usize {
     const win = g_window orelse return 0;
     const fb = window_backend.framebufferSize(win);
     const cell_h = font.g_titlebar_cell_height;
-    const lc = ai_history_renderer.leftColumnLayout(currentTitlebarHeight(), cell_h);
-    const cap = ai_history_renderer.dateVisibleCapacity(@floatFromInt(fb.height), lc.date_rows_top, cell_h);
+    const lc = terminal_agent_sessions_renderer.leftColumnLayout(currentTitlebarHeight(), cell_h);
+    const cap = terminal_agent_sessions_renderer.dateVisibleCapacity(@floatFromInt(fb.height), lc.date_rows_top, cell_h);
     return if (cap > 1) cap - 1 else 0;
 }
 
@@ -3085,8 +3097,23 @@ pub fn leftPanelsWidth() f32 {
     return titlebar.sidebarWidth() + file_explorer.width();
 }
 
+fn copilotSidebarHost() copilot_sidebar.Host {
+    return .{
+        .allocator = g_allocator,
+        .history_store = &g_agent_history,
+        .history_mutex = &g_agent_history_mutex,
+        .make_session = makeCopilotSession,
+        .open_api_config = openCopilotApiConfig,
+        .focus_input = input.focusAiCopilot,
+        .blur_input = input.blurAiCopilot,
+        .mark_dirty = markUiDirty,
+        .mark_history_dirty_locked = markAgentHistoryDirtyLocked,
+        .reopen_session = reopenCopilotSessionFromHistorySessionId,
+    };
+}
+
 pub fn aiCopilotVisible() bool {
-    return tab.activeCopilotVisible();
+    return copilot_sidebar.visible();
 }
 
 /// True when a right-docked panel (browser / Jupyter webview) is showing for the
@@ -3099,15 +3126,11 @@ pub fn anyRightDockPanelVisible() bool {
 /// Hide the active tab's copilot panel if visible (used by the right-slot
 /// arbiter when another right panel opens). No-op if already hidden.
 pub fn hideAiCopilot() void {
-    if (!tab.setActiveCopilotVisible(false)) return;
-    input.blurAiCopilot();
-    g_force_rebuild = true;
-    g_cells_valid = false;
+    copilot_sidebar.hide(copilotSidebarHost());
 }
 
 pub fn aiCopilotWidth(window_width: i32) f32 {
-    if (!aiCopilotVisible()) return 0;
-    return ai_sidebar.panelWidthForWindow(window_width, leftPanelsWidth(), 0);
+    return copilot_sidebar.width(window_width, leftPanelsWidth());
 }
 
 fn makeCopilotSession() ?*ai_chat.Session {
@@ -3115,94 +3138,52 @@ fn makeCopilotSession() ?*ai_chat.Session {
 }
 
 fn ensureActiveCopilotSession() ?*ai_chat.Session {
-    const session = tab.activeCopilotSession(makeCopilotSession) orelse return null;
-    const context_surface_id = surface_snapshots.agentContextSurfaceId();
-    if (context_surface_id.len > 0) {
-        session.setBoundSurface(context_surface_id);
+    return copilot_sidebar.ensureActiveSession(copilotSidebarHost());
+}
+
+fn openCopilotApiConfig(session: ?*ai_chat.Session) void {
+    if (session) |s| {
+        overlays.openAiConfigForSession(s);
+    } else {
+        overlays.openAiConfigForMissingCopilotApi();
     }
-    return session;
+    overlays.showStatusToast("Missing API key. Configure API settings.");
+}
+
+fn ensureActiveCopilotSessionConfigured() ?*ai_chat.Session {
+    return copilot_sidebar.ensureActiveSessionConfigured(copilotSidebarHost());
 }
 
 /// Input layer getter: the active terminal tab's copilot session, only when the
 /// copilot panel is visible. Used by input routing (next task).
 pub fn activeCopilotSessionForInput() ?*ai_chat.Session {
-    if (!aiCopilotVisible()) return null;
-    const t = tab.activeTab() orelse return null;
-    return t.copilot_session;
+    return copilot_sidebar.activeSessionForInput();
 }
 
 /// Build the picker rows from the store (copilot records only) and open it.
 pub fn openCopilotConversationPicker() void {
-    refreshCopilotPickerRows();
+    copilot_sidebar.openPicker(copilotSidebarHost());
 }
 
 /// (Re)load picker rows from the store. Called on open and after a delete.
 pub fn refreshCopilotPickerRows() void {
-    const allocator = g_allocator orelse return;
-    var empty_rows = [_]agent_history.Row{};
-    g_agent_history_mutex.lock();
-    const rows: []agent_history.Row = blk: {
-        const store = g_agent_history orelse break :blk empty_rows[0..];
-        break :blk store.buildCopilotRows(allocator) catch empty_rows[0..];
-    };
-    g_agent_history_mutex.unlock();
-    defer if (rows.len > 0) agent_history.freeRows(allocator, rows);
-
-    var picker_rows: [copilot_picker.MAX_ROWS]copilot_picker.Row = undefined;
-    const n = @min(rows.len, copilot_picker.MAX_ROWS);
-    for (0..n) |i| picker_rows[i] = .{
-        .session_id = rows[i].session_id,
-        .title = rows[i].title,
-        .updated_at = rows[i].updated_at,
-    };
-    copilot_picker.show(picker_rows[0..n]);
+    copilot_sidebar.refreshPickerRows(copilotSidebarHost());
 }
 
 /// Load conversation `session_id` into the active terminal tab's sidebar. If a
 /// live copy is already open in some tab, switch to that tab instead (a second
 /// live Session with the same id would corrupt the store).
 pub fn loadCopilotConversationById(session_id: []const u8) void {
-    if (tab.switchToCopilotTabBySessionId(session_id)) {
-        browser_panel.close(); // exclusive right slot, mirror toggleAiCopilot
-        _ = tab.setActiveCopilotVisible(true);
-        input.focusAiCopilot();
-        g_force_rebuild = true;
-        g_cells_valid = false;
-        return;
-    }
-    if (!isActiveTabTerminal()) return;
-    const t = tab.activeTab() orelse return;
-    const session = reopenCopilotSessionFromHistorySessionId(session_id) orelse return;
-    if (t.copilot_session) |old| old.deinit(); // already saved by its hook
-    t.copilot_session = session;
-    browser_panel.close();
-    _ = tab.setActiveCopilotVisible(true);
-    input.focusAiCopilot();
-    g_force_rebuild = true;
-    g_cells_valid = false;
+    copilot_sidebar.loadConversationById(copilotSidebarHost(), session_id);
 }
 
 pub fn deleteCopilotConversationById(session_id: []const u8) void {
-    g_agent_history_mutex.lock();
-    defer g_agent_history_mutex.unlock();
-    const store = g_agent_history orelse return;
-    if (store.deleteBySessionId(session_id)) markAgentHistoryDirtyLocked();
+    copilot_sidebar.deleteConversationById(copilotSidebarHost(), session_id);
 }
 
 /// Start a fresh, empty Copilot conversation on the active terminal tab.
 pub fn newCopilotConversation() void {
-    if (!isActiveTabTerminal()) return;
-    const t = tab.activeTab() orelse return;
-    if (t.copilot_session) |old| {
-        old.deinit(); // already persisted by its hook if non-empty
-        t.copilot_session = null;
-    }
-    browser_panel.close();
-    _ = tab.setActiveCopilotVisible(true);
-    _ = ensureActiveCopilotSession();
-    input.focusAiCopilot();
-    g_force_rebuild = true;
-    g_cells_valid = false;
+    copilot_sidebar.newConversation(copilotSidebarHost());
 }
 
 /// The preview pane that currently has split-tree focus, or null if the
@@ -3258,22 +3239,7 @@ pub fn appendDroppedPathToChatAtPoint(text: []const u8, x: i32, y: i32) bool {
 }
 
 pub fn toggleAiCopilot() void {
-    if (!isActiveTabTerminal()) return; // copilot is terminal-only
-    if (tab.activeCopilotVisible()) {
-        _ = tab.setActiveCopilotVisible(false);
-        input.blurAiCopilot();
-        g_force_rebuild = true;
-        g_cells_valid = false;
-        return;
-    }
-    // Exclusive right slot: close the other right panels first.
-    browser_panel.close();
-    _ = tab.setActiveCopilotVisible(true);
-    _ = ensureActiveCopilotSession();
-    input.focusAiCopilot();
-    if (g_allocator) |alloc| platform_window_state.setCopilotHintShown(alloc);
-    g_force_rebuild = true;
-    g_cells_valid = false;
+    copilot_sidebar.toggle(copilotSidebarHost());
 }
 
 pub fn rightPanelsWidth() f32 {
@@ -3348,20 +3314,7 @@ fn saveMarkdownDialogPath(
 }
 
 fn writeFilePath(path: []const u8, bytes: []const u8) !void {
-    if (std.fs.path.dirname(path)) |dir| {
-        try std.fs.cwd().makePath(dir);
-    }
-
-    if (std.fs.path.isAbsolute(path)) {
-        var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(bytes);
-        return;
-    }
-
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(bytes);
+    try platform_atomic_file.writeFileReplaceSafe(path, bytes);
 }
 
 fn syncWindowTitlebarHeight(win: *window_backend.Window) f32 {
@@ -3573,7 +3526,7 @@ pub fn spawnTabWithCommandUtf8(command: []const u8) bool {
 /// for key auth). The controller (pumped from the main loop) builds tabs/splits
 /// from the remote tmux windows/panes. Returns false if the transport could not
 /// be launched.
-pub fn startTmuxSession(ssh_cmd: []const u8, password: []const u8, profile_name: []const u8, ssh_conn: ?@import("ssh_connection.zig").SshConnection) bool {
+pub fn startTmuxSession(ssh_cmd: []const u8, password: []const u8, profile_name: []const u8, ssh_conn: ?@import("ssh/connection.zig").SshConnection) bool {
     const allocator = g_allocator orelse return false;
     return tmux_controller.start(
         allocator,
@@ -4619,7 +4572,7 @@ fn applyReloadedConfig(allocator: std.mem.Allocator, cfg: *const Config) void {
     ai_chat.reloadFirstPartyToolState(allocator);
     ai_chat.setDefaultWorkingDir(cfg.@"ai-agent-working-dir");
     overlays.setSubagentProfileName(cfg.@"ai-subagent-profile");
-    @import("web_search.zig").setJinaApiKey(cfg.@"jina-api-key");
+    @import("research/web_search.zig").setJinaApiKey(cfg.@"jina-api-key");
     @import("pty.zig").setConsoleHostPreference(cfg.@"windows-conpty");
 
     if (g_window == null) return;
@@ -5044,7 +4997,27 @@ pub fn clearWeixinTranscriptCache() void {
 
 pub fn enableAgentControl() void {
     control_api.setUiStateBuilder(overlays.buildUiStateJson);
+    control_api.setSpawnHandler(ctlSpawnTab);
     control_api.enable();
+}
+
+/// UI-thread handler for `wisptermctl spawn`: open a new terminal tab. `cwd`
+/// empty = inherit the active tab's cwd; `command` empty = the configured shell.
+fn ctlSpawnTab(cwd_path: []const u8, command: []const u8) void {
+    const allocator = g_allocator orelse return;
+    var cwd_buf: platform_pty_command.CwdBuffer = undefined;
+    const cwd = if (cwd_path.len != 0)
+        platform_pty_command.cwdFromUtf8(&cwd_buf, cwd_path)
+    else
+        getActiveCwd(&cwd_buf);
+
+    const ok = if (command.len != 0) blk: {
+        const command_line = platform_pty_command.allocCommandLineFromUtf8(allocator, command) catch break :blk false;
+        defer platform_pty_command.freeCommandLine(allocator, command_line);
+        break :blk tab.spawnTabWithCommandAndCwd(allocator, term_cols, term_rows, platform_pty_command.commandLineFromOwned(command_line), g_cursor_style, g_cursor_blink, cwd);
+    } else tab.spawnTabWithCwd(allocator, term_cols, term_rows, g_cursor_style, g_cursor_blink, cwd);
+
+    if (ok) clearUiStateOnTabChange();
 }
 
 /// The Control the agent-control server drives. Backed by process-global state,
@@ -5088,6 +5061,256 @@ fn agentRequestSaveSshProfile(allocator: std.mem.Allocator, args: ai_chat.SshPro
     return overlays.agentSaveSshProfile(allocator, args);
 }
 
+const AgentTerminalFocusTarget = struct {
+    surface: *Surface,
+    tab_index: usize,
+};
+
+fn focusAgentTerminalSurfaceById(surface_id_raw: []const u8) ?AgentTerminalFocusTarget {
+    const surface_id = std.mem.trim(u8, surface_id_raw, " \t\r\n");
+    if (surface_id.len == 0) return null;
+
+    for (0..tab.g_tab_count) |tab_index| {
+        const tab_state = tab.g_tabs[tab_index] orelse continue;
+        if (tab_state.kind != .terminal) continue;
+        var it = tab_state.tree.surfaces();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.surface.remote_id[0..], surface_id)) continue;
+
+            if (active_tab_state.g_active_tab != tab_index) {
+                switchTab(tab_index);
+            }
+            tab_state.focused = entry.handle;
+            handleActiveSurfaceChangeWithinTab();
+            return .{
+                .surface = entry.surface,
+                .tab_index = tab_index,
+            };
+        }
+    }
+    return null;
+}
+
+fn agentRequestFocusTerminalSurface(allocator: std.mem.Allocator, surface_id: []const u8) anyerror!ai_chat.ToolSurface {
+    const target = focusAgentTerminalSurfaceById(surface_id) orelse return error.SurfaceNotFound;
+    return surface_snapshots.makeAgentToolSurface(
+        allocator,
+        target.surface,
+        target.tab_index,
+        true,
+    );
+}
+
+const AgentUiScreenshotCapture = struct {
+    rect: appwindow_ui_screenshot.Rect,
+    target: ai_chat_types.UiScreenshotTarget,
+    surface_id: ?[]const u8 = null,
+};
+
+const LiveUiScreenshotRect = struct {
+    rect: appwindow_ui_screenshot.Rect,
+    surface_id: ?[]const u8 = null,
+};
+
+fn fullUiScreenshotCapture(fb_width: u32, fb_height: u32) AgentUiScreenshotCapture {
+    return .{
+        .rect = .{ .x = 0, .y = 0, .width = fb_width, .height = fb_height },
+        .target = .active_tab,
+    };
+}
+
+fn splitRectToUiScreenshotRect(rect: split_layout.SplitRect) ?appwindow_ui_screenshot.Rect {
+    if (rect.width <= 0 or rect.height <= 0) return null;
+    return .{
+        .x = rect.x,
+        .y = rect.y,
+        .width = @intCast(rect.width),
+        .height = @intCast(rect.height),
+    };
+}
+
+fn liveUiScreenshotRectForHandle(handle: SplitTree.Node.Handle) ?LiveUiScreenshotRect {
+    for (0..split_layout.g_split_rect_count) |i| {
+        const rect = split_layout.g_split_rects[i];
+        if (rect.handle != handle) continue;
+        if (!split_layout.cachedRectIsLive(rect)) continue;
+        return .{
+            .rect = splitRectToUiScreenshotRect(rect) orelse return null,
+            .surface_id = if (rect.surface()) |surface| surface.remote_id[0..] else null,
+        };
+    }
+    return null;
+}
+
+fn liveUiScreenshotRectForSurfaceId(surface_id: []const u8) ?LiveUiScreenshotRect {
+    for (0..split_layout.g_split_rect_count) |i| {
+        const rect = split_layout.g_split_rects[i];
+        if (!split_layout.cachedRectIsLive(rect)) continue;
+        const surface = rect.surface() orelse continue;
+        if (std.mem.eql(u8, surface.remote_id[0..], surface_id)) {
+            return .{
+                .rect = splitRectToUiScreenshotRect(rect) orelse continue,
+                .surface_id = surface.remote_id[0..],
+            };
+        }
+    }
+    return null;
+}
+
+fn isFocusedUiScreenshotSelector(surface_id: []const u8) bool {
+    return surface_id.len == 0 or
+        std.ascii.eqlIgnoreCase(surface_id, "focused") or
+        std.ascii.eqlIgnoreCase(surface_id, "active") or
+        std.ascii.eqlIgnoreCase(surface_id, "current");
+}
+
+fn resolveAgentUiScreenshotCapture(
+    target: ai_chat_types.UiScreenshotTarget,
+    surface_id: ?[]const u8,
+    fb_width: u32,
+    fb_height: u32,
+) anyerror!AgentUiScreenshotCapture {
+    const full = fullUiScreenshotCapture(fb_width, fb_height);
+    const id = if (surface_id) |raw| std.mem.trim(u8, raw, " \t\r\n") else "";
+    const focused_selector = isFocusedUiScreenshotSelector(id);
+    switch (target) {
+        .active_tab => {
+            if (focused_selector) return full;
+            const active_tab = tab.activeTab() orelse return error.SurfaceNotInActiveTab;
+            if (active_tab.kind != .terminal) return error.SurfaceNotInActiveTab;
+            const live = liveUiScreenshotRectForSurfaceId(id) orelse return error.SurfaceNotInActiveTab;
+            return .{ .rect = full.rect, .target = .active_tab, .surface_id = live.surface_id };
+        },
+        .focused_panel => {
+            const active_tab = tab.activeTab() orelse {
+                if (focused_selector) return full;
+                return error.SurfaceNotInActiveTab;
+            };
+            if (active_tab.kind != .terminal) {
+                if (focused_selector) return full;
+                return error.SurfaceNotInActiveTab;
+            }
+
+            if (focused_selector) {
+                const live = liveUiScreenshotRectForHandle(active_tab.focused) orelse return full;
+                return .{ .rect = live.rect, .target = .focused_panel, .surface_id = live.surface_id };
+            }
+
+            const live = liveUiScreenshotRectForSurfaceId(id) orelse return error.SurfaceNotInActiveTab;
+            return .{ .rect = live.rect, .target = .focused_panel, .surface_id = live.surface_id };
+        },
+    }
+}
+
+fn ensureAbsoluteDir(path: []const u8) !void {
+    std.fs.makeDirAbsolute(path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        error.FileNotFound => {
+            const parent = std.fs.path.dirname(path) orelse return err;
+            try ensureAbsoluteDir(parent);
+            std.fs.makeDirAbsolute(path) catch |err2| switch (err2) {
+                error.PathAlreadyExists => {},
+                else => return err2,
+            };
+        },
+        else => return err,
+    };
+}
+
+fn writeUiScreenshotFile(path: []const u8, bytes: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        if (parent.len > 0) {
+            if (std.fs.path.isAbsolute(parent)) {
+                try ensureAbsoluteDir(parent);
+            } else {
+                try std.fs.cwd().makePath(parent);
+            }
+        }
+    }
+
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.fs.createFileAbsolute(path, .{ .truncate = true })
+    else
+        try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(bytes);
+}
+
+fn agentUiScreenshotBaseDir(allocator: std.mem.Allocator, working_dir: ?[]const u8) ![]const u8 {
+    if (working_dir) |wd| {
+        if (wd.len > 0) return allocator.dupe(u8, wd);
+    }
+    return platform_dirs.exportsDir(allocator);
+}
+
+fn agentRequestCaptureUiScreenshot(
+    allocator: std.mem.Allocator,
+    target: ai_chat_types.UiScreenshotTarget,
+    surface_id: ?[]const u8,
+    working_dir: ?[]const u8,
+) anyerror!ai_chat_types.UiScreenshotResult {
+    const win = g_window orelse return error.WindowUnavailable;
+    if (window_backend.isMinimized(win)) return error.WindowUnavailable;
+
+    const fb = window_backend.framebufferSize(win);
+    if (fb.width <= 0 or fb.height <= 0) return error.WindowUnavailable;
+    const fb_width: u32 = @intCast(fb.width);
+    const fb_height: u32 = @intCast(fb.height);
+
+    const output_base = try agentUiScreenshotBaseDir(allocator, working_dir);
+    defer allocator.free(output_base);
+
+    const capture = try resolveAgentUiScreenshotCapture(target, surface_id, fb_width, fb_height);
+    const rect = appwindow_ui_screenshot.clampRect(capture.rect, fb_width, fb_height) orelse return error.WindowUnavailable;
+
+    const bottom_up = try gpu.readback.readRgba(
+        allocator,
+        rect.x,
+        appwindow_ui_screenshot.glReadY(rect, fb_height),
+        rect.width,
+        rect.height,
+    );
+    defer allocator.free(bottom_up);
+
+    const top_down = try png_writer.flipRgbaRows(allocator, bottom_up, rect.width, rect.height);
+    defer allocator.free(top_down);
+
+    const output_image = try appwindow_ui_screenshot.fitRgbaToMaxLongEdge(
+        allocator,
+        top_down,
+        rect.width,
+        rect.height,
+        appwindow_ui_screenshot.max_output_long_edge,
+    );
+    defer output_image.deinit(allocator);
+
+    const png = try png_writer.encodeRgba(allocator, .{
+        .width = output_image.width,
+        .height = output_image.height,
+        .rgba = output_image.rgba,
+    });
+    defer allocator.free(png);
+
+    var result_surface_id: ?[]u8 = null;
+    errdefer if (result_surface_id) |id| allocator.free(id);
+    if (capture.surface_id) |id| {
+        result_surface_id = try allocator.dupe(u8, id);
+    }
+
+    const path = try appwindow_ui_screenshot.outputPath(allocator, output_base, std.time.milliTimestamp());
+    errdefer allocator.free(path);
+    try writeUiScreenshotFile(path, png);
+
+    return .{
+        .path = path,
+        .mime = "image/png",
+        .width = output_image.width,
+        .height = output_image.height,
+        .target = capture.target,
+        .surface_id = result_surface_id,
+    };
+}
+
 fn agentRequestHost() agent_requests.Host {
     return .{
         .nativeHandleForContext = agentRequestNativeHandle,
@@ -5097,6 +5320,8 @@ fn agentRequestHost() agent_requests.Host {
         .closeTabByIndex = agentRequestCloseTabByIndex,
         .connectSshProfile = agentRequestConnectSshProfile,
         .saveSshProfile = agentRequestSaveSshProfile,
+        .captureUiScreenshot = agentRequestCaptureUiScreenshot,
+        .focusTerminalSurface = agentRequestFocusTerminalSurface,
     };
 }
 
@@ -5235,6 +5460,8 @@ fn onPlatformMessage(msg: window_backend.MessageId, wParam: window_backend.WordP
         .agent_ssh_save => agent_requests.handleSshSaveRequest(@ptrFromInt(decoded.ptr), agent_host),
         .agent_tab_new => agent_requests.handleTabNewRequest(@ptrFromInt(decoded.ptr), agent_host),
         .agent_tab_close => agent_requests.handleTabCloseRequest(@ptrFromInt(decoded.ptr), agent_host),
+        .agent_ui_screenshot => agent_requests.handleUiScreenshotRequest(@ptrFromInt(decoded.ptr), agent_host),
+        .agent_terminal_focus => agent_requests.handleTerminalFocusRequest(@ptrFromInt(decoded.ptr), agent_host),
         .remote_ai_input => remote_sync.handleAiInputRequest(@ptrFromInt(decoded.ptr), remoteSyncHost()),
         .remote_open_ai_agent => remote_sync.handleAiAgentOpenRequest(@ptrFromInt(decoded.ptr), remoteSyncHost()),
         .weixin_control => weixin_bridge.handleControlRequest(@ptrFromInt(decoded.ptr), weixinBridgeHost()),
@@ -5254,6 +5481,8 @@ fn installAgentToolHost(self: *AppWindow) void {
         .saveSshProfile = agent_requests.saveSshProfile,
         .connectSshProfile = agent_requests.connectSshProfile,
         .sshConnectionForSurface = surface_snapshots.agentSshConnectionForSurface,
+        .uiScreenshot = agent_requests.uiScreenshot,
+        .focusTerminal = agent_requests.focusTerminal,
     });
 }
 
@@ -5809,13 +6038,13 @@ fn syncAiChatImeCaret(win: *window_backend.Window, session: *ai_chat.Session, ch
     const wh: f32 = @floatFromInt(size.height);
     session.mutex.lock();
     const input_text = session.input();
-    const layout = ai_chat_renderer.inputLayout(chat_x, chat_w, input_text);
-    const cursor = ai_chat_renderer.inputCursorRect(input_text, session.input_cursor, layout.text_x, layout.text_w);
+    const layout = assistant_conversation_renderer.inputLayout(chat_x, chat_w, input_text);
+    const cursor = assistant_conversation_renderer.inputCursorRect(input_text, session.inputCursorLocked(), layout.text_x, layout.text_w);
     const scrolled_row = session.input_scroll_row;
     const follow_cursor = session.input_scroll_follow_cursor;
     session.mutex.unlock();
     const input_line_h = @round(@max(23.0, font.g_titlebar_cell_height + 8.0));
-    const visible_rows = ai_chat_renderer.inputVisibleRowsForField(layout.field_h);
+    const visible_rows = assistant_conversation_renderer.inputVisibleRowsForField(layout.field_h);
     var first_row = scrolled_row;
     if (follow_cursor) {
         if (cursor.row < first_row) {
@@ -5827,7 +6056,7 @@ fn syncAiChatImeCaret(win: *window_backend.Window, session: *ai_chat.Session, ch
     if (cursor.row < first_row) return;
     const row = cursor.row - first_row;
     const field_top_px = wh - layout.field_y - layout.field_h;
-    const cursor_top_px = field_top_px + ai_chat_renderer.INPUT_FIELD_PAD_TOP + @as(f32, @floatFromInt(row)) * input_line_h;
+    const cursor_top_px = field_top_px + assistant_conversation_renderer.INPUT_FIELD_PAD_TOP + @as(f32, @floatFromInt(row)) * input_line_h;
     const cursor_y = cursor_top_px;
     const h = font.g_titlebar_cell_height;
     window_backend.setImeCaret(
@@ -6524,6 +6753,9 @@ fn runMainLoop(self: *AppWindow) !void {
         rememberWindowedPosition(win);
         // Fire any due /loop or /watch tasks (UI thread: tab.g_tabs is populated).
         ai_loop_store.tick(std.time.milliTimestamp());
+        // Open any tabs requested via `wisptermctl spawn` (queued by the ctl
+        // server thread, created here on the UI thread).
+        control_api.drainSpawnQueue();
 
         // Handle bells, notifications, and OSC 52 clipboard writes staged by
         // the IO threads. This runs before the render gate: background-tab
@@ -6557,6 +6789,7 @@ fn runMainLoop(self: *AppWindow) !void {
         const fb_width: c_int = fb.width;
         const fb_height: c_int = fb.height;
         if (window_backend.isMinimized(win) or fb_width <= 0 or fb_height <= 0) {
+            agent_requests.failPendingUiScreenshots(error.WindowUnavailable);
             const timeout_ms = render_gate.computeBlockTimeoutMs(.{
                 .visibility = .hidden,
                 .cursor_blink_enabled = false,
@@ -6584,7 +6817,7 @@ fn runMainLoop(self: *AppWindow) !void {
         });
 
         const signals = render_gate.RenderSignals{
-            .force_rebuild = g_force_rebuild or !g_cells_valid or pendingResizeActive() or windowState().layout_resize_immediate,
+            .force_rebuild = g_force_rebuild or !g_cells_valid or pendingResizeActive() or windowState().layout_resize_immediate or agent_requests.hasPendingUiScreenshot(),
             .any_surface_dirty = anyVisibleSurfaceDirty(),
             .cursor_blink_due = blink.due,
             .ai_streaming = aiStreamingActive(),
@@ -6603,6 +6836,12 @@ fn runMainLoop(self: *AppWindow) !void {
             continue;
         }
         if (blink.due) g_gate_last_blink_render = gate_now;
+
+        // A pending ui_screenshot is captured from this frame's framebuffer right
+        // after endFrame. The Metal backend can't read a presented+released
+        // drawable, so arm an in-frame capture before we render+endFrame. No-op
+        // on OpenGL (it reads the live back buffer post-endFrame).
+        if (agent_requests.hasPendingUiScreenshot()) gpu.state.armUiScreenshotCapture();
 
         gpu.gl_init.g_draw_call_count = 0;
         overlays.updateFps();
@@ -6895,6 +7134,7 @@ fn runMainLoop(self: *AppWindow) !void {
         logSwapDiagnosticsIfChanged(win, fb_width, fb_height);
         forceOpaqueBackbufferForPresent();
         gpu.state.endFrame();
+        agent_requests.capturePendingUiScreenshots(agentRequestHost());
         window_backend.swapBuffers(win);
         if (windowState().takePresentBringupSettlement()) {
             platform_window_state.settleD3dBringup(allocator);
@@ -6925,6 +7165,8 @@ fn runMainLoop(self: *AppWindow) !void {
             platform_window_state.blockD3dBringup(allocator, build_options.app_version);
         }
     }
+
+    agent_requests.failPendingUiScreenshots(error.WindowUnavailable);
 
     // Save window position + size for next session
     if (g_window) |w| {
@@ -6964,6 +7206,7 @@ fn runMainLoop(self: *AppWindow) !void {
     clearWeixinTranscriptCache();
     control_api.clearPanesCache();
     control_api.clearUiStateCache();
+    control_api.clearSpawnQueue();
     markdown_preview_renderer.deinit();
     browser_panel.deinit();
 
@@ -7069,6 +7312,169 @@ test "appwindow: render gate ignores background-tab surface dirty" {
     clearVisibleSurfaceDirty();
     try std.testing.expect(!active_surface.dirty.load(.acquire));
     try std.testing.expect(background_surface.dirty.load(.acquire));
+}
+
+test "appwindow: ui screenshot focused_panel uses focused non-terminal split rect" {
+    const allocator = std.testing.allocator;
+    const saved_active = active_tab_state.g_active_tab;
+    const saved_tab_count = tab.g_tab_count;
+    const saved_tab0 = tab.g_tabs[0];
+    const saved_split_rect_count = split_layout.g_split_rect_count;
+    const saved_split_rect0: split_layout.SplitRect = if (saved_split_rect_count > 0) split_layout.g_split_rects[0] else undefined;
+
+    var surface: Surface = undefined;
+    surface.ref_count = 1;
+    var active_tab_v = tab.TabState{ .tree = try SplitTree.init(allocator, &surface) };
+    defer active_tab_v.tree.deinit();
+
+    tab.g_tabs[0] = &active_tab_v;
+    tab.g_tab_count = 1;
+    active_tab_state.g_active_tab = 0;
+    split_layout.g_split_rect_count = 0;
+    defer {
+        if (saved_split_rect_count > 0) split_layout.g_split_rects[0] = saved_split_rect0;
+        split_layout.g_split_rect_count = saved_split_rect_count;
+        tab.g_tabs[0] = saved_tab0;
+        tab.g_tab_count = saved_tab_count;
+        active_tab_state.g_active_tab = saved_active;
+    }
+
+    const preview = tab.splitIntoPreview(allocator) orelse return error.SplitIntoPreviewFailed;
+    try std.testing.expect(tab.focusPreviewPane(preview));
+    const focused_pane = switch (active_tab_v.tree.nodes[active_tab_v.focused.idx()]) {
+        .leaf => |pane| pane,
+        .split => return error.FocusedIsSplit,
+    };
+
+    split_layout.g_split_rects[0] = .{
+        .x = 11,
+        .y = 22,
+        .width = 33,
+        .height = 44,
+        .cols = 0,
+        .rows = 0,
+        .pane = focused_pane,
+        .handle = active_tab_v.focused,
+    };
+    split_layout.g_split_rect_count = 1;
+
+    const capture = try resolveAgentUiScreenshotCapture(.focused_panel, null, 100, 100);
+    try std.testing.expectEqual(ai_chat_types.UiScreenshotTarget.focused_panel, capture.target);
+    try std.testing.expectEqual(appwindow_ui_screenshot.Rect{ .x = 11, .y = 22, .width = 33, .height = 44 }, capture.rect);
+}
+
+test "appwindow: ui screenshot explicit surface id errors on non-terminal active tab" {
+    const saved_active = active_tab_state.g_active_tab;
+    const saved_tab_count = tab.g_tab_count;
+    const saved_tab0 = tab.g_tabs[0];
+
+    var active_tab_v = tab.TabState{ .kind = .ai_chat, .tree = .empty };
+    tab.g_tabs[0] = &active_tab_v;
+    tab.g_tab_count = 1;
+    active_tab_state.g_active_tab = 0;
+    defer {
+        tab.g_tabs[0] = saved_tab0;
+        tab.g_tab_count = saved_tab_count;
+        active_tab_state.g_active_tab = saved_active;
+    }
+
+    try std.testing.expectError(
+        error.SurfaceNotInActiveTab,
+        resolveAgentUiScreenshotCapture(.focused_panel, "surface-123", 100, 100),
+    );
+    try std.testing.expectError(
+        error.SurfaceNotInActiveTab,
+        resolveAgentUiScreenshotCapture(.active_tab, "surface-123", 100, 100),
+    );
+}
+
+test "appwindow: agent terminal focus activates the owning tab and split" {
+    const allocator = std.testing.allocator;
+    const id_a = "00000000000000a1";
+    const id_b = "00000000000000b2";
+    const id_c = "00000000000000c3";
+
+    var surface_a: Surface = undefined;
+    surface_a.ref_count = 1;
+    @memcpy(surface_a.remote_id[0..], id_a);
+    var surface_b: Surface = undefined;
+    surface_b.ref_count = 1;
+    @memcpy(surface_b.remote_id[0..], id_b);
+    var surface_c: Surface = undefined;
+    surface_c.ref_count = 1;
+    @memcpy(surface_c.remote_id[0..], id_c);
+
+    var tab0_v = tab.TabState{ .tree = try SplitTree.init(allocator, &surface_a) };
+    defer tab0_v.tree.deinit();
+
+    var left = session_persist.NodeSnap{ .leaf = .{ .surface = .{ .local_shell = .{} } } };
+    var right = session_persist.NodeSnap{ .leaf = .{ .surface = .{ .local_shell = .{} } } };
+    var root = session_persist.NodeSnap{ .split = .{ .layout = .horizontal, .ratio = 0.5, .left = &left, .right = &right } };
+    const Stub = struct {
+        var idx: usize = 0;
+        var surfaces: [2]*Surface = undefined;
+        fn make(_: *const session_persist.SurfaceSnap, _: std.mem.Allocator) ?*Surface {
+            const surface = surfaces[idx];
+            idx += 1;
+            return surface;
+        }
+    };
+    Stub.idx = 0;
+    Stub.surfaces = .{ &surface_b, &surface_c };
+    var tab1_v = tab.TabState{
+        .tree = try SplitTree.fromSnapshot(allocator, &root, Stub.make),
+        .focused = @enumFromInt(1),
+    };
+    defer tab1_v.tree.arena.deinit();
+
+    const saved_active = active_tab_state.g_active_tab;
+    const saved_tab_count = tab.g_tab_count;
+    const saved_tab0 = tab.g_tabs[0];
+    const saved_tab1 = tab.g_tabs[1];
+    defer {
+        tab.g_tabs[0] = saved_tab0;
+        tab.g_tabs[1] = saved_tab1;
+        tab.g_tab_count = saved_tab_count;
+        active_tab_state.g_active_tab = saved_active;
+    }
+
+    tab.g_tabs[0] = &tab0_v;
+    tab.g_tabs[1] = &tab1_v;
+    tab.g_tab_count = 2;
+    active_tab_state.g_active_tab = 0;
+
+    const target = focusAgentTerminalSurfaceById(id_c) orelse return error.FocusTargetMissing;
+    try std.testing.expect(target.surface == &surface_c);
+    try std.testing.expectEqual(@as(usize, 1), target.tab_index);
+    try std.testing.expectEqual(@as(usize, 1), active_tab_state.g_active_tab);
+    try std.testing.expectEqual(@as(SplitTree.Node.Handle.Backing, 2), @intFromEnum(tab1_v.focused));
+}
+
+test "appwindow: ui screenshot base dir falls back to exports dir" {
+    const allocator = std.testing.allocator;
+    platform_dirs.setTestConfigDirForCurrentThread("/tmp/wispterm-test-config");
+    defer platform_dirs.clearTestConfigDirForCurrentThread();
+
+    const fallback = try agentUiScreenshotBaseDir(allocator, null);
+    defer allocator.free(fallback);
+    const expected = try std.fs.path.join(allocator, &.{ "/tmp/wispterm-test-config", "exports" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, fallback);
+
+    const explicit = try agentUiScreenshotBaseDir(allocator, "/work/project");
+    defer allocator.free(explicit);
+    try std.testing.expectEqualStrings("/work/project", explicit);
+}
+
+test "appwindow: ui screenshot reports unavailable window before missing working dir" {
+    const saved_window = g_window;
+    g_window = null;
+    defer g_window = saved_window;
+
+    try std.testing.expectError(
+        error.WindowUnavailable,
+        agentRequestCaptureUiScreenshot(std.testing.allocator, .active_tab, null, null),
+    );
 }
 
 test "appwindow: ai history content width accounts for right panels" {

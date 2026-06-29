@@ -15,14 +15,14 @@ const overlays = AppWindow.overlays;
 const split_layout = AppWindow.split_layout;
 const file_explorer = AppWindow.file_explorer;
 const file_backend = @import("file_backend.zig");
-const markdown_preview = @import("markdown_preview.zig");
-const preview_gallery = @import("preview_gallery.zig");
-const preview_token = @import("preview_token.zig");
+const markdown_preview = @import("preview/markdown.zig");
+const preview_gallery = @import("preview/gallery.zig");
+const preview_token = @import("preview/token.zig");
 const browser_panel = AppWindow.browser_panel;
-const html_server = @import("html_server.zig");
-const html_server_model = @import("html_server_model.zig");
-const ai_sidebar = @import("ai_sidebar.zig");
-const copilot_hint_gate = @import("copilot_hint_gate.zig");
+const html_server = @import("html/server.zig");
+const html_server_model = @import("html/server_model.zig");
+const ai_sidebar = @import("assistant/sidebar/panel.zig");
+const copilot_hint_gate = @import("assistant/sidebar/hint_gate.zig");
 const ui_perf = AppWindow.ui_perf;
 const render_diagnostics = @import("render_diagnostics.zig");
 const link_open = @import("link_open.zig");
@@ -41,6 +41,7 @@ const window_backend = @import("platform/window_backend.zig");
 const window_metrics = @import("ui/window_metrics.zig");
 const WindowMetrics = window_metrics.WindowMetrics;
 const input_key = @import("input/key.zig");
+const assistant_conversation = @import("input/assistant_conversation.zig");
 const command_dispatch = @import("input/command_dispatch.zig");
 const file_explorer_keymap = @import("input/file_explorer_keymap.zig");
 const input_effects = @import("input/effects.zig");
@@ -49,7 +50,7 @@ const command_palette_input = @import("renderer/overlays/command_palette_input.z
 const Config = @import("config.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("split_tree.zig");
-const PreviewPane = @import("preview_pane.zig");
+const PreviewPane = @import("preview/pane.zig");
 const PreviewImageDrag = @import("input/preview_image_drag.zig");
 const selection_unit = @import("selection_unit.zig");
 const Selection = Surface.Selection;
@@ -59,7 +60,7 @@ const clipboard = @import("input/clipboard.zig");
 const click_tracker = @import("input/click_tracker.zig");
 const hit_test = @import("input/hit_test.zig");
 const preview_source = @import("input/preview_source.zig");
-const preview_diagnostics = @import("preview_diagnostics.zig");
+const preview_diagnostics = @import("preview/diagnostics.zig");
 const ls_path_context = @import("input/ls_path_context.zig");
 const terminal_link_action = @import("input/terminal_link_action.zig");
 const underline_span = @import("input/underline_span.zig");
@@ -68,10 +69,10 @@ const mouse_dispatch = @import("input/mouse_dispatch.zig");
 const mouse_wheel_scroll = @import("input/mouse_wheel_scroll.zig");
 const close_confirm = @import("close_confirm.zig");
 const close_confirm_state = @import("ui/close_shortcut_confirm.zig");
-const jupyter_picker = @import("jupyter_picker.zig");
-const copilot_picker = @import("copilot_picker.zig");
-const jupyter_detect = @import("jupyter_detect.zig");
-const scp = @import("scp.zig");
+const jupyter_picker = @import("jupyter/picker.zig");
+const copilot_picker = @import("assistant/sidebar/picker.zig");
+const jupyter_detect = @import("jupyter/detect.zig");
+const scp = @import("ssh/scp.zig");
 const writeToPty = clipboard.writeToPty;
 pub const copyTextToClipboard = clipboard.copyTextToClipboard;
 const activeTerminalSelectionExists = clipboard.activeTerminalSelectionExists;
@@ -1742,6 +1743,40 @@ test "input: overlay navigation drives the render gate to repaint" {
     try std.testing.expect(render_gate.frameNeedsRender(signals));
 }
 
+test "input: right-clicking a sidebar tab starts tab rename" {
+    const previous_tabs = tab.g_tabs;
+    const previous_count = tab.g_tab_count;
+    const previous_active = active_tab_state.g_active_tab;
+    const previous_sidebar = tab.g_sidebar_visible;
+    const previous_sidebar_width = titlebar.g_sidebar_width;
+    defer {
+        tab.g_tabs = previous_tabs;
+        tab.g_tab_count = previous_count;
+        active_tab_state.g_active_tab = previous_active;
+        tab.g_sidebar_visible = previous_sidebar;
+        titlebar.g_sidebar_width = previous_sidebar_width;
+        tab.g_tab_rename_active = false;
+        tab.g_tab_rename_idx = 0;
+    }
+
+    var first = tab.TabState{ .kind = .skill_center, .tree = .empty };
+    var second = tab.TabState{ .kind = .skill_center, .tree = .empty };
+    tab.g_tabs = .{null} ** tab.MAX_TABS;
+    tab.g_tabs[0] = &first;
+    tab.g_tabs[1] = &second;
+    tab.g_tab_count = 2;
+    active_tab_state.g_active_tab = 0;
+    tab.g_sidebar_visible = true;
+    titlebar.g_sidebar_width = 220;
+    tab.g_tab_rename_active = false;
+
+    const y: i32 = @intFromFloat(titlebarHeight() + titlebar.sidebarHeaderHeight() + 6 + titlebar.sidebarRowHeight() / 2);
+    handleMouseButton(.{ .button = .right, .action = .release, .x = 24, .y = y });
+
+    try std.testing.expect(tab.g_tab_rename_active);
+    try std.testing.expectEqual(@as(usize, 0), tab.g_tab_rename_idx);
+}
+
 test "macOS UI smoke: Cmd+Shift+B toggles the tab sidebar" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
 
@@ -2046,8 +2081,8 @@ pub fn cancelTransientMouseState(win: anytype) void {
     g_ai_input_scroll_chat = null;
     g_ai_transcript_scroll_dragging = false;
     g_ai_transcript_scroll_chat = null;
-    AppWindow.ai_chat_renderer.g_transcript_scrollbar_dragging = false;
-    AppWindow.ai_chat_renderer.g_transcript_scrollbar_hover = false;
+    AppWindow.assistant_conversation_renderer.g_transcript_scrollbar_dragging = false;
+    AppWindow.assistant_conversation_renderer.g_transcript_scrollbar_hover = false;
     g_ai_transcript_scroll_panel = .active_chat;
     g_ai_transcript_selecting = false;
     g_ai_transcript_select_chat = null;
@@ -2663,10 +2698,10 @@ fn dispatchChar(ev: platform_input.CharEvent) ui_effect.UiEffect {
         tab.handleRenameChar(ev.codepoint);
         return .none;
     }
-    if (AppWindow.activeAiChat()) |chat| {
+    if (assistant_conversation.current(aiCopilotFocused())) |target| {
         if (!ev.ctrl and !ev.alt) {
             AppWindow.resetCursorBlink();
-            chat.handleChar(ev.codepoint);
+            target.session.handleChar(ev.codepoint);
             return input_effects.repaint();
         }
         return .none;
@@ -2674,7 +2709,8 @@ fn dispatchChar(ev: platform_input.CharEvent) ui_effect.UiEffect {
     if (AppWindow.activeAiHistory() != null) {
         // aiHistoryInsertCodepoint only consumes the codepoint while the Search box
         // owns focus, so 'r'/Space type into the query there yet stay free to act as
-        // Scan/Preview shortcuts when another panel is focused.
+        // Scan/Preview shortcuts when another panel is focused. A Space on an empty
+        // query is declined (see typeIntoSearch) so it previews the transcript too.
         if (!ev.ctrl and !ev.alt and !ev.super) {
             _ = AppWindow.aiHistoryInsertCodepoint(ev.codepoint);
         }
@@ -2701,19 +2737,6 @@ fn dispatchChar(ev: platform_input.CharEvent) ui_effect.UiEffect {
             _ = AppWindow.portForwardingInsertChar(ev.codepoint);
         }
         return .none;
-    }
-    // AI copilot sidebar (terminal tabs): when the copilot owns focus, route
-    // text input to its composer. `activeCopilotSessionForInput` is non-null
-    // only when the panel is visible on the active terminal tab.
-    if (aiCopilotFocused()) {
-        if (AppWindow.activeCopilotSessionForInput()) |chat| {
-            if (!ev.ctrl and !ev.alt) {
-                AppWindow.resetCursorBlink();
-                chat.handleChar(ev.codepoint);
-                return input_effects.repaint();
-            }
-            return .none;
-        }
     }
     // A focused raster (image/PDF) preview consumes +/=/- as zoom in/out. Only
     // raster previews claim these chars (markdown previews ignore them so they
@@ -2932,27 +2955,15 @@ fn executeCommand(cmd: command_dispatch.Command) bool {
         // Late
         .copy => copySelectionToClipboard(),
         .paste => {
-            if (AppWindow.activeAiChat()) |chat| {
-                pasteFromClipboardIntoAiChat(chat);
-            } else if (aiCopilotFocused()) {
-                if (AppWindow.activeCopilotSessionForInput()) |chat| {
-                    pasteFromClipboardIntoAiChat(chat);
-                } else {
-                    pasteFromClipboard();
-                }
+            if (assistant_conversation.current(aiCopilotFocused())) |target| {
+                pasteFromClipboardIntoAiChat(target.session);
             } else {
                 pasteFromClipboard();
             }
         },
         .paste_image => {
-            if (AppWindow.activeAiChat()) |chat| {
-                pasteImageIntoAiChat(chat);
-            } else if (aiCopilotFocused()) {
-                if (AppWindow.activeCopilotSessionForInput()) |chat| {
-                    pasteImageIntoAiChat(chat);
-                } else {
-                    pasteImageFromClipboard();
-                }
+            if (assistant_conversation.current(aiCopilotFocused())) |target| {
+                pasteImageIntoAiChat(target.session);
             } else {
                 pasteImageFromClipboard();
             }
@@ -3152,49 +3163,41 @@ fn dispatchKey(ev: platform_input.KeyEvent) ui_effect.UiEffect {
             return input_effects.repaint();
         }
     }
-    if (AppWindow.activeAiChat()) |chat| {
+    if (assistant_conversation.current(aiCopilotFocused())) |target| {
         // Accept Cmd (super, macOS) or Ctrl (Windows) for chat editing keys.
         const mod = ev.ctrl or ev.super;
         if (mod and !ev.alt and ev.key_code == 0x41) { // select all
-            chat.selectAll();
+            target.session.selectAll();
             return input_effects.repaint();
         }
         if (mod and !ev.alt and ev.key_code == 0x43) { // copy
-            copyAiChatToClipboard(chat);
+            copyAiChatToClipboard(target.session);
             return .none;
         }
         if (mod and !ev.alt and ev.key_code == 0x58) { // cut input
-            copyAiChatCutToClipboard(chat);
+            copyAiChatCutToClipboard(target.session);
             return .none;
-        }
-    }
-    // AI copilot sidebar editing-mod keys (select-all / copy / cut), mirroring
-    // the ai_chat tab block above but for the copilot session.
-    if (aiCopilotFocused()) {
-        if (AppWindow.activeCopilotSessionForInput()) |chat| {
-            const mod = ev.ctrl or ev.super;
-            if (mod and !ev.alt and ev.key_code == 0x41) { // select all
-                chat.selectAll();
-                return input_effects.repaint();
-            }
-            if (mod and !ev.alt and ev.key_code == 0x43) { // copy
-                copyAiChatToClipboard(chat);
-                return .none;
-            }
-            if (mod and !ev.alt and ev.key_code == 0x58) { // cut input
-                copyAiChatCutToClipboard(chat);
-                return .none;
-            }
         }
     }
     if (action) |app_action| {
         if (handleConfiguredKeybindAction(app_action, .late)) return .none;
     }
 
-    if (AppWindow.activeAiChat()) |chat| {
+    if (assistant_conversation.current(aiCopilotFocused())) |target| {
+        if (target.isSidebar() and ev.key_code == platform_input.key_escape) {
+            if (target.session.requestState().inflight) {
+                target.session.stopRequest();
+            } else if (target.session.hasSelection()) {
+                target.session.clearSelection();
+            } else {
+                AppWindow.hideAiCopilot();
+            }
+            return input_effects.repaint();
+        }
         if (isAiChatKey(ev)) {
             AppWindow.resetCursorBlink();
-            chat.handleKeyWithWrapCols(key_event, aiChatInputWrapCols());
+            const wrap_cols = if (target.isSidebar()) aiCopilotInputWrapCols() else aiChatInputWrapCols();
+            target.session.handleKeyWithWrapCols(key_event, wrap_cols);
             return input_effects.repaint();
         }
     }
@@ -3246,7 +3249,7 @@ fn dispatchKey(ev: platform_input.KeyEvent) ui_effect.UiEffect {
                 _ = AppWindow.aiHistoryScrollTranscript(1 << 30);
                 return .none;
             },
-            0x20 => if (plain and !search_focused) {
+            0x20 => if (plain and AppWindow.aiHistorySpacePreviews()) {
                 _ = AppWindow.aiHistoryPreviewSelectedTranscript();
                 return .none;
             },
@@ -3467,34 +3470,6 @@ fn dispatchKey(ev: platform_input.KeyEvent) ui_effect.UiEffect {
         return .none;
     }
 
-    // AI copilot sidebar (terminal tabs): route editing/navigation keys to the
-    // copilot composer. Esc is intercepted specially so it never reaches the
-    // terminal — it stops an in-flight request, or hides the panel when idle.
-    if (aiCopilotFocused()) {
-        if (AppWindow.activeCopilotSessionForInput()) |chat| {
-            if (ev.key_code == platform_input.key_escape) {
-                // Progressive Esc: stop an in-flight request, else clear an
-                // active selection, else hide the panel. Matches the AI-chat
-                // tab's stop/clear behavior; closing is only the final step,
-                // so Esc never abruptly dismisses a panel that still has a
-                // selection to clear.
-                if (chat.requestState().inflight) {
-                    chat.stopRequest();
-                } else if (chat.hasSelection()) {
-                    chat.clearSelection();
-                } else {
-                    AppWindow.hideAiCopilot();
-                }
-                return input_effects.repaint();
-            }
-            if (isAiChatKey(ev)) {
-                AppWindow.resetCursorBlink();
-                chat.handleKeyWithWrapCols(key_event, aiCopilotInputWrapCols());
-                return input_effects.repaint();
-            }
-        }
-    }
-
     // A focused preview leaf consumes plain navigation keys for scroll/pan.
     // Only engaged when a preview actually holds focus; otherwise this block is
     // skipped entirely and terminal/copilot key handling is unchanged. Modified
@@ -3644,7 +3619,7 @@ fn aiChatInputWrapCols() usize {
     const size = clientSize(win);
     const ww: f32 = @floatFromInt(size.width);
     const panel_w = @max(1.0, ww - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidth());
-    return AppWindow.ai_chat_renderer.inputWrapColumns(panel_w);
+    return AppWindow.assistant_conversation_renderer.inputWrapColumns(panel_w);
 }
 
 /// Wrap columns for the AI copilot sidebar's composer. Mirrors
@@ -3654,7 +3629,7 @@ fn aiCopilotInputWrapCols() usize {
     const win = AppWindow.g_window orelse return std.math.maxInt(usize);
     const size = clientSize(win);
     const panel_w = AppWindow.aiCopilotWidth(size.width);
-    return AppWindow.ai_chat_renderer.inputWrapColumns(panel_w);
+    return AppWindow.assistant_conversation_renderer.inputWrapColumns(panel_w);
 }
 
 fn handleBrowserUrlBarKey(ev: platform_input.KeyEvent) void {
@@ -3769,12 +3744,12 @@ fn hitTestSidebarTabCloseButton(xpos: f64, ypos: f64, tab_idx: usize) bool {
     return hit_test.sidebarTabCloseButton(sidebarLayout(), xpos, ypos, tab_idx);
 }
 
-fn shouldStartSidebarTabRename(xpos: f64, ypos: f64, tab_idx: usize) bool {
-    if (tab_idx >= tab.g_tab_count) return false;
-    const layout = sidebarLayout();
-    if (hit_test.sidebarPlusButton(layout, xpos, ypos)) return false;
-    if (hit_test.sidebarResizeHandle(layout, xpos, ypos)) return false;
-    if (hit_test.sidebarTabCloseButton(layout, xpos, ypos, tab_idx)) return false;
+fn handleSidebarTabRenameGesture(xpos: f64, ypos: f64) bool {
+    if (hitTestSidebarTab(xpos, ypos) == null) return false;
+    if (hit_test.sidebarTabRenameTarget(sidebarLayout(), xpos, ypos)) |tab_idx| {
+        tab.startTabRename(tab_idx);
+        requestInputRepaint();
+    }
     return true;
 }
 
@@ -3898,7 +3873,7 @@ fn aiCopilotHeaderLayout() ?hit_test.PanelHeaderLayout {
         .left = @floatFromInt(bounds.left),
         .right = @floatFromInt(bounds.right),
         .top = @floatFromInt(bounds.top),
-        .height = @floatCast(AppWindow.ai_chat_renderer.HEADER_H),
+        .height = @floatCast(AppWindow.assistant_conversation_renderer.HEADER_H),
     };
 }
 
@@ -4041,7 +4016,7 @@ fn handleFileExplorerKey(ev: platform_input.KeyEvent) bool {
     // Normal navigation mode
     switch (ev.key_code) {
         key_escape => {
-            file_explorer.g_focused = false;
+            file_explorer.blur();
             return true;
         },
         key_up, key_down, key_enter => {
@@ -4052,35 +4027,6 @@ fn handleFileExplorerKey(ev: platform_input.KeyEvent) bool {
                 file_explorer.handleAction(action);
             }
             return true;
-        },
-        0x52 => { // 'R': bare = rename, Ctrl/Cmd+R = refresh
-            if (!ev.ctrl and !ev.alt and !ev.super) {
-                file_explorer.startRename();
-                return true;
-            }
-            if ((ev.ctrl or ev.super) and !ev.alt and !ev.shift) {
-                file_explorer.refresh();
-                return true;
-            }
-            return false;
-        },
-        0x4E => { // 'N' key = new file, Shift+N = new dir
-            if (!ev.ctrl and !ev.alt and !ev.super) {
-                if (ev.shift) {
-                    file_explorer.startNewDir();
-                } else {
-                    file_explorer.startNewFile();
-                }
-                return true;
-            }
-            return false;
-        },
-        0x44 => { // 'D' key = delete
-            if (!ev.ctrl and !ev.alt and !ev.shift and !ev.super) {
-                file_explorer.startDelete();
-                return true;
-            }
-            return false;
         },
         0x53 => { // 'S' key: Ctrl/Cmd+S = download selected file
             if ((ev.ctrl or ev.super) and !ev.alt and !ev.shift) {
@@ -4107,18 +4053,20 @@ fn handleFileExplorerKey(ev: platform_input.KeyEvent) bool {
             }
             return false;
         },
-        platform_input.key_f5 => {
-            file_explorer.refresh();
-            return true;
+        else => {
+            if (file_explorer_keymap.fromOperationKey(ev)) |action| {
+                file_explorer.handleAction(action);
+                return true;
+            }
+            return false;
         },
-        else => return false,
     }
 }
 
 fn handleAgentHistoryKey(ev: platform_input.KeyEvent) bool {
     switch (ev.key_code) {
         platform_input.key_escape => {
-            file_explorer.g_focused = false;
+            file_explorer.blur();
             return true;
         },
         platform_input.key_up => {
@@ -4191,7 +4139,7 @@ fn openFolderDialogAndUpload() void {
 }
 
 fn handleFileExplorerPress(xpos: f64, ypos: f64, ctrl: bool, shift: bool, alt: bool, super: bool) void {
-    file_explorer.g_focused = true;
+    file_explorer.focus();
 
     // Check resize handle first
     if (hitTestFileExplorerResizeHandle(xpos, ypos)) {
@@ -4221,22 +4169,16 @@ fn handleFileExplorerPress(xpos: f64, ypos: f64, ctrl: bool, shift: bool, alt: b
     const list_top = titlebar_h + header_h;
     if (ypos < list_top) return;
 
-    const row_h: f64 = @floatCast(file_explorer.rowHeight());
-    const scroll: f64 = @floatCast(file_explorer.g_scroll_offset);
-    const row_idx: usize = @intFromFloat((ypos - list_top + scroll) / row_h);
-
-    if (row_idx < file_explorer.g_entry_count) {
+    if (file_explorer.rowIndexAtListY(ypos - list_top)) |row_idx| {
         const click_count = nextLeftClickCount(xpos, ypos);
-        file_explorer.g_selected = row_idx;
-        if (!file_explorer.g_entries[row_idx].is_dir and ((primaryOpenMod(ctrl, super) and !shift and !alt) or click_count == 2)) {
-            if (openFileExplorerPreview(row_idx)) {
+        const entry = file_explorer.selectEntry(row_idx) orelse return;
+        if (!entry.is_dir and ((primaryOpenMod(ctrl, super) and !shift and !alt) or click_count == 2)) {
+            if (openFileExplorerPreview(entry)) {
                 requestInputRebuild();
                 return;
             }
         }
-        if (file_explorer.g_entries[row_idx].is_dir) {
-            file_explorer.toggleExpand(row_idx);
-        }
+        _ = file_explorer.toggleDirectoryAt(row_idx);
         requestInputRebuild();
     }
 }
@@ -4267,9 +4209,9 @@ fn handleAgentHistoryPress(xpos: f64, ypos: f64) void {
 
 fn activateSelectedAgentHistoryRow() void {
     const session_id = file_explorer.selectedHistorySessionId() orelse return;
-    file_explorer.g_focused = false;
+    file_explorer.blur();
     if (!AppWindow.reopenAiChatTabFromHistorySessionId(session_id)) return;
-    file_explorer.g_focused = false;
+    file_explorer.blur();
 }
 
 fn deleteSelectedAgentHistoryRow() void {
@@ -4959,10 +4901,10 @@ fn openPreviewNew(kind: markdown_preview.Kind, title: []const u8, path: []const 
 }
 
 fn fileExplorerPreviewSourceKind() ?PreviewPane.PreviewSourceKind {
-    return switch (file_explorer.g_mode) {
+    return switch (file_explorer.sourceSnapshot() orelse return null) {
         .local => .local,
         .wsl => .wsl,
-        .remote => if (file_explorer.g_has_ssh_conn) .{ .remote = file_explorer.g_ssh_conn } else null,
+        .remote => |conn| .{ .remote = conn },
     };
 }
 
@@ -4974,17 +4916,13 @@ fn terminalPreviewSourceKind(surface: *Surface) ?PreviewPane.PreviewSourceKind {
     };
 }
 
-fn openFileExplorerPreview(row_idx: usize) bool {
+fn openFileExplorerPreview(entry: file_explorer.EntryView) bool {
     const perf = ui_perf.begin("input.open_file_explorer_preview");
     defer perf.end();
 
-    if (row_idx >= file_explorer.g_entry_count) return false;
-    const entry = &file_explorer.g_entries[row_idx];
     if (entry.is_dir) return false;
 
-    const path = entry.path_buf[0..entry.path_len];
-    const kind = markdown_preview.detectKind(path) orelse return false;
-    const title = entry.name_buf[0..entry.name_len];
+    const kind = markdown_preview.detectKind(entry.path) orelse return false;
     const source_kind = fileExplorerPreviewSourceKind() orelse {
         file_explorer.setTransferStatus(.failed, "Preview failed");
         return true;
@@ -4992,7 +4930,7 @@ fn openFileExplorerPreview(row_idx: usize) bool {
 
     // File-explorer preview keeps moving focus onto the preview so its scroll /
     // gallery keys work straight away (the user is browsing files, not typing).
-    return openPreviewAsync(kind, title, path, source_kind, true);
+    return openPreviewAsync(kind, entry.name, entry.path, source_kind, true);
 }
 
 /// Infer the `ls <dir>/` directory prefix for the clicked cell, copied into
@@ -5091,7 +5029,7 @@ fn buildRemotePathKindCommand(buf: []u8, remote_path: []const u8) ?[]const u8 {
     ) catch null;
 }
 
-fn remotePathIsDirectoryForDownload(allocator: std.mem.Allocator, conn: *const @import("ssh_connection.zig").SshConnection, remote_path: []const u8) ?bool {
+fn remotePathIsDirectoryForDownload(allocator: std.mem.Allocator, conn: *const @import("ssh/connection.zig").SshConnection, remote_path: []const u8) ?bool {
     var cmd_buf: [2300]u8 = undefined;
     const cmd = buildRemotePathKindCommand(cmd_buf[0..], remote_path) orelse return null;
     // Runs on the UI thread, so bound it: a hung remote `test -d` becomes a
@@ -5451,12 +5389,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             }
             return;
         }
-        if (hitTestSidebarTab(xpos, ypos)) |tab_idx| {
-            if (shouldStartSidebarTabRename(xpos, ypos, tab_idx)) {
-                tab.startTabRename(tab_idx);
-            }
-            return;
-        }
+        if (handleSidebarTabRenameGesture(xpos, ypos)) return;
         // No chrome hit — this is a double-click in terminal content. The macOS
         // backend reports the 2nd/3rd/4th click of a multi-click as
         // double_click (clickCount > 1) rather than press, so they never reach
@@ -5481,7 +5414,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
         if (AppWindow.activeAiChat()) |chat| {
             const win = AppWindow.g_window orelse return;
             const fb = window_backend.framebufferSize(win);
-            if (AppWindow.ai_chat_renderer.inputFieldMetricsAt(
+            if (AppWindow.assistant_conversation_renderer.inputFieldMetricsAt(
                 chat,
                 xpos,
                 ypos,
@@ -5500,6 +5433,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
     // Ctrl+right-click (Cmd on macOS) over a local terminal opens the file under
     // the cursor in the OS default app; otherwise follow the configured action.
     if (ev.button == .right and ev.action == .release) {
+        if (handleSidebarTabRenameGesture(@floatFromInt(ev.x), @floatFromInt(ev.y))) return;
         if (openInEditorAtRightClick(ev)) return;
         handleConfiguredRightClick();
         return;
@@ -5579,8 +5513,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             }
 
             if (over_browser_url_bar) {
-                file_explorer.g_focused = false;
-                if (file_explorer.hasActiveOp()) file_explorer.cancelOp();
+                file_explorer.blurAndCancelOp();
                 browser_panel.focusUrlBar();
                 markBrowserUrlBarDirty();
                 return;
@@ -5592,8 +5525,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             }
 
             if (hitTestBrowserPanel(xpos, ypos)) {
-                file_explorer.g_focused = false;
-                if (file_explorer.hasActiveOp()) file_explorer.cancelOp();
+                file_explorer.blurAndCancelOp();
                 browser_panel.blurUrlBar();
                 markBrowserUrlBarDirty();
                 browser_panel.focus();
@@ -5607,8 +5539,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             }
 
             // Clicking outside file explorer unfocuses it
-            file_explorer.g_focused = false;
-            if (file_explorer.hasActiveOp()) file_explorer.cancelOp();
+            file_explorer.blurAndCancelOp();
 
             if (AppWindow.activeAiHistory() != null) {
                 if (AppWindow.aiHistoryHandleMousePress(xpos, ypos)) return;
@@ -5640,7 +5571,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                         focusAiCopilot();
                         const chat_x: f32 = @floatFromInt(bounds.left);
                         const chat_w: f32 = @floatFromInt(bounds.right - bounds.left);
-                        if (AppWindow.ai_chat_renderer.stopButtonHitTest(
+                        if (AppWindow.assistant_conversation_renderer.stopButtonHitTest(
                             chat,
                             xpos,
                             ypos,
@@ -5654,7 +5585,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                             requestInputRepaint();
                             return;
                         }
-                        if (AppWindow.ai_chat_renderer.missingApiKeyStatusHitTest(
+                        if (AppWindow.assistant_conversation_renderer.missingApiKeyStatusHitTest(
                             chat,
                             xpos,
                             ypos,
@@ -5668,7 +5599,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                             requestInputRepaint();
                             return;
                         }
-                        if (AppWindow.ai_chat_renderer.interactionHitTest(
+                        if (AppWindow.assistant_conversation_renderer.interactionHitTest(
                             chat,
                             xpos,
                             ypos,
@@ -5695,7 +5626,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                             }
                             return;
                         }
-                        if (AppWindow.ai_chat_renderer.modelLabelHitTest(
+                        if (AppWindow.assistant_conversation_renderer.modelLabelHitTest(
                             chat,
                             xpos,
                             ypos,
@@ -5708,7 +5639,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                             requestInputRepaint();
                             return;
                         }
-                        if (AppWindow.ai_chat_renderer.permissionChipHitTest(
+                        if (AppWindow.assistant_conversation_renderer.permissionChipHitTest(
                             xpos,
                             ypos,
                             @floatFromInt(fb.width),
@@ -5719,7 +5650,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                             toggleAiAgentPermission();
                             return;
                         }
-                        if (AppWindow.ai_chat_renderer.transcriptScrollbarHitTest(
+                        if (AppWindow.assistant_conversation_renderer.transcriptScrollbarHitTest(
                             chat,
                             xpos,
                             ypos,
@@ -5733,13 +5664,13 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                             g_ai_transcript_scroll_chat = chat;
                             g_ai_transcript_scroll_drag_offset = drag_offset;
                             g_ai_transcript_scroll_panel = .copilot_sidebar;
-                            AppWindow.ai_chat_renderer.g_transcript_scrollbar_dragging = true;
+                            AppWindow.assistant_conversation_renderer.g_transcript_scrollbar_dragging = true;
                             applyAiTranscriptScrollbarDrag(chat, ypos);
                             requestInputRepaint();
                             return;
                         }
                         if (!ev.ctrl and !ev.alt) {
-                            if (AppWindow.ai_chat_renderer.transcriptTextHitTest(
+                            if (AppWindow.assistant_conversation_renderer.transcriptTextHitTest(
                                 chat,
                                 xpos,
                                 ypos,
@@ -5773,7 +5704,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             if (AppWindow.activeAiChat()) |chat| {
                 const win = AppWindow.g_window orelse return;
                 const fb = window_backend.framebufferSize(win);
-                if (AppWindow.ai_chat_renderer.stopButtonHitTest(
+                if (AppWindow.assistant_conversation_renderer.stopButtonHitTest(
                     chat,
                     xpos,
                     ypos,
@@ -5787,7 +5718,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     requestInputRepaint();
                     return;
                 }
-                if (AppWindow.ai_chat_renderer.missingApiKeyStatusHitTest(
+                if (AppWindow.assistant_conversation_renderer.missingApiKeyStatusHitTest(
                     chat,
                     xpos,
                     ypos,
@@ -5801,7 +5732,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     requestInputRepaint();
                     return;
                 }
-                if (AppWindow.ai_chat_renderer.interactionHitTest(
+                if (AppWindow.assistant_conversation_renderer.interactionHitTest(
                     chat,
                     xpos,
                     ypos,
@@ -5828,7 +5759,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     }
                     return;
                 }
-                if (AppWindow.ai_chat_renderer.modelLabelHitTest(
+                if (AppWindow.assistant_conversation_renderer.modelLabelHitTest(
                     chat,
                     xpos,
                     ypos,
@@ -5841,7 +5772,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     requestInputRepaint();
                     return;
                 }
-                if (AppWindow.ai_chat_renderer.permissionChipHitTest(
+                if (AppWindow.assistant_conversation_renderer.permissionChipHitTest(
                     xpos,
                     ypos,
                     @floatFromInt(fb.width),
@@ -5852,7 +5783,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     toggleAiAgentPermission();
                     return;
                 }
-                if (AppWindow.ai_chat_renderer.transcriptScrollbarHitTest(
+                if (AppWindow.assistant_conversation_renderer.transcriptScrollbarHitTest(
                     chat,
                     xpos,
                     ypos,
@@ -5866,13 +5797,13 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                     g_ai_transcript_scroll_chat = chat;
                     g_ai_transcript_scroll_drag_offset = drag_offset;
                     g_ai_transcript_scroll_panel = .active_chat;
-                    AppWindow.ai_chat_renderer.g_transcript_scrollbar_dragging = true;
+                    AppWindow.assistant_conversation_renderer.g_transcript_scrollbar_dragging = true;
                     applyAiTranscriptScrollbarDrag(chat, ypos);
                     requestInputRepaint();
                     return;
                 }
                 if (!ev.ctrl and !ev.alt) {
-                    if (AppWindow.ai_chat_renderer.transcriptTextHitTest(
+                    if (AppWindow.assistant_conversation_renderer.transcriptTextHitTest(
                         chat,
                         xpos,
                         ypos,
@@ -5892,7 +5823,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                         return;
                     }
                 }
-                if (AppWindow.ai_chat_renderer.inputScrollbarHitTest(
+                if (AppWindow.assistant_conversation_renderer.inputScrollbarHitTest(
                     chat,
                     xpos,
                     ypos,
@@ -6012,7 +5943,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
             g_ai_transcript_scroll_dragging = false;
             g_ai_transcript_scroll_chat = null;
             g_ai_transcript_scroll_panel = .active_chat;
-            AppWindow.ai_chat_renderer.g_transcript_scrollbar_dragging = false;
+            AppWindow.assistant_conversation_renderer.g_transcript_scrollbar_dragging = false;
             if (g_ai_transcript_selecting) {
                 if (g_ai_transcript_select_chat) |chat| {
                     if (chat.finishTranscriptSelection() and g_ai_transcript_select_auto_copy) copyAiChatToClipboard(chat);
@@ -6207,7 +6138,7 @@ fn hitTestPlusButton(xpos: f64) bool {
 fn applyAiInputScrollbarDrag(chat: *AppWindow.ai_chat.Session, ypos: f64) void {
     const win = AppWindow.g_window orelse return;
     const size = clientSize(win);
-    if (AppWindow.ai_chat_renderer.inputScrollbarDragRowAt(
+    if (AppWindow.assistant_conversation_renderer.inputScrollbarDragRowAt(
         chat,
         ypos,
         @floatFromInt(size.width),
@@ -6223,7 +6154,7 @@ fn applyAiInputScrollbarDrag(chat: *AppWindow.ai_chat.Session, ypos: f64) void {
 
 fn applyAiTranscriptScrollbarDrag(chat: *AppWindow.ai_chat.Session, ypos: f64) void {
     const geometry = aiTranscriptPanelGeometry(g_ai_transcript_scroll_panel) orelse return;
-    if (AppWindow.ai_chat_renderer.transcriptScrollbarScrollPxAt(
+    if (AppWindow.assistant_conversation_renderer.transcriptScrollbarScrollPxAt(
         chat,
         ypos,
         geometry.window_width,
@@ -6240,7 +6171,7 @@ fn applyAiTranscriptScrollbarDrag(chat: *AppWindow.ai_chat.Session, ypos: f64) v
 
 fn updateAiTranscriptSelectionDrag(chat: *AppWindow.ai_chat.Session, xpos: f64, ypos: f64) void {
     const geometry = aiTranscriptPanelGeometry(g_ai_transcript_select_panel) orelse return;
-    if (AppWindow.ai_chat_renderer.transcriptTextHitTest(
+    if (AppWindow.assistant_conversation_renderer.transcriptTextHitTest(
         chat,
         xpos,
         ypos,
@@ -6313,7 +6244,7 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
     if (AppWindow.g_window) |hover_win| {
         if (AppWindow.activeAiChat()) |chat| {
             const hover_fb = window_backend.framebufferSize(hover_win);
-            const over = AppWindow.ai_chat_renderer.transcriptScrollbarHitTest(
+            const over = AppWindow.assistant_conversation_renderer.transcriptScrollbarHitTest(
                 chat,
                 xpos,
                 ypos,
@@ -6323,12 +6254,12 @@ fn handleMouseMove(ev: platform_input.MouseMoveEvent) void {
                 AppWindow.leftPanelsWidth(),
                 @as(f32, @floatFromInt(hover_fb.width)) - AppWindow.leftPanelsWidth() - AppWindow.rightPanelsWidthForWindow(hover_fb.width),
             ) != null;
-            if (over != AppWindow.ai_chat_renderer.g_transcript_scrollbar_hover) {
-                AppWindow.ai_chat_renderer.g_transcript_scrollbar_hover = over;
+            if (over != AppWindow.assistant_conversation_renderer.g_transcript_scrollbar_hover) {
+                AppWindow.assistant_conversation_renderer.g_transcript_scrollbar_hover = over;
                 requestInputRebuild();
             }
-        } else if (AppWindow.ai_chat_renderer.g_transcript_scrollbar_hover) {
-            AppWindow.ai_chat_renderer.g_transcript_scrollbar_hover = false;
+        } else if (AppWindow.assistant_conversation_renderer.g_transcript_scrollbar_hover) {
+            AppWindow.assistant_conversation_renderer.g_transcript_scrollbar_hover = false;
             requestInputRebuild();
         }
     }
@@ -6812,7 +6743,7 @@ fn handleMouseWheel(ev: platform_input.MouseWheelEvent) void {
         const left_f = AppWindow.leftPanelsWidth();
         const right_f = @as(f32, @floatFromInt(size.width)) - AppWindow.rightPanelsWidthForWindow(size.width);
         const content_w = @max(0, right_f - left_f);
-        const layout = AppWindow.ai_history_renderer.computeLayout(left_f, content_w);
+        const layout = AppWindow.terminal_agent_sessions_renderer.computeLayout(left_f, content_w);
         const x: f32 = @floatFromInt(ev.xpos);
         if (x >= layout.detail_x and x < layout.detail_x + layout.detail_w) {
             const units: i32 = @intCast(mouseWheelUnits(ev.delta));
@@ -6833,7 +6764,7 @@ fn handleMouseWheel(ev: platform_input.MouseWheelEvent) void {
         const left = @as(i32, @intFromFloat(AppWindow.leftPanelsWidth()));
         const right = size.width - @as(i32, @intFromFloat(AppWindow.rightPanelsWidthForWindow(size.width)));
         if (ev.xpos >= left and ev.xpos < right) {
-            if (AppWindow.ai_chat_renderer.inputFieldMetricsAt(
+            if (AppWindow.assistant_conversation_renderer.inputFieldMetricsAt(
                 chat,
                 @floatFromInt(ev.xpos),
                 @floatFromInt(ev.ypos),
@@ -6872,7 +6803,7 @@ fn handleMouseWheel(ev: platform_input.MouseWheelEvent) void {
             if (ev.xpos >= bounds.left and ev.xpos < bounds.right and ev.ypos >= bounds.top and ev.ypos < bounds.bottom) {
                 const chat_x: f32 = @floatFromInt(bounds.left);
                 const chat_w: f32 = @floatFromInt(bounds.right - bounds.left);
-                if (AppWindow.ai_chat_renderer.inputFieldMetricsAt(
+                if (AppWindow.assistant_conversation_renderer.inputFieldMetricsAt(
                     chat,
                     @floatFromInt(ev.xpos),
                     @floatFromInt(ev.ypos),
