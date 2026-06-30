@@ -340,6 +340,141 @@ back over WeChat. The remaining command-center entries manage that binding:
 Because replies are delivered to a phone, the `Export Copilot Markdown Clean`
 output (prompts plus the final answer only) is a good fit for forwarding results.
 
+## Feishu/Lark Direct Control
+
+WispTerm can also receive messages from a Feishu self-built app and route them
+to the active Copilot/Agent flow. In Feishu Open Platform, open your self-built
+app, or create a new **enterprise self-built app** first:
+
+```text
+https://open.feishu.cn/app
+```
+
+For international Lark tenants, the corresponding Open Platform API domain is:
+
+```text
+https://open.larksuite.com
+```
+
+Create and publish the Feishu app first:
+
+### Step 1: Create an enterprise self-built app
+
+Log in to Feishu Open Platform and create an **enterprise self-built app**, for
+example `WispTerm-Lab`.
+
+![Create Feishu enterprise self-built app](assets/feishu/feishu-create-enterprise-app.png)
+
+### Step 2: Add the Robot capability
+
+Open **Add app capabilities** and select **Robot**.
+
+![Add Robot capability](assets/feishu/feishu-add-robot-capability.png)
+
+### Step 3: Import permissions
+
+In **Permission management**, open **Bulk import/export permissions**, switch to
+**Import**, and paste this JSON:
+
+```json
+{
+  "scopes": {
+    "tenant": [
+      "application:application:self_manage",
+      "application:bot.basic_info:read",
+      "application:bot.menu:write",
+      "cardkit:card:read",
+      "cardkit:card:write",
+      "contact:contact.base:readonly",
+      "docs:document.comment:create",
+      "docs:document.comment:delete",
+      "docs:document.comment:read",
+      "docs:document.comment:update",
+      "docs:document.comment:write_only",
+      "docx:document.block:convert",
+      "docx:document:readonly",
+      "docx:document:write_only",
+      "drive:drive.metadata:readonly",
+      "im:chat.members:bot_access",
+      "im:chat:create",
+      "im:chat:read",
+      "im:chat:update",
+      "im:message.group_at_msg.include_bot:readonly",
+      "im:message.group_at_msg:readonly",
+      "im:message.p2p_msg:readonly",
+      "im:message.pins:read",
+      "im:message.pins:write_only",
+      "im:message.reactions:read",
+      "im:message.reactions:write_only",
+      "im:message:readonly",
+      "im:message:send_as_bot",
+      "im:message:send_multi_users",
+      "im:message:send_sys_msg",
+      "im:message:update",
+      "im:resource",
+      "wiki:node:read"
+    ],
+    "user": [
+      "offline_access"
+    ]
+  }
+}
+```
+
+![Import Feishu permissions as JSON](assets/feishu/feishu-permission-bulk-import.png)
+
+### Step 4: Configure long-connection events
+
+Open **Events & Callbacks → Event configuration** and select **Long connection**
+mode.
+
+![Choose Feishu long-connection event mode](assets/feishu/feishu-event-long-connection.png)
+
+Then add the event **Receive message** / `im.message.receive_v1`.
+
+![Add im.message.receive_v1 event](assets/feishu/feishu-event-receive-message.png)
+
+The long-connection status showing **connection failed** is expected at this
+point because WispTerm has not been configured with the app credentials yet.
+
+### Step 5: Publish the app
+
+Open **App release → Create version**. Use version `1.0.0`, select **Robot** as
+the default mobile and desktop capability, add any release note, and submit the
+release. Feishu personal tenants usually publish immediately.
+
+### Step 6: Copy credentials into WispTerm
+
+After the app is published, copy the App ID and App Secret from Feishu:
+
+![Feishu app created with App ID and App Secret](assets/feishu/app-created.png)
+
+### Step 7: Configure in WispTerm
+
+Then configure WispTerm:
+
+1. Open the command center with `Ctrl+Shift+P` (`Cmd+Shift+P` on macOS).
+2. Type `feishu`.
+3. Run **Feishu: Configure**.
+4. Fill `App ID` and `App Secret`, then save.
+5. Restart WispTerm. The Feishu long-connection channel starts only during app
+   startup.
+
+![WispTerm Feishu bot configuration form](assets/feishu/command-center-config.png)
+
+You can also set the same values in the config file or the process environment:
+
+```text
+feishu-enabled = true
+feishu-app-id = cli_xxx
+feishu-app-secret = your-app-secret
+# Optional: restrict control to one Feishu open_id.
+feishu-allowed-user = ou_xxx
+```
+
+If `feishu-app-id` or `feishu-app-secret` is empty, WispTerm falls back to the
+`FEISHU_APP_ID` and `FEISHU_APP_SECRET` environment variables.
+
 ## Asking About WispTerm Itself
 
 The agent can read WispTerm's own user documentation on demand through the

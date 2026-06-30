@@ -115,6 +115,134 @@ summary / 上文摘要** 卡片。摘要运行时你可以继续输入；如果�
 回复 `N`/`no` 表示拒绝；WispTerm 会把该回复路由回原本在桌面 UI 等待的同一个审批对话。
 桌面应用仍是状态的唯一真相来源，受保护文件路径也会先经过常规访问 gate，再发出审批提示。
 
+## 飞书/Lark 直连控制
+
+WispTerm 可以通过飞书企业自建应用接收消息，并把消息路由到当前 Copilot/Agent 流程。进入
+飞书开放平台，打开你的自建应用；如果还没有应用，就新建一个**企业自建应用**：
+
+```text
+https://open.feishu.cn/app
+```
+
+如果使用国际版 Lark，对应的开放平台接口域名是：
+
+```text
+https://open.larksuite.com
+```
+
+先在飞书开放平台完成应用创建和发布：
+
+### 第 1 步：创建企业自建应用
+
+登录飞书开放平台，创建**企业自建应用**，例如 `WispTerm-Lab`。
+
+![创建飞书企业自建应用](assets/feishu-create-enterprise-app.png)
+
+### 第 2 步：添加机器人能力
+
+进入**添加应用能力**，选择**机器人**。
+
+![添加机器人能力](assets/feishu-add-robot-capability.png)
+
+### 第 3 步：导入权限
+
+在**权限管理**里选择**批量导入/导出权限**，切到**导入**，粘贴下面的 JSON：
+
+```json
+{
+  "scopes": {
+    "tenant": [
+      "application:application:self_manage",
+      "application:bot.basic_info:read",
+      "application:bot.menu:write",
+      "cardkit:card:read",
+      "cardkit:card:write",
+      "contact:contact.base:readonly",
+      "docs:document.comment:create",
+      "docs:document.comment:delete",
+      "docs:document.comment:read",
+      "docs:document.comment:update",
+      "docs:document.comment:write_only",
+      "docx:document.block:convert",
+      "docx:document:readonly",
+      "docx:document:write_only",
+      "drive:drive.metadata:readonly",
+      "im:chat.members:bot_access",
+      "im:chat:create",
+      "im:chat:read",
+      "im:chat:update",
+      "im:message.group_at_msg.include_bot:readonly",
+      "im:message.group_at_msg:readonly",
+      "im:message.p2p_msg:readonly",
+      "im:message.pins:read",
+      "im:message.pins:write_only",
+      "im:message.reactions:read",
+      "im:message.reactions:write_only",
+      "im:message:readonly",
+      "im:message:send_as_bot",
+      "im:message:send_multi_users",
+      "im:message:send_sys_msg",
+      "im:message:update",
+      "im:resource",
+      "wiki:node:read"
+    ],
+    "user": [
+      "offline_access"
+    ]
+  }
+}
+```
+
+![批量导入飞书权限 JSON](assets/feishu-permission-bulk-import.png)
+
+### 第 4 步：配置长连接事件
+
+进入**事件与回调 → 事件配置**，选择**长连接**模式（不需要公网回调地址）。
+
+![选择飞书长连接事件模式](assets/feishu-event-long-connection.png)
+
+然后添加**接收消息** / `im.message.receive_v1` 事件。
+
+![添加 im.message.receive_v1 事件](assets/feishu-event-receive-message.png)
+
+此时长连接显示**连接失败**是正常的，因为 WispTerm 还没有配置 App ID 和 App Secret。
+
+### 第 5 步：发布应用
+
+进入**应用发布 → 创建版本**。版本号填 `1.0.0`，移动端默认能力和桌面端默认能力都选择
+**机器人**，更新说明随意填写，然后提交发布。飞书个人版通常免审核，提交后立即可用。
+
+### 第 6 步：把凭证填到 WispTerm
+
+应用发布后，从飞书复制 App ID 和 App Secret：
+
+![飞书应用创建成功](assets/feishu-app-created.png)
+
+### 第 7 步：在 WispTerm 中配置
+
+然后在 WispTerm 里填写凭证：
+
+1. 按 `Ctrl+Shift+P`（macOS 上 `Cmd+Shift+P`）打开命令中心。
+2. 输入 `feishu`。
+3. 运行 **Feishu: Configure / 飞书 bot 配置**。
+4. 填写 `App ID` 和 `App Secret`，然后保存。
+5. 重启 WispTerm。飞书长连接通道只在应用启动时创建。
+
+![WispTerm 飞书 bot 配置表单](assets/feishu-command-center-config.png)
+
+等价的配置项如下：
+
+```text
+feishu-enabled = true
+feishu-app-id = cli_xxx
+feishu-app-secret = your-app-secret
+# 可选：限制只有一个飞书 open_id 可以控制。
+feishu-allowed-user = ou_xxx
+```
+
+如果 `feishu-app-id` 或 `feishu-app-secret` 为空，WispTerm 会回退读取环境变量
+`FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`。
+
 ## 会话浏览与恢复
 
 打开命令中心（`Ctrl+Shift+P`）并运行 **Copilot History**，可以重开 WispTerm 自己保存的
