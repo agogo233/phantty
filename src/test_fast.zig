@@ -164,6 +164,8 @@ test {
     _ = @import("renderer/overlays/ssh_profiles_layout.zig");
     _ = @import("renderer/overlays/assistant_profiles.zig");
     _ = @import("renderer/overlays/feishu_config.zig");
+    _ = @import("renderer/overlays/quick_ai_config.zig");
+    _ = @import("assistant/quick_verify.zig");
     _ = @import("renderer/overlays/session_launcher.zig");
     _ = @import("renderer/overlays/state.zig");
     _ = @import("renderer/overlays/state_guard.zig");
@@ -320,6 +322,7 @@ test {
     _ = @import("weixin/binding.zig");
     _ = @import("chatops/approval_reply.zig");
     _ = @import("chatops/question_reply.zig");
+    _ = @import("chatops/router.zig");
     _ = @import("feishu/types.zig");
     _ = @import("feishu/pbbp2.zig");
     _ = @import("feishu/ws.zig");
@@ -329,6 +332,8 @@ test {
     _ = @import("feishu/longconn.zig");
     _ = @import("feishu/controller.zig");
     _ = @import("feishu/progress.zig");
+    _ = @import("feishu/registration.zig");
+    _ = @import("feishu/registration_panel.zig");
     _ = @import("feishu/card.zig");
     _ = @import("feishu/media.zig");
     _ = @import("assistant/conversation/title.zig");

@@ -110,6 +110,9 @@ const file_explorer_renderer = @import("renderer/file_explorer_renderer.zig");
 const markdown_preview_renderer = @import("renderer/markdown_preview_renderer.zig");
 pub const weixin_qr_panel = @import("weixin/qr_panel.zig");
 const weixin_qr_renderer = @import("renderer/weixin_qr_renderer.zig");
+const feishu_registration = @import("feishu/registration.zig");
+const feishu_reg_panel = @import("feishu/registration_panel.zig");
+const feishu_reg_renderer = @import("renderer/feishu_qr_renderer.zig");
 const html_server = @import("html/server.zig");
 pub const browser_panel = if (build_options.webview)
     @import("browser/panel.zig")
@@ -2998,6 +3001,12 @@ pub fn applyUiEffect(effect: UiEffect) void {
     if (effect.wake_backend) window_backend.postWakeup();
 }
 
+/// Worker 线程用:直接唤醒后端事件循环,无需经 UiEffect 结构。
+/// 供 feishu registration worker 等后台线程在状态变更后调用。
+pub fn postWakeup() void {
+    window_backend.postWakeup();
+}
+
 /// Tick all preview panes across every tab. Returns true if any pane
 /// updated its content (caller should redraw).
 fn tickAllPreviewPanes() bool {
@@ -3421,6 +3430,7 @@ fn installSessionRestoreHooks() void {
     // restore, re-attach each via the launcher's tmux connect path.
     tab.g_tmux_active_profiles_hook = tmux_controller.activeProfileNames;
     tab.g_tmux_restore_hook = overlays.connectProfileByNameTmux;
+    tab.g_ssh_restore_arm_hook = overlays.armSshPasswordFromProfileForSurface;
 }
 
 fn deinitGlobalAgentHistoryStore(allocator: std.mem.Allocator) void {
@@ -3628,12 +3638,13 @@ fn spawnDefaultAgentAndLocalShellTabs(allocator: std.mem.Allocator) bool {
         switchTab(first_tab_index);
     }
 
-    // No AI profile yet: surface the profile-creation form so the user can set one
-    // up (the form is an overlay, not a tab) — but only on the first launch. After
-    // it has been shown once, the persisted flag suppresses it so it does not
-    // reappear every launch. Users can still open setup via the session launcher.
+    // No AI profile yet, first launch only: surface the Quick Configure AI overlay so
+    // the user can paste a DeepSeek key in one step (it's an overlay, not a tab). The
+    // persisted ai-setup-prompted flag suppresses it after it has been shown once, so
+    // it does not reappear every launch — opening the Copilot sidebar later still
+    // prompts setup when no AI is configured.
     if (startup_tabs.shouldAutoShowAgentForm(has_ai_profile, platform_window_state.aiSetupPrompted(allocator))) {
-        _ = overlays.openDefaultAgentSessionForStartup();
+        overlays.openQuickAiForm();
         platform_window_state.setAiSetupPrompted(allocator);
     }
 
@@ -3951,7 +3962,7 @@ pub fn splitFocusedReturningSurface(direction: SplitTree.Split.Direction) ?*Surf
         if (conn.usesPasswordAuth()) {
             const pw = conn.password();
             if (pw.len > 0)
-                overlays.scheduleSshPasswordForSurface(surface, pw);
+                overlays.scheduleSshPasswordForSurface(surface);
         }
     }
     handleActiveSurfaceChangeWithinTab();
@@ -4398,6 +4409,7 @@ fn renderResizeFrame(width: i32, height: i32) void {
     overlays.renderSettingsPage(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
     overlays.renderSessionLauncher(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
     weixin_qr_renderer.render(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
+    feishu_reg_renderer.render(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
     overlays.renderDebugOverlay(@floatFromInt(fb_width));
     overlays.renderCloseShortcutConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
     overlays.renderCopyToast(@floatFromInt(fb_width), @floatFromInt(fb_height));
@@ -6668,6 +6680,7 @@ fn runMainLoop(self: *AppWindow) !void {
         if (config_watcher) |*w| checkConfigReload(allocator, w);
         tmux_controller.tickAll(allocator, term_cols, term_rows);
         overlays.tickSessionLauncher();
+        overlays.tickQuickAiVerify();
         if (file_explorer.tickAsync()) {
             g_force_rebuild = true;
             g_cells_valid = false;
@@ -7119,6 +7132,7 @@ fn runMainLoop(self: *AppWindow) !void {
         overlays.renderSettingsPage(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
         overlays.renderSessionLauncher(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
         weixin_qr_renderer.render(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
+        feishu_reg_renderer.render(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
         overlays.renderDebugOverlay(@floatFromInt(fb_width));
         overlays.renderCloseShortcutConfirm(@floatFromInt(fb_width), @floatFromInt(fb_height));
         overlays.renderCopyToast(@floatFromInt(fb_width), @floatFromInt(fb_height));
@@ -7203,6 +7217,9 @@ fn runMainLoop(self: *AppWindow) !void {
     file_explorer.deinit();
     weixin_qr_renderer.deinit();
     weixin_qr_panel.deinit();
+    feishu_reg_renderer.deinit();
+    feishu_reg_panel.deinit();
+    feishu_registration.shutdown();
     clearWeixinTranscriptCache();
     control_api.clearPanesCache();
     control_api.clearUiStateCache();

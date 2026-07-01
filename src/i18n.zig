@@ -235,6 +235,20 @@ pub const Strings = struct {
     shortcuts_hint: []const u8,
     shortcuts_unbound: []const u8,
 
+    // —— 快速配置 AI ——
+    quick_ai_form_title: []const u8,
+    quick_ai_intro: []const u8,
+    quick_ai_register_row: []const u8,
+    quick_ai_tutorial_row: []const u8,
+    quick_ai_verify_row: []const u8,
+    quick_ai_status_idle: []const u8,
+    quick_ai_status_verifying: []const u8,
+    quick_ai_status_empty: []const u8,
+    quick_ai_status_invalid: []const u8,
+    quick_ai_status_network: []const u8,
+    quick_ai_status_full: []const u8,
+    toast_quick_ai_done: []const u8,
+
     // —— 飞书凭证表单 ——
     feishu_form_title: []const u8,
     feishu_form_enabled: []const u8,
@@ -243,7 +257,11 @@ pub const Strings = struct {
     feishu_form_app_secret: []const u8,
     feishu_form_secret_set_hint: []const u8,
     feishu_form_save: []const u8,
+    feishu_form_scan: []const u8,
+    feishu_form_scan_hint: []const u8,
     toast_feishu_restart: []const u8,
+    toast_feishu_scan_failed: []const u8,
+    toast_feishu_scan_success: []const u8,
 };
 
 const en = Strings{
@@ -463,6 +481,19 @@ const en = Strings{
     .shortcuts_hint = "Press any key or click to hide",
     .shortcuts_unbound = "unbound",
 
+    .quick_ai_form_title = "Quick Configure AI",
+    .quick_ai_intro = "Paste your DeepSeek API key to set up the main and subagent models.",
+    .quick_ai_register_row = "1. Register at platform.deepseek.com  (Enter to open)",
+    .quick_ai_tutorial_row = "2. Open the setup guide  (Enter to open)",
+    .quick_ai_verify_row = "Verify & Save",
+    .quick_ai_status_idle = "Paste your API key, then Verify.",
+    .quick_ai_status_verifying = "Verifying…",
+    .quick_ai_status_empty = "Paste an API key first.",
+    .quick_ai_status_invalid = "Invalid API key — check it and retry.",
+    .quick_ai_status_network = "Network error — check your connection and retry.",
+    .quick_ai_status_full = "Too many AI profiles — remove one and retry.",
+    .toast_quick_ai_done = "AI configured — DeepSeek is ready.",
+
     .feishu_form_title = "Feishu bot config",
     .feishu_form_enabled = "Enabled",
     .feishu_form_international = "International (Lark)",
@@ -470,7 +501,11 @@ const en = Strings{
     .feishu_form_app_secret = "App Secret",
     .feishu_form_secret_set_hint = "already set — leave blank to keep",
     .feishu_form_save = "Save",
+    .feishu_form_scan = "Create app via QR",
+    .feishu_form_scan_hint = "Scan with Feishu to auto-fill app_id/secret",
     .toast_feishu_restart = "Feishu setting updated — restart WispTerm to apply",
+    .toast_feishu_scan_failed = "App creation failed, please retry",
+    .toast_feishu_scan_success = "App created, credentials filled in — please save",
 };
 
 const zh_CN = Strings{
@@ -690,6 +725,19 @@ const zh_CN = Strings{
     .shortcuts_hint = "按任意键或点击隐藏",
     .shortcuts_unbound = "未绑定",
 
+    .quick_ai_form_title = "快速配置 AI",
+    .quick_ai_intro = "粘贴 DeepSeek API key，自动配好主模型和 subagent。",
+    .quick_ai_register_row = "1. 去 platform.deepseek.com 注册（回车打开）",
+    .quick_ai_tutorial_row = "2. 打开配置教程（回车打开）",
+    .quick_ai_verify_row = "校验并保存",
+    .quick_ai_status_idle = "粘贴 API key 后点校验。",
+    .quick_ai_status_verifying = "校验中…",
+    .quick_ai_status_empty = "请先粘贴 API Key。",
+    .quick_ai_status_invalid = "API key 无效，请检查后重试。",
+    .quick_ai_status_network = "网络错误，请检查网络后重试。",
+    .quick_ai_status_full = "AI 配置数量已满，请删除一个后重试。",
+    .toast_quick_ai_done = "AI 配置完成，DeepSeek 已就绪。",
+
     .feishu_form_title = "飞书 bot 配置",
     .feishu_form_enabled = "启用",
     .feishu_form_international = "国际版 (Lark)",
@@ -697,7 +745,11 @@ const zh_CN = Strings{
     .feishu_form_app_secret = "App Secret",
     .feishu_form_secret_set_hint = "已设置，留空保留",
     .feishu_form_save = "保存",
+    .feishu_form_scan = "扫码创建应用",
+    .feishu_form_scan_hint = "用飞书扫码自动获取 app_id/secret",
     .toast_feishu_restart = "飞书配置已更新，重启 WispTerm 生效",
+    .toast_feishu_scan_failed = "创建应用失败，请重试",
+    .toast_feishu_scan_success = "应用已创建，凭据已回填，请保存",
 };
 
 // Set once at startup before any UI thread exists (see main.zig startup wiring).
@@ -838,6 +890,7 @@ pub fn commandTitle(action: CommandAction) ?[]const u8 {
         .wechat_status => "微信：状态",
         .unbind_wechat => "微信：解绑",
         .configure_feishu => "飞书：配置",
+        .quick_configure_ai => "设置：快速配置 AI",
         .export_ai_chat_markdown => "导出副驾 Markdown",
         .export_ai_chat_markdown_clean => "导出副驾 Markdown 精简版",
         .show_version => "版本",
@@ -891,6 +944,7 @@ pub fn commandDetail(action: CommandAction) ?[]const u8 {
         .wechat_status => "显示微信直连连接状态",
         .unbind_wechat => "清除已存储的微信直连绑定",
         .configure_feishu => "填写飞书 bot 的 App ID 和 App Secret",
+        .quick_configure_ai => "粘贴一个 DeepSeek API key，自动配好主模型和 subagent",
         .export_ai_chat_markdown => "把当前 AI 对话保存为 Markdown",
         .export_ai_chat_markdown_clean => "保存用户提问与最终回答（不含思考过程）",
         .show_version => "显示 WispTerm 版本",

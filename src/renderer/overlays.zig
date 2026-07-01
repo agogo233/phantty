@@ -44,6 +44,11 @@ const ssh_profiles = @import("overlays/ssh_profiles.zig");
 const ssh_profiles_layout = @import("overlays/ssh_profiles_layout.zig");
 const assistant_profiles = @import("overlays/assistant_profiles.zig");
 const feishu_config = @import("overlays/feishu_config.zig");
+const quick_ai_config = @import("overlays/quick_ai_config.zig");
+const quick_verify = @import("../assistant/quick_verify.zig");
+const window_backend = @import("../platform/window_backend.zig");
+const feishu_registration = @import("../feishu/registration.zig");
+const feishu_reg_panel = @import("../feishu/registration_panel.zig");
 const session_launcher = @import("overlays/session_launcher.zig");
 const command_palette_state = @import("overlays/command_palette_state.zig");
 const command_palette_layout = @import("overlays/command_palette_layout.zig");
@@ -126,6 +131,14 @@ fn feishuForm() *overlay_state.FeishuFormState {
 
 fn feishuConfig() *feishu_config.State {
     return &g_overlay_state.feishu.config;
+}
+
+fn quickAiForm() *overlay_state.QuickAiFormState {
+    return &g_overlay_state.quick_ai;
+}
+
+fn quickAi() *quick_ai_config.State {
+    return &g_overlay_state.quick_ai.config;
 }
 
 fn launcherState() *session_launcher.State {
@@ -685,6 +698,7 @@ fn executeCommand(action: CommandAction) void {
         .wechat_status => showWeixinDirectStatus(),
         .unbind_wechat => unbindWeixinDirect(),
         .configure_feishu => openFeishuConfigForm(),
+        .quick_configure_ai => openQuickAiForm(),
         .export_ai_chat_markdown => AppWindow.exportActiveAiChatMarkdown(.full),
         .export_ai_chat_markdown_clean => AppWindow.exportActiveAiChatMarkdown(.clean),
         .show_version => showVersionToast(),
@@ -2249,6 +2263,7 @@ const SessionAction = enum {
     connect_ai,
     save_ai,
     feishu_save,
+    feishu_scan,
     cancel,
 };
 
@@ -2330,12 +2345,6 @@ pub const ModelProfileSwitchResult = enum {
     unknown_profile,
     failed,
 };
-
-threadlocal var g_pending_ssh_password: [SSH_FIELD_MAX + 1]u8 = undefined;
-threadlocal var g_pending_ssh_password_len: usize = 0;
-threadlocal var g_pending_ssh_password_due_ms: i64 = 0;
-threadlocal var g_pending_ssh_password_deadline_ms: i64 = 0;
-threadlocal var g_pending_ssh_surface: ?*Surface = null;
 
 const SSH_PASSWORD_PROMPT_MIN_WAIT_MS: i64 = 250;
 const SSH_PASSWORD_PROMPT_TIMEOUT_MS: i64 = 60_000;
@@ -2435,6 +2444,7 @@ fn commandCenterStateApply(state: command_center_state.State) void {
     // so it can't be stomped on open. Prevents the feishu render gate from firing stale when
     // another launcher mode (AI list, SSH, plain launcher) reuses g_session_launcher_visible.
     feishuForm().visible = false;
+    quickAiForm().visible = false;
 }
 
 pub fn sessionLauncherOpen() void {
@@ -2486,11 +2496,6 @@ fn openAiListFromCommandPalette() void {
     markSessionLauncherReturnToCommandPalette();
 }
 
-fn openAiFormNewFromCommandPalette() void {
-    openAiFormNew();
-    markSessionLauncherReturnToCommandPalette();
-}
-
 pub fn sessionLauncherInsertChar(codepoint: u21) void {
     if (codepoint < 0x20 or codepoint == 0x7f) return;
     if (feishuForm().visible) {
@@ -2498,6 +2503,14 @@ pub fn sessionLauncherInsertChar(codepoint: u21) void {
         var buf: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(codepoint, &buf) catch return;
         feishuConfig().append(field, buf[0..n]);
+        return;
+    }
+    if (quickAiForm().visible) {
+        if (quickAi().focus != quick_ai_config.ROW_KEY) return;
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(codepoint, &buf) catch return;
+        quickAi().append(buf[0..n]);
+        AppWindow.applyUiEffect(.{ .needs_rebuild = true });
         return;
     }
     if (g_ssh_list_visible) {
@@ -2508,6 +2521,7 @@ pub fn sessionLauncherInsertChar(codepoint: u21) void {
         if (codepoint > 0x7f) return;
         if (sshState().focus >= SSH_FIELD_COUNT) return;
         const field = sshState().focus;
+        if (field == @intFromEnum(SshField.auth_method)) return; // ←/→ toggle, not free text
         if (sshState().lens[field] >= SSH_FIELD_MAX) return;
         sshState().bufs[field][sshState().lens[field]] = @intCast(codepoint);
         sshState().lens[field] += 1;
@@ -2525,6 +2539,12 @@ pub fn sessionLauncherPasteText(text: []const u8) bool {
         feishuConfig().append(field, text);
         return true;
     }
+    if (quickAiForm().visible) {
+        if (quickAi().focus != quick_ai_config.ROW_KEY) return false;
+        quickAi().append(text);
+        AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+        return true;
+    }
     if (g_ssh_list_visible) {
         appendSshListFilterText(text);
         return true;
@@ -2536,6 +2556,7 @@ pub fn sessionLauncherPasteText(text: []const u8) bool {
     }
     if (g_ssh_form_visible) {
         if (sshState().focus >= SSH_FIELD_COUNT) return false;
+        if (sshState().focus == @intFromEnum(SshField.auth_method)) return true; // toggle field, ignore paste
         appendSshFormText(sshState().focus, text);
         return true;
     }
@@ -2591,12 +2612,31 @@ fn sessionLauncherHandleKeyImpl(ev: input_key.KeyEvent) void {
             .arrow_left, .arrow_right => feishuConfig().toggleFocusedBool(),
             .enter => switch (feishuConfig().focus) {
                 feishu_config.SAVE_ROW => saveFeishuConfig(),
+                feishu_config.SCAN_ROW => startFeishuRegistration(),
                 else => feishuConfig().toggleFocusedBool(), // toggle rows flip; field rows no-op
             },
             .backspace => if (feishuConfig().focusedField()) |f| feishuConfig().backspace(f),
             .escape => closeFeishuConfigForm(),
             else => {},
         }
+        return;
+    }
+    if (quickAiForm().visible) {
+        switch (ev.key) {
+            .tab, .arrow_down => quickAi().focusNextRow(),
+            .arrow_up => quickAi().focusPrevRow(),
+            .enter => switch (quickAi().focus) {
+                quick_ai_config.ROW_OPEN_REGISTER => openQuickAiUrl(quick_ai_config.REGISTER_URL),
+                quick_ai_config.ROW_OPEN_TUTORIAL => openQuickAiUrl(quick_ai_config.TUTORIAL_URL),
+                quick_ai_config.ROW_KEY => quickAi().focus = quick_ai_config.ROW_VERIFY,
+                quick_ai_config.ROW_VERIFY => startQuickAiVerify(),
+                else => {},
+            },
+            .backspace => if (quickAi().focus == quick_ai_config.ROW_KEY) quickAi().backspace(),
+            .escape => closeQuickAiForm(),
+            else => {},
+        }
+        AppWindow.applyUiEffect(.{ .needs_rebuild = true });
         return;
     }
     if (ev.key == .escape) {
@@ -2680,8 +2720,15 @@ fn sessionLauncherHandleKeyImpl(ev: input_key.KeyEvent) void {
     switch (ev.key) {
         .tab, .arrow_down => sshState().focusNextRow(),
         .arrow_up => sshState().focusPrevRow(),
+        .arrow_right => {
+            if (sshState().focus == @intFromEnum(SshField.auth_method)) cycleSshFormAuthMethod(true);
+        },
+        .arrow_left => {
+            if (sshState().focus == @intFromEnum(SshField.auth_method)) cycleSshFormAuthMethod(false);
+        },
         .backspace => {
-            if (sshState().focus < SSH_FIELD_COUNT and sshState().lens[sshState().focus] > 0) sshState().lens[sshState().focus] -= 1;
+            // auth_method is a ←/→ toggle, not a text field — never backspace it.
+            if (sshState().focus < SSH_FIELD_COUNT and sshState().focus != @intFromEnum(SshField.auth_method) and sshState().lens[sshState().focus] > 0) sshState().lens[sshState().focus] -= 1;
         },
         .enter => runSshFormFocusAction(),
         else => {},
@@ -2742,6 +2789,7 @@ pub fn sessionLauncherExecuteAt(xpos: f64, ypos: f64, window_width: f32, window_
         .connect_ai => connectAiFromForm(),
         .save_ai => saveAiFormOnly(),
         .feishu_save => saveFeishuConfig(),
+        .feishu_scan => startFeishuRegistration(),
         .cancel => sessionLauncherBackOrClose(),
     }
     return true;
@@ -3071,6 +3119,27 @@ fn sshFormAuthMethod() ?ssh_connection.SshAuthMethod {
     const raw = sshField(.auth_method);
     if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return defaultSshAuthMethodForPassword(sshField(.password));
     return parseSshAuthMethod(raw);
+}
+
+/// Cycle the auth-method form field to the next/previous valid method. The field
+/// is constrained to password/key/credentials, so users toggle with ←/→ instead
+/// of typing an arbitrary string.
+fn cycleSshFormAuthMethod(forward: bool) void {
+    const idx = @intFromEnum(SshField.auth_method);
+    const current: ssh_connection.SshAuthMethod = sshFormAuthMethod() orelse .credentials;
+    const next = current.cycle(forward).fieldValue();
+    const len = @min(next.len, SSH_FIELD_MAX);
+    @memcpy(sshState().bufs[idx][0..len], next[0..len]);
+    sshState().lens[idx] = len;
+}
+
+/// Auth-method row display: current method name plus the ←/→ toggle affordance.
+fn sshAuthMethodDisplay() []const u8 {
+    const S = struct {
+        threadlocal var buf: [48]u8 = undefined;
+    };
+    const m: ssh_connection.SshAuthMethod = sshFormAuthMethod() orelse .credentials;
+    return std.fmt.bufPrint(&S.buf, "{s}   <-/->", .{m.fieldValue()}) catch m.fieldValue();
 }
 
 fn sshProfileAuthMethod(profile: *const SshProfile) ?ssh_connection.SshAuthMethod {
@@ -3618,7 +3687,7 @@ fn connectSshProfileReturningSurfaceWithCommand(idx: usize, remote_command: []co
             surface.setTitleOverride(server_name);
         }
         if (conn.usesPasswordAuth()) {
-            scheduleSshPasswordForSurface(surface, conn.password());
+            scheduleSshPasswordForSurface(surface);
         }
         return surface;
     }
@@ -3645,59 +3714,85 @@ fn isPortTokenSafe(value: []const u8) bool {
 /// Queue password entry for a new SSH surface.
 ///
 /// OpenSSH only consumes the password after it has printed the password prompt.
-/// A fixed startup delay races slow networks, so the main-loop tick waits until
-/// the prompt is visible in terminal state before injecting the stored password.
-pub fn scheduleSshPasswordForSurface(surface: *Surface, password: []const u8) void {
-    const len = @min(password.len, SSH_FIELD_MAX);
+/// Arm SSH password autofill for `surface`. Once the remote password prompt
+/// shows up (after a short settle delay), `tickSessionLauncher` types the
+/// password stored in the surface's `ssh_connection`. Per-surface (no single
+/// global slot), so many sessions (re)connecting at once each get filled.
+/// Callers only arm password-auth connections (key auth is left to native ssh).
+pub fn scheduleSshPasswordForSurface(surface: *Surface) void {
     const now = std.time.milliTimestamp();
-    @memcpy(g_pending_ssh_password[0..len], password[0..len]);
-    g_pending_ssh_password[len] = '\r';
-    g_pending_ssh_password_len = len + 1;
-    g_pending_ssh_password_due_ms = now + SSH_PASSWORD_PROMPT_MIN_WAIT_MS;
-    g_pending_ssh_password_deadline_ms = now + SSH_PASSWORD_PROMPT_TIMEOUT_MS;
-    g_pending_ssh_surface = surface;
+    surface.ssh_autofill_due_ms = now + SSH_PASSWORD_PROMPT_MIN_WAIT_MS;
+    surface.ssh_autofill_deadline_ms = now + SSH_PASSWORD_PROMPT_TIMEOUT_MS;
+}
+
+/// Re-supply an SSH password from the saved profile config and arm autofill.
+/// Used on session restore: the snapshot carries no password (security invariant
+/// I1 — never persisted to session.json), so the password is matched back from
+/// the profile by host/user/port and copied into the live `ssh_connection`.
+/// No-op if the surface is not SSH, no profile matches, or the match is key-auth.
+pub fn armSshPasswordFromProfileForSurface(surface: *Surface) void {
+    const conn = surface.ssh_connection orelse return;
+    loadSshProfiles();
+    var idx: usize = 0;
+    while (idx < sshState().profile_count) : (idx += 1) {
+        const profile = &sshState().profiles[idx];
+        if (!std.mem.eql(u8, profileField(profile, .ip), conn.host())) continue;
+        if (!std.mem.eql(u8, profileField(profile, .user), conn.user())) continue;
+        const p_port = profileField(profile, .port);
+        const c_port = conn.port();
+        const ports_match = std.mem.eql(u8, p_port, c_port) or
+            (p_port.len == 0 and std.mem.eql(u8, c_port, "22")) or
+            (c_port.len == 0 and std.mem.eql(u8, p_port, "22"));
+        if (!ports_match) continue;
+        if ((sshProfileAuthMethod(profile) orelse return) != .password) return;
+        const password = profileField(profile, .password);
+        if (password.len == 0) return;
+        // Copy the password into the live ssh_connection so this connect (and any
+        // later Enter-reconnect of the same pane) can autofill it.
+        surface.setSshConnection(conn.user(), conn.host(), conn.port(), password, conn.proxyJump(), true, AppWindow.g_ssh_legacy_algorithms);
+        scheduleSshPasswordForSurface(surface);
+        return;
+    }
 }
 
 pub fn tickSessionLauncher() void {
-    if (g_pending_ssh_password_len == 0) return;
     const now = std.time.milliTimestamp();
-    if (now < g_pending_ssh_password_due_ms) return;
-
-    const surface = g_pending_ssh_surface orelse {
-        clearPendingSshPassword();
-        return;
-    };
-    if (!surfaceIsOpen(surface)) {
-        clearPendingSshPassword();
-        return;
-    }
-    if (now > g_pending_ssh_password_deadline_ms) {
-        clearPendingSshPassword();
-        return;
-    }
-    if (!surfaceHasSshPasswordPrompt(surface)) return;
-
-    AppWindow.input.writeTextToSurfacePty(surface, g_pending_ssh_password[0..g_pending_ssh_password_len]);
-    clearPendingSshPassword();
-}
-
-fn clearPendingSshPassword() void {
-    g_pending_ssh_password_len = 0;
-    g_pending_ssh_password_due_ms = 0;
-    g_pending_ssh_password_deadline_ms = 0;
-    g_pending_ssh_surface = null;
-}
-
-fn surfaceIsOpen(surface: *const Surface) bool {
     for (0..tab.g_tab_count) |tab_index| {
         const tab_state = tab.g_tabs[tab_index] orelse continue;
         if (tab_state.kind != .terminal) continue;
         var it = tab_state.tree.surfaces();
         while (it.next()) |entry| {
-            if (@intFromPtr(entry.surface) == @intFromPtr(surface)) return true;
+            maybeInjectSshPassword(entry.surface, now);
         }
     }
-    return false;
+}
+
+/// Inject the armed SSH password into `surface` once its own password prompt is
+/// on screen. Each surface is independent, so concurrently-restoring sessions
+/// each fill their own prompt. `ssh_autofill_deadline_ms == 0` means not armed.
+fn maybeInjectSshPassword(surface: *Surface, now: i64) void {
+    if (surface.ssh_autofill_deadline_ms == 0) return;
+    if (now < surface.ssh_autofill_due_ms) return;
+    if (now > surface.ssh_autofill_deadline_ms) {
+        surface.ssh_autofill_deadline_ms = 0; // gave up waiting for the prompt
+        return;
+    }
+    if (surface.ssh_connection) |*conn| {
+        const pw = conn.password();
+        if (pw.len == 0) {
+            surface.ssh_autofill_deadline_ms = 0;
+            return;
+        }
+        if (!surfaceHasSshPasswordPrompt(surface)) return; // prompt not up yet
+        var buf: [129]u8 = undefined; // ssh_connection password_buf is [128]
+        const len = @min(pw.len, buf.len - 1);
+        @memcpy(buf[0..len], pw[0..len]);
+        buf[len] = '\r';
+        AppWindow.input.writeTextToSurfacePty(surface, buf[0 .. len + 1]);
+        surface.ssh_autofill_deadline_ms = 0; // injected once
+    } else {
+        surface.ssh_autofill_deadline_ms = 0;
+    }
 }
 
 fn surfaceHasSshPasswordPrompt(surface: *Surface) bool {
@@ -3767,7 +3862,7 @@ fn openAiList() void {
 fn openDefaultAiSession() void {
     loadAiProfiles();
     if (assistantProfiles().profile_count == 0) {
-        openAiFormNew();
+        openQuickAiForm(); // no AI configured: guide setup via Quick Configure, not the full form
         return;
     }
     connectAiProfile(defaultAiProfileIndex());
@@ -3776,7 +3871,7 @@ fn openDefaultAiSession() void {
 fn openDefaultAgentSessionFromCommandCenter() void {
     loadAiProfiles();
     switch (command_center_state.resolveNewAgentLaunch(assistantProfiles().profile_count != 0)) {
-        .open_form => openAiFormNewFromCommandPalette(),
+        .open_form => openQuickAiForm(), // no AI configured: guide setup via Quick Configure, not the full form
         .connect_default_profile_as_agent => connectAiProfileWithAgentOverride(defaultAiProfileIndex(), "true"),
     }
 }
@@ -3789,7 +3884,7 @@ pub fn hasAiProfiles() bool {
 pub fn openDefaultAgentSessionForStartup() DefaultAgentOpenResult {
     loadAiProfiles();
     if (assistantProfiles().profile_count == 0) {
-        openAiFormNew();
+        openQuickAiForm(); // no AI configured: guide setup via Quick Configure, not the full form
         return .form_opened;
     }
     return if (spawnAiProfileWithAgentOverride(defaultAiProfileIndex(), "true")) .opened else .failed;
@@ -3910,10 +4005,11 @@ pub fn openAiConfigForSession(session: *AppWindow.ai_chat.Session) void {
 pub fn openAiConfigForMissingCopilotApi() void {
     loadAiProfiles();
     if (assistantProfiles().profile_count == 0) {
-        openAiFormNew();
-    } else {
-        openAiFormEdit(defaultAiProfileIndex());
+        openQuickAiForm(); // no AI at all: guide setup via Quick Configure
+        return;
     }
+    // A profile exists but its API key is missing: jump to that profile's key field.
+    openAiFormEdit(defaultAiProfileIndex());
     assistantProfiles().focus = @intFromEnum(AiField.api_key);
 }
 
@@ -3980,6 +4076,128 @@ fn closeFeishuConfigForm() void {
     feishuForm().visible = false;
     g_session_launcher_visible = false;
     feishuConfig().reset();
+}
+
+/// Quick Configure AI: guided overlay to paste + verify a DeepSeek key.
+/// Rides on the session-launcher plumbing like the Feishu form.
+pub fn openQuickAiForm() void {
+    g_ssh_list_visible = false;
+    g_ssh_form_visible = false;
+    g_ai_list_visible = false;
+    g_ai_form_visible = false;
+    g_ai_history_source_visible = false;
+    settingsState().visible = false;
+    commandPaletteClose();
+    quickAi().reset();
+    g_session_launcher_visible = true;
+    quickAiForm().visible = true;
+    AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+}
+
+fn closeQuickAiForm() void {
+    quickAiForm().visible = false;
+    g_session_launcher_visible = false;
+    quickAi().reset();
+    AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+}
+
+fn openQuickAiUrl(url: []const u8) void {
+    if (AppWindow.g_allocator) |alloc| _ = platform_open_url.open(alloc, .{ .url = url });
+}
+
+fn startQuickAiVerify() void {
+    const k = quickAi().key();
+    if (k.len == 0) {
+        quickAi().status = .empty;
+        AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+        return;
+    }
+    quickAi().status = .verifying;
+    AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+    _ = quick_verify.start(quick_ai_config.BASE_URL, k, window_backend.postWakeup);
+}
+
+fn applyQuickAiConfig() void {
+    const allocator = AppWindow.g_allocator orelse return;
+    const profiles = assistantProfiles().profiles[0..];
+    var count = assistant_profile_store.loadProfiles(allocator, profiles);
+    count = quick_ai_config.upsertProfiles(profiles, count, quickAi().key());
+    if (!quick_ai_config.bothProfilesPresent(profiles, count)) {
+        quickAi().status = .store_full;
+        AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+        return; // do not persist config keys, save, toast success, or close
+    }
+    assistantProfiles().profile_count = count;
+    _ = assistant_profile_store.saveProfiles(allocator, profiles[0..count]);
+    Config.setConfigValue(allocator, "ai-default-profile", quick_ai_config.MAIN_PROFILE_NAME) catch {};
+    Config.setConfigValue(allocator, "ai-subagent-profile", quick_ai_config.SUB_PROFILE_NAME) catch {};
+    showStatusToast(i18n.s().toast_quick_ai_done);
+    closeQuickAiForm();
+}
+
+/// Called every frame from the main loop. Drains a finished verify result and,
+/// if the overlay is still open, applies it (success) or shows the error.
+pub fn tickQuickAiVerify() void {
+    const outcome = quick_verify.take() orelse return; // always drain to clear the channel
+    if (!quickAiForm().visible) return; // overlay was closed mid-verify — drop stale result
+    switch (outcome) {
+        .ok => applyQuickAiConfig(),
+        .invalid_key => quickAi().status = .invalid,
+        .network_error => quickAi().status = .network,
+    }
+    AppWindow.applyUiEffect(.{ .needs_rebuild = true });
+}
+
+fn startFeishuRegistration() void {
+    const allocator = AppWindow.g_allocator orelse std.heap.page_allocator;
+    feishu_registration.setWakeupHook(&AppWindow.postWakeup);
+    feishu_registration.start(allocator, feishuConfig().international) catch {
+        showStatusToast(i18n.s().toast_feishu_scan_failed);
+        return;
+    };
+    feishu_reg_panel.open();
+    AppWindow.applyUiEffect(.repaint);
+}
+
+pub fn feishuRegPanelHandleAction(action: feishu_reg_panel.Action) void {
+    switch (action) {
+        .none => {},
+        .close => {
+            feishu_registration.cancel();
+            feishu_reg_panel.close();
+            AppWindow.applyUiEffect(.repaint);
+        },
+        .retry => {
+            const allocator = AppWindow.g_allocator orelse std.heap.page_allocator;
+            feishu_registration.setWakeupHook(&AppWindow.postWakeup);
+            feishu_registration.start(allocator, feishuConfig().international) catch {
+                showStatusToast(i18n.s().toast_feishu_scan_failed);
+                return;
+            };
+            feishu_reg_panel.open();
+            AppWindow.applyUiEffect(.repaint);
+        },
+    }
+}
+
+/// 渲染层在检测到注册成功时调用:把凭据回填进飞书配置表单并关面板。
+pub fn applyFeishuRegistrationSuccess() void {
+    if (feishu_reg_panel.takeSuccessCreds()) |creds| {
+        feishuConfig().setValue(.app_id, creds.app_id);
+        if (creds.app_secret.len > 0) feishuConfig().setValue(.app_secret, creds.app_secret);
+        showStatusToast(i18n.s().toast_feishu_scan_success);
+    }
+    feishu_registration.cancel();
+    feishu_reg_panel.close();
+    AppWindow.applyUiEffect(.repaint);
+}
+
+pub fn feishuRegPanelVisible() bool {
+    return feishu_reg_panel.visible();
+}
+
+pub fn feishuRegPanelExecuteAt(xpos: f64, ypos: f64, w: f32, h: f32, top: f32) feishu_reg_panel.Action {
+    return feishu_reg_panel.executeAt(xpos, ypos, w, h, top);
 }
 
 fn saveFeishuConfig() void {
@@ -4470,30 +4688,35 @@ test "default AI profile snapshot normalizes Anthropic URL with default protocol
     );
 }
 
-test "overlays: missing copilot API opens AI config at API key" {
+test "overlays: missing copilot API with no profile opens Quick Configure" {
     const saved_loaded = assistantProfiles().profiles_loaded;
     const saved_count = assistantProfiles().profile_count;
-    const saved_focus = assistantProfiles().focus;
     const saved_list = g_ai_list_visible;
     const saved_form = g_ai_form_visible;
+    const saved_quick = quickAiForm().visible;
+    const saved_launcher = g_session_launcher_visible;
     defer {
         assistantProfiles().profiles_loaded = saved_loaded;
         assistantProfiles().profile_count = saved_count;
-        assistantProfiles().focus = saved_focus;
         g_ai_list_visible = saved_list;
         g_ai_form_visible = saved_form;
+        quickAiForm().visible = saved_quick;
+        g_session_launcher_visible = saved_launcher;
     }
 
     assistantProfiles().profiles_loaded = true;
     assistantProfiles().profile_count = 0;
     g_ai_list_visible = true;
     g_ai_form_visible = false;
+    quickAiForm().visible = false;
 
     openAiConfigForMissingCopilotApi();
 
+    // No AI configured → guide setup via the Quick Configure overlay, not the full
+    // 12-field profile form (which g_ai_form_visible tracks).
+    try std.testing.expect(quickAiForm().visible);
+    try std.testing.expect(!g_ai_form_visible);
     try std.testing.expect(!g_ai_list_visible);
-    try std.testing.expect(g_ai_form_visible);
-    try std.testing.expectEqual(@as(usize, @intFromEnum(AiField.api_key)), assistantProfiles().focus);
 }
 
 threadlocal var g_ai_default_name_buf: [256]u8 = undefined;
@@ -4688,6 +4911,7 @@ fn sessionTwoColumnWidth(left: []const u8, right: []const u8) f32 {
 
 fn sessionLauncherTitle() []const u8 {
     if (feishuForm().visible) return i18n.s().feishu_form_title;
+    if (quickAiForm().visible) return i18n.s().quick_ai_form_title;
     if (g_ai_history_source_visible) return i18n.s().sl_sessions;
     if (g_ai_form_visible) {
         return i18n.s().sl_ai_agent;
@@ -4774,7 +4998,7 @@ fn sessionDesiredBoxWidth() f32 {
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_password, sshField(.password)));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_port, sshField(.port)));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_jump_host, sshField(.proxy_jump)));
-        desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_auth_method, sshField(.auth_method)));
+        desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_auth_method, sshAuthMethodDisplay()));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_ssh_identity_file, sshField(.identity_file)));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_save_connect, platform_pty_command.sshLauncherDetail()));
         desired = @max(desired, sessionTwoColumnWidth(i18n.s().sl_save, i18n.s().sl_v_profile));
@@ -4872,6 +5096,8 @@ fn sessionDesiredBoxWidth() f32 {
 fn sessionActiveRowCount() usize {
     return if (feishuForm().visible)
         FEISHU_ROW_COUNT
+    else if (quickAiForm().visible)
+        quick_ai_config.ROW_COUNT
     else if (g_ai_form_visible)
         AI_FIELD_COUNT + 3
     else if (g_ai_list_visible)
@@ -4890,6 +5116,8 @@ fn sessionActiveRowCount() usize {
 fn sessionActiveSelection() usize {
     return if (feishuForm().visible)
         feishuConfig().focus
+    else if (quickAiForm().visible)
+        quickAi().focus
     else if (g_ai_form_visible)
         assistantProfiles().focus
     else if (g_ai_list_visible)
@@ -4908,6 +5136,8 @@ fn sessionActiveSelection() usize {
 fn sessionActiveSelectionPtr() *usize {
     return if (feishuForm().visible)
         &feishuConfig().focus
+    else if (quickAiForm().visible)
+        &quickAi().focus
     else if (g_ai_form_visible)
         &assistantProfiles().focus
     else if (g_ai_list_visible)
@@ -4987,7 +5217,15 @@ fn sessionHitTest(xpos: f64, ypos: f64, window_width: f32, window_height: f32, t
         if (row >= FEISHU_ROW_COUNT) return null;
         feishuConfig().focus = row;
         if (row == feishu_config.SAVE_ROW) return .feishu_save;
+        if (row == feishu_config.SCAN_ROW) return .feishu_scan;
         feishuConfig().toggleFocusedBool(); // toggle rows flip on click; field rows no-op
+        return null;
+    }
+
+    if (quickAiForm().visible) {
+        if (row >= quick_ai_config.ROW_COUNT) return null;
+        quickAi().focus = row;
+        AppWindow.applyUiEffect(.{ .needs_rebuild = true });
         return null;
     }
 
@@ -5176,6 +5414,49 @@ fn defaultAiModeLabel() []const u8 {
     return aiModeText(AppWindow.ai_chat.DEFAULT_AGENT);
 }
 
+fn quickAiStatusText() []const u8 {
+    return switch (quickAi().status) {
+        .idle => i18n.s().quick_ai_status_idle,
+        .verifying => i18n.s().quick_ai_status_verifying,
+        .empty => i18n.s().quick_ai_status_empty,
+        .invalid => i18n.s().quick_ai_status_invalid,
+        .network => i18n.s().quick_ai_status_network,
+        .store_full => i18n.s().quick_ai_status_full,
+        .ok => i18n.s().toast_quick_ai_done,
+    };
+}
+
+// Draws the quick-configure AI form inside the session-launcher box.
+// The API key row is masked: rendered as U+2022 (•) repeated once per codepoint
+// (continuation bytes are skipped, so the dot count matches the codepoint count,
+// not the byte count; ASCII keys happen to match either way).
+fn renderQuickAiConfigForm(layout: SessionLayout, window_height: f32) void {
+    const st = quickAi();
+
+    // Row 0: register link
+    renderSessionRow(layout, window_height, quick_ai_config.ROW_OPEN_REGISTER, i18n.s().quick_ai_register_row, "", st.focus == quick_ai_config.ROW_OPEN_REGISTER);
+
+    // Row 1: tutorial link
+    renderSessionRow(layout, window_height, quick_ai_config.ROW_OPEN_TUTORIAL, i18n.s().quick_ai_tutorial_row, "", st.focus == quick_ai_config.ROW_OPEN_TUTORIAL);
+
+    // Row 2: API key (masked — never draw the raw key)
+    const key_bytes = st.key();
+    var dot_buf: [quick_ai_config.KEY_FIELD_MAX * 3]u8 = undefined; // • is 3 UTF-8 bytes
+    const key_display: []const u8 = if (key_bytes.len > 0) blk: {
+        var out: usize = 0;
+        for (key_bytes) |b| {
+            if ((b & 0xC0) == 0x80) continue; // skip UTF-8 continuation bytes — one • per codepoint
+            @memcpy(dot_buf[out..][0..3], "\u{2022}");
+            out += 3;
+        }
+        break :blk dot_buf[0..out];
+    } else "";
+    renderSessionRow(layout, window_height, quick_ai_config.ROW_KEY, "API Key:", key_display, st.focus == quick_ai_config.ROW_KEY);
+
+    // Row 3: Verify & Save
+    renderSessionRow(layout, window_height, quick_ai_config.ROW_VERIFY, i18n.s().quick_ai_verify_row, quickAiStatusText(), st.focus == quick_ai_config.ROW_VERIFY);
+}
+
 // Draws the 2-field feishu credential form inside the session-launcher box. The
 // app_secret row is masked: rendered as U+2022 (•) repeated once per *codepoint* (never the
 // plaintext), or the "leave blank to keep" hint when empty and a secret already exists.
@@ -5188,10 +5469,13 @@ fn renderFeishuConfigForm(layout: SessionLayout, window_height: f32) void {
     // Row 1: international (Lark) toggle — picks open.larksuite.com over open.feishu.cn
     renderSessionRow(layout, window_height, feishu_config.INTERNATIONAL_ROW, i18n.s().feishu_form_international, boolText(st.international), st.focus == feishu_config.INTERNATIONAL_ROW);
 
-    // Row 2: app_id (plain text)
+    // Row 2: 扫码创建应用(动作行,右侧给一句提示)
+    renderSessionRow(layout, window_height, feishu_config.SCAN_ROW, i18n.s().feishu_form_scan, i18n.s().feishu_form_scan_hint, st.focus == feishu_config.SCAN_ROW);
+
+    // Row 3: app_id (plain text)
     renderSessionFieldValue(layout, window_height, feishu_config.APP_ID_ROW, i18n.s().feishu_form_app_id, st.value(.app_id), false, st.focus == feishu_config.APP_ID_ROW);
 
-    // Row 3: app_secret (masked)
+    // Row 4: app_secret (masked)
     const secret = st.value(.app_secret);
     var dot_buf: [feishu_config.FEISHU_FIELD_MAX * 3]u8 = undefined; // • is 3 UTF-8 bytes; mask by codepoint count
     const secret_display: []const u8 = if (secret.len > 0) blk: {
@@ -5208,7 +5492,7 @@ fn renderFeishuConfigForm(layout: SessionLayout, window_height: f32) void {
         "";
     renderSessionRow(layout, window_height, feishu_config.APP_SECRET_ROW, i18n.s().feishu_form_app_secret, secret_display, st.focus == feishu_config.APP_SECRET_ROW);
 
-    // Row 4: Save
+    // Row 5: Save
     renderSessionRow(layout, window_height, feishu_config.SAVE_ROW, i18n.s().feishu_form_save, i18n.s().toast_feishu_restart, st.focus == feishu_config.SAVE_ROW);
 }
 
@@ -5275,6 +5559,11 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
 
     if (feishuForm().visible) {
         renderFeishuConfigForm(layout, window_height);
+        return;
+    }
+
+    if (quickAiForm().visible) {
+        renderQuickAiConfigForm(layout, window_height);
         return;
     }
 
@@ -5398,7 +5687,7 @@ pub fn renderSessionLauncher(window_width: f32, window_height: f32, top_offset: 
     renderSessionField(layout, window_height, @intFromEnum(SshField.password), i18n.s().sl_ssh_password, sshField(.password), true);
     renderSessionField(layout, window_height, @intFromEnum(SshField.port), i18n.s().sl_ssh_port, sshField(.port), false);
     renderSessionField(layout, window_height, @intFromEnum(SshField.proxy_jump), i18n.s().sl_ssh_jump_host, sshField(.proxy_jump), false);
-    renderSessionField(layout, window_height, @intFromEnum(SshField.auth_method), i18n.s().sl_ssh_auth_method, sshField(.auth_method), false);
+    renderSessionField(layout, window_height, @intFromEnum(SshField.auth_method), i18n.s().sl_ssh_auth_method, sshAuthMethodDisplay(), false);
     renderSessionField(layout, window_height, @intFromEnum(SshField.identity_file), i18n.s().sl_ssh_identity_file, sshField(.identity_file), false);
     renderSessionRow(layout, window_height, SSH_FIELD_COUNT, i18n.s().sl_save_connect, platform_pty_command.sshLauncherDetail(), sshState().focus == SSH_FIELD_COUNT);
     renderSessionRow(layout, window_height, SSH_FIELD_COUNT + 1, i18n.s().sl_save, i18n.s().sl_v_profile, sshState().focus == SSH_FIELD_COUNT + 1);

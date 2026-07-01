@@ -41,6 +41,7 @@ const window_backend = @import("platform/window_backend.zig");
 const window_metrics = @import("ui/window_metrics.zig");
 const WindowMetrics = window_metrics.WindowMetrics;
 const input_key = @import("input/key.zig");
+const feishu_reg_panel = @import("feishu/registration_panel.zig");
 const assistant_conversation = @import("input/assistant_conversation.zig");
 const command_dispatch = @import("input/command_dispatch.zig");
 const file_explorer_keymap = @import("input/file_explorer_keymap.zig");
@@ -80,6 +81,7 @@ const handleConfiguredRightClick = clipboard.handleConfiguredRightClick;
 const copyAiChatToClipboard = clipboard.copyAiChatToClipboard;
 const copyAiChatCutToClipboard = clipboard.copyAiChatCutToClipboard;
 const copyAiChatMessageToClipboard = clipboard.copyAiChatMessageToClipboard;
+const copyAiChatSpanToClipboard = clipboard.copyAiChatSpanToClipboard;
 pub const handleFileDrop = clipboard.handleFileDrop;
 pub const copySelectionToClipboard = clipboard.copySelectionToClipboard;
 pub const pasteFromClipboard = clipboard.pasteFromClipboard;
@@ -2679,6 +2681,7 @@ fn dispatchChar(ev: platform_input.CharEvent) ui_effect.UiEffect {
         return effect;
     }
     if (weixinQrPanelConsumesChar()) return .none;
+    if (overlays.feishuRegPanelVisible()) return .none;
     if (browser_panel.urlBarFocused()) {
         if (!ev.ctrl and !ev.alt) {
             browser_panel.insertUrlBarChar(ev.codepoint);
@@ -3138,6 +3141,17 @@ fn dispatchKey(ev: platform_input.KeyEvent) ui_effect.UiEffect {
         }
         return .none;
     }
+    if (overlays.feishuRegPanelVisible()) {
+        switch (ev.key_code) {
+            platform_input.key_escape => overlays.feishuRegPanelHandleAction(.close),
+            platform_input.key_enter => {
+                const s = feishu_reg_panel.status();
+                if (s == .expired or s == .denied or s == .err) overlays.feishuRegPanelHandleAction(.retry);
+            },
+            else => {},
+        }
+        return .none;
+    }
     // File explorer key handling (when focused and in operation mode)
     if (file_explorer.isFocused() and file_explorer.isVisibleForActiveTab()) {
         if (handleFileExplorerKey(ev)) {
@@ -3514,6 +3528,28 @@ fn dispatchKey(ev: platform_input.KeyEvent) ui_effect.UiEffect {
     if (!AppWindow.isActiveTabTerminal()) return .none;
 
     const surface = AppWindow.activeSurface() orelse return .none;
+
+    // A cleanly-exited panel (SSH closed, shell `exit`) stays open showing
+    // "Press Enter to reconnect". Plain Enter re-runs the panel's original
+    // command in place. Other keys fall through, so e.g. Shift+PageUp still
+    // scrolls the scrollback before reconnecting.
+    if (surface.isExited() and
+        ev.key_code == platform_input.key_enter and
+        !ev.ctrl and !ev.alt and !ev.super and !ev.shift)
+    {
+        surface.respawn();
+        // Initial connect arms SSH password auto-injection; respawn only re-runs
+        // the command, so re-arm it here or the reconnect stalls at the password
+        // prompt. The surface keeps its ssh_connection (with the saved password)
+        // across respawn. Key-auth profiles report usesPasswordAuth()=false and
+        // are skipped.
+        if (surface.ssh_connection) |*conn| {
+            if (conn.usesPasswordAuth()) {
+                overlays.scheduleSshPasswordForSurface(surface);
+            }
+        }
+        return input_effects.repaint();
+    }
 
     // Track whether this keypress actually sends data to the PTY.
     // Like Ghostty, we only scroll-to-bottom when input is actually generated,
@@ -5317,6 +5353,19 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
         }
         return;
     }
+    if (overlays.feishuRegPanelVisible()) {
+        if (ev.button == .left and ev.action == .press) {
+            const win = AppWindow.g_window orelse return;
+            const fb = window_backend.framebufferSize(win);
+            const w_f: f32 = @floatFromInt(fb.width);
+            const h_f: f32 = @floatFromInt(fb.height);
+            const top_offset: f32 = @floatCast(titlebarHeight());
+            const xpos: f64 = @floatFromInt(ev.x);
+            const ypos: f64 = @floatFromInt(ev.y);
+            overlays.feishuRegPanelHandleAction(overlays.feishuRegPanelExecuteAt(xpos, ypos, w_f, h_f, top_offset));
+        }
+        return;
+    }
     if (ev.button == .left and ev.action == .press) {
         const win = AppWindow.g_window orelse return;
         const fb = window_backend.framebufferSize(win);
@@ -5611,6 +5660,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                         )) |target| {
                             switch (target) {
                                 .copy_message => |message_index| copyAiChatMessageToClipboard(chat, message_index),
+                                .copy_span => |s| copyAiChatSpanToClipboard(chat, s.message_index, s.start, s.end),
                                 .toggle_tool => |message_index| {
                                     chat.toggleToolMessageCollapsed(message_index);
                                     requestInputRepaint();
@@ -5744,6 +5794,7 @@ fn handleMouseButton(ev: platform_input.MouseButtonEvent) void {
                 )) |target| {
                     switch (target) {
                         .copy_message => |message_index| copyAiChatMessageToClipboard(chat, message_index),
+                        .copy_span => |s| copyAiChatSpanToClipboard(chat, s.message_index, s.start, s.end),
                         .toggle_tool => |message_index| {
                             chat.toggleToolMessageCollapsed(message_index);
                             requestInputRepaint();
